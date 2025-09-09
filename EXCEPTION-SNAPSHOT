@@ -1,5 +1,5 @@
 # SNAPSHOT — CST/CDT; global-date logging; success=I/U/D rows (counts incl. 0); failure=single 'E'
-# Logs: load_date from staging (CST), insert_timestamp = load_date 00:00:00 CST; first-seen consolidation.
+# Logs: load_date from staging (CST), runtime timestamps recorded at actual wall-clock times in CST/CDT.
 
 from __future__ import annotations
 from datetime import datetime, date
@@ -81,14 +81,6 @@ def _staging_on_date(df: DataFrame, d: date) -> DataFrame:
     ts = _resolve_insert_ts_col(df)
     return df.where(_to_cst_date_from_ts(ts) == F.lit(str(d)).cast("date"))
 
-def _localize_staging_ts(df: DataFrame) -> DataFrame:
-    """Ensure staging timestamp column is in CST when writing to SNAPSHOT."""
-    ts_col = _resolve_insert_ts_col(df)
-    if STAGING_TIMESTAMPS_ARE_UTC:
-        return df.withColumn(ts_col, F.from_utc_timestamp(F.col(ts_col), LOCAL_TZ_NAME))
-    else:
-        return df
-
 def _convert_to_cst(df: DataFrame, ts_cols: List[str]) -> DataFrame:
     out = df
     for c in ts_cols:
@@ -105,9 +97,9 @@ snap_log_schema = T.StructType([
     T.StructField("status", T.StringType()),      # 'D','I','U' (success) or 'E' (failure)
     T.StructField("count", T.LongType()),
     T.StructField("error_message", T.StringType()),
-    T.StructField("insert_timestamp", T.TimestampType()),  # = load_date 00:00:00 CST
-    T.StructField("start_time", T.TimestampType()),        # runtime CST
-    T.StructField("end_time", T.TimestampType()),          # runtime CST
+    T.StructField("insert_timestamp", T.TimestampType()),  # exact wall-clock when row appended (CST/CDT)
+    T.StructField("start_time", T.TimestampType()),        # exact wall-clock start (CST/CDT)
+    T.StructField("end_time", T.TimestampType()),          # exact wall-clock end (CST/CDT)
     T.StructField("load_type", T.StringType()),            # "incremental"
 ])
 
@@ -128,38 +120,46 @@ def reset_daily_log() -> None:
     print(f"[{_ts()}] Truncating LOGS.snapshot_daily_log ...")
     spark.sql("TRUNCATE TABLE LOGS.snapshot_daily_log")
 
-def _insert_ts_from_load_date(load_date: date):
-    """insert_timestamp = midnight of load_date (CST/CDT)."""
-    return F.to_timestamp(F.lit(str(load_date)))  # session TZ => America/Chicago
-
 def append_snapshot_daily_log(table_name: str, load_date: date, status: str,
                               cnt: int, start_time_py: datetime | None = None,
                               error_message: str | None = None) -> None:
-    # Business-day anchored timestamps: all three equal to load_date @ 00:00:00 (CST/CDT)
-    insert_ts = F.to_timestamp(F.lit(str(load_date)))  # session TZ = America/Chicago
-    start_ts  = insert_ts
-    end_ts    = insert_ts
+    """
+    Logs with exact runtime timestamps in CST/CDT:
+      - insert_timestamp: the moment the log row is written (now)
+      - start_time: when the operation actually started (from caller)
+      - end_time: now
+    load_date remains the business date derived from staging (CST/CDT).
+    """
+    st_py = start_time_py if start_time_py is not None else datetime.now(tz)
+    if st_py.tzinfo is None:
+        st_py = tz.localize(st_py)
+    now_py = datetime.now(tz)
 
-    row_df = (spark.range(1).select(
-        F.lit(load_date).cast("date").alias("load_date"),
-        F.lit(table_name).alias("table_name"),
-        F.lit(status).alias("status"),
-        F.lit(int(cnt or 0)).cast("long").alias("count"),
-        F.lit(error_message).cast("string").alias("error_message"),
-        insert_ts.alias("insert_timestamp"),
-        start_ts.alias("start_time"),
-        end_ts.alias("end_time"),
-        F.lit("incremental").alias("load_type"),
-    ))
-    print(f"[{_ts()}] LOGS.snapshot_daily_log += table={table_name}, date={load_date}, "
-          f"status='{status}', count={cnt} (times anchored to business date)")
+    row_df = (
+        spark.range(1).select(
+            F.lit(load_date).cast("date").alias("load_date"),
+            F.lit(table_name).alias("table_name"),
+            F.lit(status).alias("status"),
+            F.lit(int(cnt or 0)).cast("long").alias("count"),
+            F.lit(error_message).cast("string").alias("error_message"),
+            F.lit(now_py).cast("timestamp").alias("insert_timestamp"),
+            F.lit(st_py).cast("timestamp").alias("start_time"),
+            F.lit(now_py).cast("timestamp").alias("end_time"),
+            F.lit("incremental").alias("load_type"),
+        )
+    )
+
+    print(
+        f"[{_ts()}] LOGS.snapshot_daily_log += table={table_name}, date={load_date}, "
+        f"status='{status}', count={cnt} "
+        f"(start={st_py.strftime('%Y-%m-%d %H:%M:%S')}, end={now_py.strftime('%Y-%m-%d %H:%M:%S')})"
+    )
     row_df.write.mode("append").saveAsTable("LOGS.snapshot_daily_log")
-
 
 def consolidate_snapshot_logs_to_final() -> None:
     """
     First-seen policy: append only (load_date, table_name, status) not already present in FINAL.
-    Keeps original insert_timestamp stable across reruns.
+    Keeps original timestamps from the first time we saw that key.
     """
     print(f"[{_ts()}] Consolidating snapshot daily logs -> final (first-seen policy) ...")
     try:
@@ -320,7 +320,7 @@ def apply_snapshot_for_table_and_date(table_name: str, key_cols: List[str], d: d
         start_u = datetime.now(tz)
         u_df_raw = stg_day.filter(F.upper(F.col(status_col)) == "U").select(*snap_cols)
 
-        # Normalize to CST if needed for common timestamp columns
+        # Normalize to CST if needed for common timestamp columns coming from UTC
         if STAGING_TIMESTAMPS_ARE_UTC:
             ts_like = [c for c in snap_cols if c.lower() in ("insert_ts","insert_timestamp","update_ts","load_ts")]
             i_df = _convert_to_cst(i_df_raw, ts_like)
@@ -339,20 +339,20 @@ def apply_snapshot_for_table_and_date(table_name: str, key_cols: List[str], d: d
 
         # If no effective changes, still log zeros and return
         if d_count == 0 and i_count == 0 and u_count == 0:
-            print(f"[{_ts()}] {table_name} {d} -> No classified changes; skipping swap. Logging zeros.")
+            print(f"[{_ts()}] {table_name} {d} -> No classified changes; logging zeros (no swap).")
             append_snapshot_daily_log(table_name, d, "D", 0, start_d, None)
             append_snapshot_daily_log(table_name, d, "I", 0, start_i, None)
             append_snapshot_daily_log(table_name, d, "U", 0, start_u, None)
             return
 
-        # Write TEMP & atomic swap
+        # Write TEMP & atomic publish (CREATE OR REPLACE avoids a drop-gap)
         print(f"[{_ts()}] {table_name} {d} -> Writing TEMP {temp_table}")
         final_df.write.mode("overwrite").saveAsTable(temp_table)
-        print(f"[{_ts()}] {table_name} {d} -> Replacing SNAPSHOT {snap_table}")
-        spark.sql(f"DROP TABLE IF EXISTS {snap_table}")
-        spark.sql(f"ALTER TABLE {temp_table} RENAME TO {snap_table}")
+        print(f"[{_ts()}] {table_name} {d} -> Atomically publishing {snap_table}")
+        spark.sql(f"CREATE OR REPLACE TABLE {snap_table} AS SELECT * FROM {temp_table}")
+        spark.sql(f"DROP TABLE IF EXISTS {temp_table}")
 
-        # SUCCESS logs (after successful write)
+        # SUCCESS logs (after successful write) with real start/end times
         append_snapshot_daily_log(table_name, d, "D", d_count, start_d, None)
         append_snapshot_daily_log(table_name, d, "I", i_count, start_i, None)
         append_snapshot_daily_log(table_name, d, "U", u_count, start_u, None)
@@ -405,6 +405,9 @@ def process_all_snapshot() -> None:
     for r in all_rows:
         table = r["TABLE_NAME"]
         key_cols = [c.strip() for c in r["KEY_COLUMN"].split(",") if c.strip()]
+        if not key_cols:
+            print(f"[{_ts()}] SKIP {table}: no KEY_COLUMN configured.")
+            continue
         print(f"[{_ts()}] -------- Planning table: {table} --------")
         pend = dates_to_process_for_table(table, global_dates)
         plan[table] = {"keys": key_cols, "pending": pend}

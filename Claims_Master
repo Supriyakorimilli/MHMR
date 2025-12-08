@@ -1,0 +1,310 @@
+# CLAIMS_MASTER_TABLE WITH ROW_HASH AND INSERT_TS - UPDATED JOINS
+
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.utils import AnalysisException
+from datetime import datetime
+import pytz
+
+# -----------------------
+# Spark session and configs
+# -----------------------
+spark = SparkSession.builder.appName("Build Service Claims Master").getOrCreate()
+spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+spark.conf.set("spark.sql.parquet.int96RebaseModeInRead",  "CORRECTED")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead",  "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
+spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+
+# =====================================================================================
+# CONFIG
+# =====================================================================================
+
+DB = "MHMR_LAKEHOUSE"
+
+SDM_TBL        = f"{DB}.RAW.service_delivery_master_raw"
+PAY_ADJ_TBL    = f"{DB}.RAW.billing_pay_adj_history_RAW"
+GUAR_TBL       = f"{DB}.RAW.billing_guar_table_RAW"
+TX_HIST_TBL    = f"{DB}.RAW.billing_tx_history_RAW"
+GUAR_SUBS_TBL  = f"{DB}.RAW.billing_guar_subs_data_RAW"
+CHARGE_DET_TBL = f"{DB}.RAW.billing_tx_charge_detail_RAW"
+CLAIM_HIST_TBL = f"{DB}.RAW.billing_claim_history_RAW"
+FEE_TBL        = f"{DB}.RAW.REF_PROJECTED_SERVICE_FEES_RAW_SQL"
+
+TARGET_TBL     = f"{DB}.RAW.ServiceClaimsMaster_RAW"
+
+# =====================================================================================
+# PARAMETERS
+# =====================================================================================
+
+BEG_DATE = F.to_date(F.lit("2018-09-01"))
+END_DATE = F.to_date(F.lit("2199-12-31"))
+
+# =====================================================================================
+# LOAD SOURCE DATAFRAMES
+# =====================================================================================
+
+sdm  = spark.table(SDM_TBL)
+pay  = spark.table(PAY_ADJ_TBL)
+bgt  = spark.table(GUAR_TBL)
+btx  = spark.table(TX_HIST_TBL)
+subs = spark.table(GUAR_SUBS_TBL)
+bcd  = spark.table(CHARGE_DET_TBL)
+bch  = spark.table(CLAIM_HIST_TBL)
+fee  = spark.table(FEE_TBL)
+
+# =====================================================================================
+# ADJ CTE TRANSLATION
+# =====================================================================================
+
+adj = (
+    pay
+    .where(
+        (F.col("DATE_OF_SERVICE") >= BEG_DATE) &
+        (F.col("DATE_OF_SERVICE") <= END_DATE)
+    )
+    .groupBy("PATID", "GUARANTOR_ID", "JOIN_TO_TX_HISTORY", "EPISODE_NUMBER")
+    .agg(
+        F.max(
+            F.when(
+                (F.col("type_of_payment") == "PAYMENT") |
+                ((F.col("payment_type_code") >= "600") & (F.col("payment_type_code") <= "608")),
+                F.col("date_of_payment")
+            )
+        ).alias("Date_of_payment"),
+        F.sum(
+            F.when(
+                (F.col("type_of_payment") == "PAYMENT") |
+                ((F.col("payment_type_code") >= "600") & (F.col("payment_type_code") <= "608")),
+                F.col("payment_amount")
+            ).otherwise(F.lit(0))
+        ).alias("Total_Payments"),
+        F.sum(
+            F.when(
+                (F.col("payment_type_code") >= "200") & (F.col("payment_type_code") <= "299"),
+                F.col("payment_amount")
+            ).otherwise(F.lit(0))
+        ).alias("Series_200_adj"),
+        F.sum(
+            F.when(
+                (F.col("payment_type_code") >= "300") & (F.col("payment_type_code") <= "399"),
+                F.col("payment_amount")
+            ).otherwise(F.lit(0))
+        ).alias("Series_300_adj"),
+        F.sum(
+            F.when(
+                (F.col("payment_type_code") >= "400") & (F.col("payment_type_code") <= "499"),
+                F.col("payment_amount")
+            ).otherwise(F.lit(0))
+        ).alias("Series_400_adj"),
+        F.sum(
+            F.when(
+                (F.col("payment_type_code") >= "500") & (F.col("payment_type_code") <= "599"),
+                F.col("payment_amount")
+            ).otherwise(F.lit(0))
+        ).alias("Series_500_adj"),
+        F.sum(
+            F.when(
+                (F.col("payment_type_code") >= "600") & (F.col("payment_type_code") <= "699"),
+                F.col("payment_amount")
+            ).otherwise(F.lit(0))
+        ).alias("Series_600_adj"),
+        F.sum(
+            F.when(
+                (F.col("payment_type_code") >= "700") & (F.col("payment_type_code") <= "799"),
+                F.col("payment_amount")
+            ).otherwise(F.lit(0))
+        ).alias("Series_700_adj"),
+    )
+)
+
+# =====================================================================================
+# BUILD MAIN DATAFRAME
+# =====================================================================================
+
+df = (
+    # Use SDM as the driving table and avoid dropping rows
+    sdm.alias("SDM")
+
+    # Was inner before, which could drop SDM rows that have no guarantor row
+    .join(
+        bgt.alias("BGT"),
+        F.col("SDM.PrimaryGuarantorID") == F.col("BGT.GUARANTOR_ID"),
+        "left"
+    )
+
+    # Was inner before, which could drop SDM rows that have no tx history row
+    .join(
+        btx.alias("BTX"),
+        F.col("BTX.ID") == F.col("SDM.ID"),
+        "left"
+    )
+
+    .join(
+        subs.alias("SUB"),
+        (F.col("SDM.PatientID") == F.col("SUB.PATID")) &
+        (F.col("SDM.PrimaryGuarantorID") == F.col("SUB.GUARANTOR_ID")) &
+        (F.col("BTX.EPISODE_NUMBER") == F.col("SUB.EPISODE_NUMBER")),
+        "left"
+    )
+    .join(
+        adj.alias("ADJ"),
+        (F.col("BTX.PATID") == F.col("ADJ.PATID")) &
+        (F.col("BTX.JOIN_TO_TX_HISTORY") == F.col("ADJ.JOIN_TO_TX_HISTORY")) &
+        (F.col("BTX.EPISODE_NUMBER") == F.col("ADJ.EPISODE_NUMBER")) &
+        (F.col("BTX.primary_guarantor") == F.col("ADJ.GUARANTOR_ID")),
+        "left"
+    )
+    .join(
+        bcd.alias("BCD"),
+        (F.col("BTX.PATID") == F.col("BCD.PATID")) &
+        (F.col("BTX.JOIN_TO_TX_HISTORY") == F.col("BCD.JOIN_TO_TX_HISTORY")) &
+        (F.col("BTX.EPISODE_NUMBER") == F.col("BCD.EPISODE_NUMBER")) &
+        (F.col("BTX.primary_guarantor") == F.col("BCD.GUARANTOR_ID")),
+        "left"
+    )
+    .join(
+        bch.alias("BCH"),
+        (F.col("BCD.PATID") == F.col("BCH.PATID")) &
+        (F.col("BCD.EPISODE_NUMBER") == F.col("BCH.EPISODE_NUMBER")) &
+        (F.col("BCD.CLAIM_NUMBER") == F.col("BCH.CLAIM_NUMBER")) &
+        (F.col("BCD.GUARANTOR_ID") == F.col("BCH.GUARANTOR_ID")),
+        "left"
+    )
+    .join(
+        fee.alias("FEE"),
+        (F.col("SDM.ServiceCode") == F.col("FEE.SERVICE_CODE")) &
+        (F.col("SDM.RRGCode") == F.col("FEE.DIVISION")) &
+        (F.col("SDM.PatientAgeonService") >= F.col("FEE.MIN_AGE")) &
+        (F.col("SDM.PatientAgeonService") <= F.col("FEE.MAX_AGE")) &
+        (F.col("BGT.financial_class_code") == F.col("FEE.FINANCIAL_CLASS")) &
+        (F.coalesce(F.col("SDM.ServiceDuration"), F.lit(0)) >= F.col("FEE.MIN_DURATION")) &
+        (F.coalesce(F.col("SDM.ServiceDuration"), F.lit(0)) <= F.col("FEE.MAX_DURATION")),
+        "left"
+    )
+)
+
+# =====================================================================================
+# SELECT LIST
+# =====================================================================================
+
+claims_no_hash = df.select(
+    F.col("SDM.Service_Delivery_Master_ID").alias("ServiceDelivery_MasterID"),
+    F.col("SDM.FACILITY").alias("FACILITY"),
+    F.col("SDM.PatientID").alias("PatientID"),
+    F.col("SDM.programcode").alias("Program_Code"),
+    F.col("SDM.ServiceCode").alias("Service_Code"),
+    F.col("SDM.PrimaryGuarantorID").alias("Primary_Guarantor"),
+    F.col("SDM.DateofService").alias("Date_Of_Service"),
+    F.col("SDM.ServiceCost").alias("Cost_Of_Service"),
+
+    F.when(
+        F.col("FEE.FEE_AMOUNT").isNotNull() & (F.col("FEE.FEE_RULE") == "EVENT"),
+        F.col("FEE.FEE_AMOUNT")
+    ).when(
+        F.col("FEE.FEE_AMOUNT").isNotNull() & (F.col("FEE.FEE_RULE") == "UNIT"),
+        F.col("FEE.FEE_AMOUNT") * F.col("SDM.ServiceUnits")
+    ).when(
+        F.col("FEE.FEE_AMOUNT").isNull(),
+        F.col("SDM.ServiceCost")
+    ).otherwise(F.lit(None)).alias("Projected_Payment"),
+
+    F.when(F.col("FEE.REF_ProjectedServiceFeeID").isNotNull(), F.lit("Fee Rule"))
+     .otherwise(F.lit("Default")).alias("Fee_Type"),
+
+    F.col("ADJ.Total_Payments").alias("Total_Payments"),
+    F.col("ADJ.Series_200_adj").alias("Reversal_Adjustment"),
+    F.col("ADJ.Series_300_adj").alias("Writeoff_Adjustment"),
+    F.col("ADJ.Series_400_adj").alias("Contractural_Adjustment"),
+    F.col("ADJ.Series_500_adj").alias("Charge_Reversal"),
+    F.col("ADJ.Series_600_adj").alias("Refunds"),
+    F.col("ADJ.Series_700_adj").alias("Transfers"),
+
+    F.col("BCD.guarantor_liability").alias("Guarantor_Liability"),
+    F.col("BCD.guarantor_total_payments").alias("Guarantor_Total_Payments"),
+    F.col("BCD.remaining_balance").alias("Remaining_Balance"),
+    F.col("BCD.v_claim_date").alias("Claim_date"),
+    F.col("ADJ.Date_of_payment").alias("Payment_date"),
+
+    F.col("BGT.financial_class_value").alias("Financial_Class_Value"),
+    F.col("BGT.guarantor_name").alias("Guarantor_name"),
+
+    F.when(F.col("FEE.IsBillable") == "N", "N")
+     .when(F.col("FEE.Appt_Required") == "N", "Y")
+     .when(
+         (F.col("FEE.Appt_Required") == "Y") &
+         (~F.col("SDM.AppointmentType").isin("1", "2", "C", "U")),
+         "N"
+     )
+     .when(F.col("SDM.ServiceCode").isin("DELETE", "153NB", "T2024", "556NB", "554NB", "2900"), "N")
+     .when(F.col("SDM.ServiceCost") == F.lit("0.00"), "N")
+     .when(
+         (F.length(F.col("SDM.ServiceCode")) == 3) &
+         (F.col("SDM.ServiceCode") >= "100") &
+         (F.col("SDM.ServiceCode") <= "650") &
+         (~F.col("SDM.ServiceCode").isin("172", "184", "205", "206", "207", "208", "443", "444")),
+         "N"
+     )
+     .otherwise("Y").alias("IsBillable"),
+
+    F.col("BCD.CLAIM_NUMBER").alias("Claim_Number"),
+    F.col("BCH.option_desc").alias("Claim_option_desc"),
+
+    F.when(
+        F.col("BGT.financial_class_code").isin("13", "17", "20", "3"),
+        F.col("SUB.subs_policy")
+    ).otherwise(F.lit(None)).alias("Medicade_Number"),
+
+    F.when(
+        F.col("BGT.financial_class_code").isin("14", "7", "8"),
+        F.col("SUB.subs_policy")
+    ).otherwise(F.lit(None)).alias("Medicare_Number"),
+
+    F.col("BTX.JOIN_TO_TX_HISTORY").alias("JOIN_TO_TX_HISTORY"),
+    F.col("BCD.ID").alias("Charge_detail_ID")
+)
+
+# =====================================================================================
+# ADD SCMID HASH FIRST, THEN INSERT_TS LAST
+# =====================================================================================
+
+hash_expr = F.sha2(
+    F.concat_ws(
+        "||",
+        *[F.coalesce(F.col(c).cast("string"), F.lit("")) for c in claims_no_hash.columns]
+    ),
+    256
+)
+
+claims_with_hash = (
+    claims_no_hash
+    .withColumn("SCMID", hash_expr)
+    .select(["SCMID"] + claims_no_hash.columns)
+)
+
+claims_with_hash = claims_with_hash.withColumn("insert_ts", F.current_date())
+
+# =====================================================================================
+# APPLY WHERE FILTERS
+# =====================================================================================
+
+result_filtered = (
+    claims_with_hash
+    .where(
+        (F.col("Date_Of_Service") >= BEG_DATE) &
+        (F.col("Date_Of_Service") <= END_DATE)
+    )
+    .where(~F.col("PatientID").isin("77777777", "88888888", "99999999"))
+    .orderBy("Date_Of_Service", "PatientID", "JOIN_TO_TX_HISTORY")
+)
+
+# =====================================================================================
+# WRITE TO TARGET
+# =====================================================================================
+
+result_filtered.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(TARGET_TBL)

@@ -1,7 +1,4 @@
-Here is your complete, production-ready PySpark script updated to match your exact directory structure strategy (dw_fact_ for tables inside your dw/fact/ folder organization).
-This script handles the data extraction from your **2 normal tables**, performs lookups against your **4 dimension tables**, checks for changes, updates the **3 separate folder-isolated fact tables**, purges deleted records, and logs the results.
-## Complete PySpark Script for Fabric
-```python
+
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
@@ -25,22 +22,22 @@ spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 DB = "MHMR_LAKEHOUSE"
 
 # Target Fact Tables (Mapped to your dw/fact/ folder structure via table names)
-TARGET_DELIVERY_TBL = f"{DB}.dw_fact_ServiceDelivery"
-TARGET_BILLING_TBL  = f"{DB}.dw_fact_ServiceBilling"
-TARGET_INFO_TBL     = f"{DB}.dw_fact_ServiceInfo"
+TARGET_DELIVERY_TBL = f"{DB}.dw.fact.ServiceDelivery"
+TARGET_BILLING_TBL  = f"{DB}.dw.fact.ServiceBilling"
+TARGET_INFO_TBL     = f"{DB}.dw.fact.ServiceInfo"
 
 # Dimension Tables 
-DIM_CLIENT_TBL      = f"{DB}.dw_dim_Client"
-DIM_STAFF_TBL       = f"{DB}.dw_dim_Staff"
-DIM_PROGRAM_TBL     = f"{DB}.dw_dim_Program"
-DIM_GUARANTOR_TBL   = f"{DB}.dw_dim_Client_Guarantors"
+DIM_CLIENT_TBL      = f"{DB}.dw.dim_Client"
+DIM_STAFF_TBL       = f"{DB}.dw.dim_Staff"
+DIM_PROGRAM_TBL     = f"{DB}.dw.dim_Program"
+DIM_GUARANTOR_TBL   = f"{DB}.dw.dim_Client_Guarantors"
 
 # Source Tables (The 2 Normal/Operational Tables)
-SERVICE_SRC_TBL     = f"{DB}.RPT_ServiceDelivery_Master"   # Normal Table 1
-APPT_SRC_TBL        = f"{DB}.DW_Appointments"              # Normal Table 2
+SERVICE_SRC_TBL     = f"{DB}.RAW.ServiceDelivery_Master_RAW_SQL"   # Normal Table 1
+APPT_SRC_TBL        = f"{DB}.RAW.appt_data_RAW"              # Normal Table 2
 
 # Logging Configurations
-LOG_TBL             = f"{DB}.LOGS_dw_fact_process_log"
+LOG_TBL             = f"{DB}.LOGS.fact_process_log"
 ETL_TYPE_FOR_LOG    = "PARTIAL MERGE"
 
 # =========================================================================================
@@ -221,23 +218,54 @@ end_count_d = get_row_count(TARGET_DELIVERY_TBL)
 end_count_b = get_row_count(TARGET_BILLING_TBL)
 end_count_i = get_row_count(TARGET_INFO_TBL)
 
+# =========================================================================================
+# CORRECTED LOG DATA PREPARATION & MEMORY CLEANUP (REPLACES LINES 225-245)
+# =========================================================================================
+
+# Ensure all metric variables are explicitly evaluated to standard Python integers
+b_cnt_d = int(begin_count_d) if 'begin_count_d' in locals() else 0
+b_cnt_b = int(begin_count_b) if 'begin_count_b' in locals() else 0
+b_cnt_i = int(begin_count_i) if 'begin_count_i' in locals() else 0
+
+n_ins_d = int(new_inserts_d) if 'new_inserts_d' in locals() else 0
+n_ins_b = int(new_inserts_b) if 'new_inserts_b' in locals() else 0
+n_ins_i = int(new_inserts_i) if 'new_inserts_i' in locals() else 0
+
+c_upd_d = int(change_updates_d) if 'change_updates_d' in locals() else 0
+c_upd_b = int(change_updates_b) if 'change_updates_b' in locals() else 0
+c_upd_i = int(change_updates_i) if 'change_updates_i' in locals() else 0
+
+d_upd_d = int(del_d) if 'del_d' in locals() else 0
+d_upd_b = int(del_b) if 'del_b' in locals() else 0
+d_upd_i = int(del_i) if 'del_i' in locals() else 0
+
+e_cnt_d = int(end_count_d) if 'end_count_d' in locals() else 0
+e_cnt_b = int(end_count_b) if 'end_count_b' in locals() else 0
+e_cnt_i = int(end_count_i) if 'end_count_i' in locals() else 0
+
+# Build log rows ensuring absolute native types (No Spark Columns)
 log_rows = [
-    (datetime.now(), "dw_fact_ServiceDelivery", begin_count_d, 0, new_inserts_d, change_updates_d, change_updates_d, del_d, end_count_d, 0, ETL_TYPE_FOR_LOG),
-    (datetime.now(), "dw_fact_ServiceBilling", begin_count_b, 0, new_inserts_b, change_updates_b, change_updates_b, del_b, end_count_b, 0, ETL_TYPE_FOR_LOG),
-    (datetime.now(), "dw_fact_ServiceInfo", begin_count_i, 0, new_inserts_i, change_updates_i, change_updates_i, del_i, end_count_i, 0, ETL_TYPE_FOR_LOG)
+    (datetime.now(), "dw_fact_ServiceDelivery", b_cnt_d, 0, n_ins_d, c_upd_d, c_upd_d, d_upd_d, e_cnt_d, 0, ETL_TYPE_FOR_LOG),
+    (datetime.now(), "dw_fact_ServiceBilling", b_cnt_b, 0, n_ins_b, c_upd_b, c_upd_b, d_upd_b, e_cnt_b, 0, ETL_TYPE_FOR_LOG),
+    (datetime.now(), "dw_fact_ServiceInfo", b_cnt_i, 0, n_ins_i, c_upd_i, c_upd_i, d_upd_i, e_cnt_i, 0, ETL_TYPE_FOR_LOG)
 ]
 
+# Generate and save the logging DataFrame safely
 log_schema = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE"]
 log_df = spark.createDataFrame(log_rows, log_schema)
-
-# Append statistics into logs folder
 log_df.write.format("delta").mode("append").saveAsTable(LOG_TBL)
 
-# Clear active caches
+# Clear active cluster memory caches
 staging_df.unpersist()
-try: orphans_df.unpersist() 
-except: pass
+
+try:
+    orphans_df.unpersist()
+except NameError:
+    # Safe protection if no orphan rows were initialized during Stage 5
+    pass
+except Exception:
+    pass
 
 print("Fabric Folder-Based Fact Load Completed Successfully.")
 
-```
+

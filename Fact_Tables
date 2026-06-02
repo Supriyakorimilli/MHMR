@@ -1,4 +1,3 @@
-
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
@@ -26,15 +25,15 @@ TARGET_DELIVERY_TBL = f"{DB}.dw_fact_ServiceDelivery"
 TARGET_BILLING_TBL  = f"{DB}.dw_fact_ServiceBilling"
 TARGET_INFO_TBL     = f"{DB}.dw_fact_ServiceInfo"
 
-# Dimension Tables (Perfectly synchronized to your working 'dw.Dim_' casing format)
-DIM_CLIENT_TBL      = f"{DB}.dw.Dim_Client"
-DIM_STAFF_TBL       = f"{DB}.dw.Dim_Staff"
-DIM_PROGRAM_TBL     = f"{DB}.dw.Dim_Program"
-DIM_GUARANTOR_TBL   = f"{DB}.dw.Dim_Client_Guarantors"
+# Dimension Tables (Synchronized to match your real DW casing structure exactly)
+DIM_CLIENT_TBL      = f"{DB}.DW.dim_client"
+DIM_STAFF_TBL       = f"{DB}.DW.dim_staff"
+DIM_PROGRAM_TBL     = f"{DB}.DW.dim_program"
+DIM_GUARANTOR_TBL   = f"{DB}.DW.dim_client_guarantors"
 
-# Source Tables (The 2 Normal/Operational Tables)
+# Source Tables (Normal Staging Feed & Clean Appointments Dimension)
 SERVICE_SRC_TBL     = f"{DB}.RAW.ServiceDelivery_Master_RAW_SQL"   # Normal Table 1
-APPT_SRC_TBL        = f"{DB}.RAW.appt_data_RAW"                    # Normal Table 2
+APPT_SRC_TBL        = f"{DB}.DW.dim_appointments"                  # FIXED: Points to actual Dim table
 
 # Logging Configurations
 LOG_TBL             = f"{DB}.LOGS_fact_process_log"
@@ -71,7 +70,7 @@ sdm_df = sdm_df.withColumn(
      .otherwise(F.substring("EpisodeNumAndName", 1, 1))
 )
 
-# FIXED: Using F.expr() to bypass the F.substring Column-as-argument limitation safely
+# Using F.expr() to bypass the F.substring Column-as-argument limitation safely
 sdm_df = sdm_df.withColumn(
     "join_tx_hist", 
     F.expr("substring(ID, locate('||', ID, 4) + 2, 20)")
@@ -80,7 +79,8 @@ sdm_df = sdm_df.withColumn(
     F.expr("substring(Tx_Note_UniqueId, locate('N', Tx_Note_UniqueId, 1), 15)")
 )
 
-# Join Normal Table 1 and Normal Table 2 using structured columns
+# Join Normal Table 1 and Appointments Dimension using structured columns
+# RESTORED: ap.AppointmentKey is safely pulled because we are using dim_appointments!
 joined_part1 = sdm_df.alias("sdm").join(
     ap_df.alias("ap"),
     (F.col("sdm.PatientID") == F.col("ap.PATID")) &
@@ -127,9 +127,9 @@ joined_part1 = sdm_df.alias("sdm").join(
     "sdm.ServiceEndTime",
     "sdm.ProgramCode",
     "sdm.EPISODE_NUMBER",
-    "sdm.join_tx_hist",         # Retained for window partitioning bounds
-    "sdm.tx_note_uid_slice",    # Retained for window partitioning bounds
-    "ap.AppointmentKey",
+    "sdm.join_tx_hist",         
+    "sdm.tx_note_uid_slice",    
+    "ap.AppointmentKey",        # Restored
     "ap.appointment_date",
     "ap.appointment_start_time"
 )
@@ -265,7 +265,6 @@ end_count_d = get_row_count(TARGET_DELIVERY_TBL)
 end_count_b = get_row_count(TARGET_BILLING_TBL)
 end_count_i = get_row_count(TARGET_INFO_TBL)
 
-# Constructing native clean primitive types for tracking protection
 log_rows = [
     (datetime.now(), "dw_fact_ServiceDelivery", int(begin_count_d), 0, int(new_inserts_d), int(change_updates_d), int(change_updates_d), int(del_d), int(end_count_d), 0, ETL_TYPE_FOR_LOG),
     (datetime.now(), "dw_fact_ServiceBilling", int(begin_count_b), 0, int(new_inserts_b), int(change_updates_b), int(change_updates_b), int(del_b), int(end_count_b), 0, ETL_TYPE_FOR_LOG),
@@ -281,7 +280,7 @@ if not spark.catalog.tableExists(LOG_TBL):
 else:
     log_df.write.format("delta").mode("append").saveAsTable(LOG_TBL)
 
-# Clear computational caches from cluster RAM
+# Clear active caches
 staging_df.unpersist()
 try:
     orphans_df.unpersist()
@@ -291,4 +290,3 @@ except Exception:
     pass
 
 print("Fabric Folder-Based Fact Load Completed Successfully.")
-

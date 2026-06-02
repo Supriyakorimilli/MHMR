@@ -1,19 +1,3 @@
-Alright, let's step back and look at why this specific [NOT_ITERABLE] Column is not iterable error is still triggering, even after ensuring explicit selections.
-In PySpark, this error almost always means that somewhere in your code, a function is expecting a list of items (an iterable like a tuple or a list of column names), but it is receiving a raw, single **Column** object or an un-evaluated string mapping instead.
-Looking closely at your provided script, there are **two hidden structural issues** causing this:
- 1. **The Dimension Lookup Selection Block (Stage 2):** ```python
-   .select( "p1.*", "dc.ClientKey", ... )
-   ```
-   Passing `"p1.*"` inside string quotes inside a `.select()` statement causes PySpark's analytical parser to choke on the schema lineage when combined with explicit string lookups. To bring over all columns from an aliased DataFrame alongside new keys, we must pass the wildcard expansion cleanly as a dedicated object: `F.col("p1.*")`.
-   
-   ```
- 2. **The Target Variable Schema Names (Stage 4 & 6):**
-   Your TARGET_DELIVERY_TBL configuration paths are structured as f"{DB}.dw.fact.ServiceDelivery". This compiles into MHMR_LAKEHOUSE.dw.fact.ServiceDelivery.
-   Standard metastores in Fabric do not support **four-part dot notation** (catalog.schema.subfolder.table) inside a standard spark.read.table() or DeltaTable.forName() call. This catalog misinterpretation causes the try / except blocks to fail silently or yield incomplete reference states, bubbling an un-iterable Column object right back down to your counters.
-## The Solution: The Complete Definitively Fixed Script
-Here is the fully corrected, completely refactored single-cell script. It fixes the p1.* selection bug, standardizes your table references so they clear Fabric's metastore requirements, and guarantees clean datatype tracking.
-Wipe clean your notebook cell, paste this exact block, and click **Run All**:
-```python
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
@@ -31,25 +15,25 @@ spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 
 # =========================================================================================
-# CONFIG (Folder-Based Table Mapping Fixed for Metastore Compliance)
+# CONFIG (Folder-Based Table Mapping - Synced with your Working Environment Format)
 # =========================================================================================
 
 DB = "MHMR_LAKEHOUSE"
 
-# Target Fact Tables (Mapped using clean, non-nested underscore notation for tracking safety)
+# Target Fact Tables (Fixed to use compliant 3-part namespace notation via underscores)
 TARGET_DELIVERY_TBL = f"{DB}.dw_fact_ServiceDelivery"
 TARGET_BILLING_TBL  = f"{DB}.dw_fact_ServiceBilling"
 TARGET_INFO_TBL     = f"{DB}.dw_fact_ServiceInfo"
 
-# Dimension Tables 
-DIM_CLIENT_TBL      = f"{DB}.dw_dim_Client"
-DIM_STAFF_TBL       = f"{DB}.dw_dim_Staff"
-DIM_PROGRAM_TBL     = f"{DB}.dw_dim_Program"
-DIM_GUARANTOR_TBL   = f"{DB}.dw_dim_Client_Guarantors"
+# Dimension Tables (FIXED: Perfectly matching your working format 'dw.Dim_')
+DIM_CLIENT_TBL      = f"{DB}.dw.Dim_Client"
+DIM_STAFF_TBL       = f"{DB}.dw.Dim_Staff"
+DIM_PROGRAM_TBL     = f"{DB}.dw.Dim_Program"
+DIM_GUARANTOR_TBL   = f"{DB}.dw.Dim_Client_Guarantors"
 
 # Source Tables (The 2 Normal/Operational Tables)
-SERVICE_SRC_TBL     = f"{DB}.RAW_ServiceDelivery_Master_RAW_SQL"   # Normal Table 1
-APPT_SRC_TBL        = f"{DB}.RAW_appt_data_RAW"                    # Normal Table 2
+SERVICE_SRC_TBL     = f"{DB}.RAW.ServiceDelivery_Master_RAW_SQL"   # Normal Table 1
+APPT_SRC_TBL        = f"{DB}.RAW.appt_data_RAW"                    # Normal Table 2
 
 # Logging Configurations
 LOG_TBL             = f"{DB}.LOGS_fact_process_log"
@@ -157,7 +141,7 @@ dim_staff     = spark.read.table(DIM_STAFF_TBL).filter("IsCurrent = 1")
 dim_program   = spark.read.table(DIM_PROGRAM_TBL).filter("IsCurrent = 1")
 dim_guarantor = spark.read.table(DIM_GUARANTOR_TBL).filter("IsCurrent = 1")
 
-# CRITICAL FIX: Replaced string "p1.*" with explicit function call object F.col("p1.*")
+# FIXED: Explicit F.col selection layout to preserve metadata evaluation lineage
 part2_df = part1_df.alias("p1") \
     .join(dim_client.alias("dc"), (F.col("p1.PatientID") == F.col("dc.PATID")), "inner") \
     .join(dim_staff.alias("ds"), (F.col("p1.ProviderID") == F.col("ds.EmployeeID")), "left") \
@@ -194,7 +178,7 @@ if spark.catalog.tableExists(TARGET_DELIVERY_TBL):
 else:
     staging_df = part2_df.withColumn("CHANGE_IND", F.lit("NEW")).cache()
 
-# Map the final 3 fact schemas matching your folder-isolated table cuts
+# Map the final 3 fact schemas matching your table boundaries
 final_delivery = staging_df.select(
     F.col("ID").alias("ServiceFactID"), "PatientID", "DateofService", "EPISODE_NUMBER", "Facility", "AdmittedProgram", 
     "DataEntrySource", "DataEntryDate", "DataEntryUser", "AccountingPeriod", "CrisisIndicator", "COPSD", 
@@ -271,7 +255,7 @@ end_count_d = get_row_count(TARGET_DELIVERY_TBL)
 end_count_b = get_row_count(TARGET_BILLING_TBL)
 end_count_i = get_row_count(TARGET_INFO_TBL)
 
-# Constructing native clean types for the log frame rows
+# Constructing native primitive Python int types for tracking protection
 log_rows = [
     (datetime.now(), "dw_fact_ServiceDelivery", int(begin_count_d), 0, int(new_inserts_d), int(change_updates_d), int(change_updates_d), int(del_d), int(end_count_d), 0, ETL_TYPE_FOR_LOG),
     (datetime.now(), "dw_fact_ServiceBilling", int(begin_count_b), 0, int(new_inserts_b), int(change_updates_b), int(change_updates_b), int(del_b), int(end_count_b), 0, ETL_TYPE_FOR_LOG),
@@ -280,7 +264,6 @@ log_rows = [
 
 log_schema = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE"]
 
-# Safely build log data entries
 log_df = spark.createDataFrame(log_rows, log_schema)
 
 if not spark.catalog.tableExists(LOG_TBL):
@@ -288,7 +271,7 @@ if not spark.catalog.tableExists(LOG_TBL):
 else:
     log_df.write.format("delta").mode("append").saveAsTable(LOG_TBL)
 
-# Clean memory allocations out of active RAM
+# Clear computational caches from cluster RAM
 staging_df.unpersist()
 try:
     orphans_df.unpersist()
@@ -298,5 +281,3 @@ except Exception:
     pass
 
 print("Fabric Folder-Based Fact Load Completed Successfully.")
-
-```

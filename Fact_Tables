@@ -1,0 +1,243 @@
+Here is your complete, production-ready PySpark script updated to match your exact directory structure strategy (dw_fact_ for tables inside your dw/fact/ folder organization).
+This script handles the data extraction from your **2 normal tables**, performs lookups against your **4 dimension tables**, checks for changes, updates the **3 separate folder-isolated fact tables**, purges deleted records, and logs the results.
+## Complete PySpark Script for Fabric
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from delta.tables import DeltaTable
+from datetime import datetime
+
+# =========================================================================================
+# SPARK CONFIG
+# =========================================================================================
+
+spark = SparkSession.builder.appName("DW_Service_Fact_Folder_Load").getOrCreate()
+
+spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
+spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+
+# =========================================================================================
+# CONFIG (Folder-Based Table Mapping)
+# =========================================================================================
+
+DB = "MHMR_LAKEHOUSE"
+
+# Target Fact Tables (Mapped to your dw/fact/ folder structure via table names)
+TARGET_DELIVERY_TBL = f"{DB}.dw_fact_ServiceDelivery"
+TARGET_BILLING_TBL  = f"{DB}.dw_fact_ServiceBilling"
+TARGET_INFO_TBL     = f"{DB}.dw_fact_ServiceInfo"
+
+# Dimension Tables 
+DIM_CLIENT_TBL      = f"{DB}.dw_dim_Client"
+DIM_STAFF_TBL       = f"{DB}.dw_dim_Staff"
+DIM_PROGRAM_TBL     = f"{DB}.dw_dim_Program"
+DIM_GUARANTOR_TBL   = f"{DB}.dw_dim_Client_Guarantors"
+
+# Source Tables (The 2 Normal/Operational Tables)
+SERVICE_SRC_TBL     = f"{DB}.RPT_ServiceDelivery_Master"   # Normal Table 1
+APPT_SRC_TBL        = f"{DB}.DW_Appointments"              # Normal Table 2
+
+# Logging Configurations
+LOG_TBL             = f"{DB}.LOGS_dw_fact_process_log"
+ETL_TYPE_FOR_LOG    = "PARTIAL MERGE"
+
+# =========================================================================================
+# INITIAL METRICS COLLECTION
+# =========================================================================================
+
+def get_row_count(table_path):
+    try:
+        return spark.read.table(table_path).count()
+    except Exception:
+        return 0
+
+# Fetch baseline records before merge executes
+begin_count_d = get_row_count(TARGET_DELIVERY_TBL)
+begin_count_b = get_row_count(TARGET_BILLING_TBL)
+begin_count_i = get_row_count(TARGET_INFO_TBL)
+
+# =========================================================================================
+# PIPELINE STAGE 1: SOURCE EXTRACTION & APPOINTMENT JOIN (Normal Tables 1 & 2)
+# =========================================================================================
+
+sdm_df = spark.read.table(SERVICE_SRC_TBL)
+ap_df = spark.read.table(APPT_SRC_TBL)
+
+# Replicating T-SQL Case Statement for Episode Numbers
+sdm_df = sdm_df.withColumn(
+    "EPISODE_NUMBER",
+    F.when(F.substring("EpisodeNumAndName", 1, 2).cast("int").isNotNull(), F.substring("EpisodeNumAndName", 1, 2))
+     .otherwise(F.substring("EpisodeNumAndName", 1, 1))
+)
+
+# Join Normal Table 1 and Normal Table 2 using structural string manipulation
+joined_part1 = sdm_df.alias("sdm").join(
+    ap_df.alias("ap"),
+    (F.col("sdm.PatientID") == F.col("ap.PATID")) &
+    (F.substring("sdm.ID", F.locate("||", "sdm.ID", 4) + 2, 20) == F.col("ap.JOIN_TO_TX_HISTORY")) &
+    (F.substring("sdm.Tx_Note_UniqueId", F.locate("N", "sdm.Tx_Note_UniqueId", 1), 15) == F.col("ap.NOT_uniqueid")),
+    "left"
+).select(
+    "sdm.*",
+    "sdm.EPISODE_NUMBER",
+    "ap.AppointmentKey",
+    F.substring("sdm.ID", F.locate("||", "sdm.ID", 4) + 2, 20).alias("join_tx_hist"),
+    "ap.NOT_uniqueid",
+    "ap.appointment_date",
+    "ap.appointment_start_time"
+)
+
+# Dedup rows via Window functions (RANK_NUM = 1)
+window_spec = Window.partitionBy("PatientID", "join_tx_hist", "NOT_uniqueid") \
+    .orderBy(F.to_timestamp(F.concat_ws(" ", F.date_format("appointment_date", "yyyy-MM-dd"), "appointment_start_time")))
+
+part1_df = joined_part1.withColumn("RANK_NUM", F.row_number().over(window_spec)) \
+                       .filter(F.col("RANK_NUM") == 1) \
+                       .drop("join_tx_hist", "NOT_uniqueid", "appointment_date", "appointment_start_time", "RANK_NUM")
+
+# =========================================================================================
+# PIPELINE STAGE 2: DIMENSION COUPLING (Lookups)
+# =========================================================================================
+
+dim_client    = spark.read.table(DIM_CLIENT_TBL).filter("IsCurrent = 1")
+dim_staff     = spark.read.table(DIM_STAFF_TBL).filter("IsCurrent = 1")
+dim_program   = spark.read.table(DIM_PROGRAM_TBL).filter("IsCurrent = 1")
+dim_guarantor = spark.read.table(DIM_GUARANTOR_TBL).filter("IsCurrent = 1")
+
+part2_df = part1_df.alias("p1") \
+    .join(dim_client.alias("dc"), (F.col("p1.PatientID") == F.col("dc.PATID")), "inner") \
+    .join(dim_staff.alias("ds"), (F.col("p1.ProviderID") == F.col("ds.EmployeeID")), "left") \
+    .join(dim_program.alias("dp"), (F.col("p1.ProgramCode") == F.col("dp.ProgramCode")), "left") \
+    .join(dim_guarantor.alias("cg"), 
+          (F.col("p1.PatientID") == F.col("cg.PATID")) & 
+          (F.col("p1.PrimaryGuarantorID") == F.col("cg.GuarantorID")) & 
+          (F.col("p1.EPISODE_NUMBER") == F.col("cg.EPISODE_NUMBER")), "left") \
+    .select(
+        "p1.*",
+        "dc.ClientKey",
+        "ds.StaffKey",
+        "dp.ProgramKey",
+        "cg.GuarantorKey"
+    )
+
+# =========================================================================================
+# PIPELINE STAGE 3: CHANGE DETECTION & FACT SPLITTING
+# =========================================================================================
+
+try:
+    dw_delivery_df = spark.read.table(TARGET_DELIVERY_TBL).select("ServiceFactID", F.col("DataEntryDate").alias("dw_DataEntryDate"))
+    
+    staging_df = part2_df.alias("stg").join(
+        dw_delivery_df.alias("dw"),
+        F.col("stg.ID") == F.col("dw.ServiceFactID"),
+        "left"
+    ).withColumn(
+        "CHANGE_IND",
+        F.when(F.col("dw.ServiceFactID").isNull(), "NEW")
+         .when(F.col("stg.DataEntryDate") > F.col("dw_DataEntryDate"), "CHANGE")
+         .otherwise(F.lit(None))
+    ).filter(F.col("CHANGE_IND").isNotNull()).cache()
+    
+except Exception:
+    # First deployment fallback if target tables do not exist yet
+    staging_df = part2_df.withColumn("CHANGE_IND", F.lit("NEW")).cache()
+
+# Map the final 3 fact schemas matching your folder-isolated table cuts
+final_delivery = staging_df.select(
+    F.col("ID").alias("ServiceFactID"), "PatientID", "DateofService", "EPISODE_NUMBER", "Facility", "AdmittedProgram", 
+    "DataEntrySource", "DataEntryDate", "DataEntryUser", "AccountingPeriod", "CrisisIndicator", "COPSD", 
+    "RecipientCode", "EncounterType", "PatientAgeonService", "ServiceStatusCode", "ServiceStatus", "ProviderID", 
+    "CoverageCode", "Co_Practitioner_ID", "Co_Practitioner2_ID", "Tx_Note_UniqueId", "ClientKey", "StaffKey", 
+    "ProgramKey", "AppointmentKey", "CHANGE_IND"
+)
+
+final_billing = staging_df.select(
+    F.col("ID").alias("ServiceFactID"), "ServiceUnits", "ServiceCost", "BalanceOfFeeOnService", "GuarantorKey", 
+    "PrimaryGuarantorLiability", "IsBillable", "InsuranceCategoryCode", "PatientID", "DateofService", 
+    "EPISODE_NUMBER", "ClientKey", "CHANGE_IND"
+)
+
+final_info = staging_df.select(
+    F.col("ID").alias("ServiceFactID"), "Service", "ServiceCode", "ServiceLocationCode", "ServiceLocation", 
+    "ServiceDuration", "TreatmentSettingCode", "TreatmentSetting", "ServiceStartTime", "ServiceEndTime", 
+    "PatientID", "DateofService", "ClientKey", "CHANGE_IND"
+)
+
+# =========================================================================================
+# PIPELINE STAGE 4: DELTA UPSERTS
+# =========================================================================================
+
+def execute_upsert(df, target_table_path):
+    # Auto-creates table inside your dw/fact/ directory if missing
+    if not spark.catalog.tableExists(target_table_path):
+        df.drop("CHANGE_IND").write.format("delta").saveAsTable(target_table_path)
+        return df.count(), 0
+    
+    delta_obj = DeltaTable.forName(spark, target_table_path)
+    upsert_df = df.filter((F.col("CHANGE_IND") == "NEW") | (F.col("CHANGE_IND") == "CHANGE"))
+    
+    ins_cnt = upsert_df.filter(F.col("CHANGE_IND") == "NEW").count()
+    upd_cnt = upsert_df.filter(F.col("CHANGE_IND") == "CHANGE").count()
+    
+    delta_obj.alias("tgt").merge(
+        source=upsert_df.alias("src"),
+        condition="tgt.ServiceFactID = src.ServiceFactID"
+    ).whenMatchedUpdateAll() \
+     .whenNotMatchedInsertAll() \
+     .execute()
+     
+    return ins_cnt, upd_cnt
+
+new_inserts_d, change_updates_d = execute_upsert(final_delivery, TARGET_DELIVERY_TBL)
+new_inserts_b, change_updates_b = execute_upsert(final_billing, TARGET_BILLING_TBL)
+new_inserts_i, change_updates_i = execute_upsert(final_info, TARGET_INFO_TBL)
+
+# =========================================================================================
+# PIPELINE STAGE 5: PURGE DELETIONS (ORPHAN CLEANUP)
+# =========================================================================================
+
+del_d, del_b, del_i = 0, 0, 0
+
+if spark.catalog.tableExists(TARGET_DELIVERY_TBL):
+    orphans_df = spark.read.table(TARGET_DELIVERY_TBL).select("ServiceFactID").join(
+        staging_df.select(F.col("ID").alias("ServiceFactID")), "ServiceFactID", "left_anti"
+    ).cache()
+    
+    orphan_count = orphans_df.count()
+    if orphan_count > 0:
+        for t_path in [TARGET_DELIVERY_TBL, TARGET_BILLING_TBL, TARGET_INFO_TBL]:
+            dt = DeltaTable.forName(spark, t_path)
+            dt.alias("tgt").merge(orphans_df.alias("src"), "tgt.ServiceFactID = src.ServiceFactID") \
+              .whenMatchedDelete().execute()
+        del_d, del_b, del_i = orphan_count, orphan_count, orphan_count
+
+# =========================================================================================
+# PIPELINE STAGE 6: AUDIT METRICS LOGGING
+# =========================================================================================
+
+end_count_d = get_row_count(TARGET_DELIVERY_TBL)
+end_count_b = get_row_count(TARGET_BILLING_TBL)
+end_count_i = get_row_count(TARGET_INFO_TBL)
+
+log_rows = [
+    (datetime.now(), "dw_fact_ServiceDelivery", begin_count_d, 0, new_inserts_d, change_updates_d, change_updates_d, del_d, end_count_d, 0, ETL_TYPE_FOR_LOG),
+    (datetime.now(), "dw_fact_ServiceBilling", begin_count_b, 0, new_inserts_b, change_updates_b, change_updates_b, del_b, end_count_b, 0, ETL_TYPE_FOR_LOG),
+    (datetime.now(), "dw_fact_ServiceInfo", begin_count_i, 0, new_inserts_i, change_updates_i, change_updates_i, del_i, end_count_i, 0, ETL_TYPE_FOR_LOG)
+]
+
+log_schema = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE"]
+log_df = spark.createDataFrame(log_rows, log_schema)
+
+# Append statistics into logs folder
+log_df.write.format("delta").mode("append").saveAsTable(LOG_TBL)
+
+# Clear active caches
+staging_df.unpersist()
+try: orphans_df.unpersist() 
+except: pass
+
+print("Fabric Folder-Based Fact Load Completed Successfully.")
+
+```

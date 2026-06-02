@@ -1,19 +1,4 @@
-Ah, now that you shared the full PySpark stack traceback error log, the true cause of your issue is finally fully visible!
-The traceback shows that the crash is happening directly inside **Stage 1 (on Line 86)**, specifically inside the **F.substring()** function:
-```python
----> 86     F.substring(
-     87         F.col("ID"),
-     88         F.locate("||", F.col("ID"), 4) + F.lit(2),  # start position
 
-```
-### The Root Cause
-In PySpark, the F.substring(str, pos, len) function **does not accept a Spark Column object** for its second (pos) and third (len) arguments. They **must be native Python integers** (like 2 and 20).
-Because your script passed a dynamic math expression (F.locate(...) + F.lit(2)) as the position parameter, PySpark tried to convert the math graph using an internal list converter (ListConverter.convert). Since a Column expression cannot be looped or iterated over, it thrown the **[NOT_ITERABLE] Column is not iterable** validation failure.
-To resolve this completely while honoring your explicit warehouse requirement that all variables match standard database naming structures, we can shift this complex string parsing logic out of F.substring and use native Spark SQL syntax instead.
-### The Final, Definitive Solution Script
-Here is your updated, fully working script. It resolves the substring argument error using clean SQL expressions, corrects your dimension paths, and keeps your logging variables pristine.
-Clear out all cells in your notebook, paste this exact block into a single cell, and click **Run All**:
-```python
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
@@ -307,4 +292,3 @@ except Exception:
 
 print("Fabric Folder-Based Fact Load Completed Successfully.")
 
-```

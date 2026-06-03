@@ -246,10 +246,10 @@ try:
     # --------------------------------------------------------
     # Identify Deleted / Orphan Records (#DELETED)
     # --------------------------------------------------------
-    # Matches T-SQL exactly: Active rows in DW missing from incoming active set
+    # FIXED: Added .alias("COMP") here to ensure reference identity resolution passes
     deleted_current_df = (
         current_target_df.join(
-            compare_df,
+            compare_df.alias("COMP"),
             on=[
                 F.col("DCG.PATID") == F.col("COMP.PATID"),
                 F.col("DCG.EPISODE_NUMBER") == F.col("COMP.EPISODE_NUMBER"),

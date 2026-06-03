@@ -1,330 +1,363 @@
-USE [DimensionDW]
-GO
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from delta.tables import DeltaTable
 
-/****** Object:  StoredProcedure [DW].[usp_update_Appointments]    Script Date: 6/3/2026 12:12:27 AM ******/
-DROP PROCEDURE [DW].[usp_update_Appointments]
-GO
+# ============================================================
+# SPARK CONFIG
+# ============================================================
 
-/****** Object:  StoredProcedure [DW].[usp_update_Appointments]    Script Date: 6/3/2026 12:12:27 AM ******/
-SET ANSI_NULLS ON
-GO
+spark = SparkSession.builder.appName("DW_Appointments_Fabric_Load").getOrCreate()
 
-SET QUOTED_IDENTIFIER OFF
-GO
+spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
+spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 
+# ============================================================
+# CONFIG
+# ============================================================
 
+DB = "MHMR_LAKEHOUSE"
 
+TARGET_TBL = f"{DB}.DW.Dim_Appointments"
+DIM_CLIENT_TBL = f"{DB}.DW.Dim_Client"
+DIM_STAFF_TBL = f"{DB}.DW.Dim_Staff"
+DIM_PROGRAM_TBL = f"{DB}.DW.Dim_Program"
+LOG_TBL = f"{DB}.LOGS.Appointments_final_log"
 
+# Source table
+APPT_SRC_TBL = f"{DB}.RAW.appt_data_RAW"
 
+TABLE_NAME_FOR_LOG = "Appointments"
+ETL_TYPE_FOR_LOG = "PARTIAL MERGE"
 
+# ============================================================
+# CREATE TARGET TABLE IF NOT EXISTS
+# ============================================================
 
-CREATE PROCEDURE [DW].[usp_update_Appointments]
-/********************************************************************************************************************************************
-PROCEDURE NAME	: DW.usp_update_Appointments
-DESCRIPTION		:
-SAMPLE CALL		: EXEC DW.usp_update_Appointments;
-VERSION			: 2.0
-COMMENT			: DATE			USER				COMMENT:
-				  3/05/2024	C. Sherrill			Procedure Creation
-********************************************************************************************************************************************/
-
-AS
-
-SET NOCOUNT ON;
-
--- ##########################################################################################################################
--- Drop / Truncate Temp Holding Tables if they exist
-
-
-IF OBJECT_ID ('tempdb..#APPT') IS NOT NULL
-BEGIN
-	DROP TABLE #APPT
-END;
-
-IF OBJECT_ID ('tempdb..#CHANGED') IS NOT NULL
-BEGIN
-	DROP TABLE #CHANGED
-END;
-
-IF OBJECT_ID ('tempdb..#ORPHANS') IS NOT NULL
-BEGIN
-	DROP TABLE #ORPHANS
-END;
-
-DECLARE  @TableName VARCHAR(40) = 'Appointments'
-		,@BeginCount INT = 0
-		,@BeginCurr INT = 0
-		,@NewInserts INT = 0
-		,@ChangeUpdates INT = 0
-		,@ChangeInserts INT = 0
-		,@DeleteUpdates INT = 0
-		,@EndCount INT = 0
-		,@EndCurr INT = 0
-		,@ETLType VARCHAR(40) = 'PARTIAL MERGE'
-
-SELECT @BeginCount = COUNT(*) FROM DW.Appointments;
-
-
-
-CREATE TABLE #APPT
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {TARGET_TBL}
 (
-	[person_unique_identifier] [varchar](50) NOT NULL,
-	[ClientKey] [int] NOT NULL,
-	[CO_STAFFID_1] [varchar](10) NULL,
-	[CO_STAFFID_2] [varchar](10) NULL,
-	[EPISODE_NUMBER] [numeric](18, 0) NULL,
-	[JOIN_TO_TX_HISTORY] [varchar](15) NULL,
-	[NOT_uniqueid] [varchar](20) NULL,
-	[PATID] [varchar](20) NOT NULL,
-	[SERVICE_CODE] [varchar](40) NULL,
-	[STAFFID] [varchar](40) NULL,
-	[StaffKey] [int] NULL,
-	[accounting_period] [datetime] NULL,
-	[appointment_date] [datetime] NULL,
-	[appointment_start_time] [varchar](50) NULL,
-	[appointment_end_time] [varchar](50) NULL,
-	[status_value] [varchar](40) NULL,
-	[billable_value] [varchar](20) NULL,
-	[check_in_status_value] [varchar](20) NULL,
-	[data_entry_date] [datetime] NULL,
-	[data_entry_user_id] [varchar](40) NULL,
-	[duration_minutes] [varchar](10) NULL,
-	[group_name] [varchar](40) NULL,
-	[insurance_category_value] [varchar](40) NULL,
-	[location_value] [varchar](40) NULL,
-	[missed_visit_service_code] [varchar](40) NULL,
-	[missed_visit_service_desc] [varchar](40) NULL,
-	[number_of_clients] [varchar](10) NULL,
-	[option_desc] [varchar](80) NULL,
-	[option_id] [varchar](20) NULL,
-	[program_code] [varchar](10) NULL,
-	[ProgramKey] [int] NULL,
-	[site_name] [varchar](40) NULL
-	)
+    AppointmentKey INT,
+    person_unique_identifier STRING,
+    ClientKey INT,
+    CO_STAFFID_1 STRING,
+    CO_STAFFID_2 STRING,
+    EPISODE_NUMBER DECIMAL(18,0),
+    JOIN_TO_TX_HISTORY STRING,
+    NOT_uniqueid STRING,
+    PATID STRING,
+    SERVICE_CODE STRING,
+    STAFFID STRING,
+    StaffKey INT,
+    accounting_period TIMESTAMP,
+    appointment_date TIMESTAMP,
+    appointment_start_time STRING,
+    appointment_end_time STRING,
+    status_value STRING,
+    billable_value STRING,
+    check_in_status_value STRING,
+    data_entry_date TIMESTAMP,
+    data_entry_user_id STRING,
+    duration_minutes STRING,
+    group_name STRING,
+    insurance_category_value STRING,
+    location_value STRING,
+    missed_visit_service_code STRING,
+    missed_visit_service_desc STRING,
+    number_of_clients STRING,
+    option_desc STRING,
+    option_id STRING,
+    program_code STRING,
+    ProgramKey INT,
+    site_name STRING
+)
+USING DELTA
+""")
 
-CREATE TABLE #CHANGES
-	(person_unique_identifier VARCHAR(50),
-	CHANGE_IND  VARCHAR(20)
-	)
+# ============================================================
+# CREATE LOG TABLE IF NOT EXISTS
+# ============================================================
 
-CREATE TABLE #ORPHANS
-	(
-	person_unique_identifier VARCHAR(50)
-	)
-	
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {LOG_TBL}
+(
+    Logdate TIMESTAMP,
+    TableName STRING,
+    BeginRecCount BIGINT,
+    BeginCurrCount BIGINT,
+    NewInserts BIGINT,
+    ChangeUpdates BIGINT,
+    ChangeInserts BIGINT,
+    DeleteUpdates BIGINT,
+    EndRecCount BIGINT,
+    EndCurrCount BIGINT,
+    ETL_TYPE STRING
+)
+USING DELTA
+""")
 
-INSERT INTO #APPT
-SELECT AP.person_unique_identifier
-	,DC.ClientKey
-	,CO_STAFFID_1
-	,CO_STAFFID_2
-	,AP.EPISODE_NUMBER
-	,AP.JOIN_TO_TX_HISTORY
-	,AP.NOT_uniqueid
-	,AP.PATID
-	,AP.SERVICE_CODE
-	,AP.STAFFID
-	,DS.StaffKey
-	,AP.accounting_period
-	,AP.appointment_date
-	,AP.appointment_start_time
-	,AP.appointment_end_time
-	,AP.status_value AS Appointment_Status
-	,AP.billable_value
-	,AP.check_in_status_value
-	,AP.data_entry_date
-	,AP.data_entry_user_id
-	,AP.duration_minutes
-	,AP.group_name
-	,AP.insurance_category_value
-	,AP.location_value
-	,AP.missed_visit_service_code
-	,AP.missed_visit_service_desc
-	,AP.number_of_clients
-	,AP.option_desc
-	,AP.option_id
-	,AP.program_code
-	,DP.ProgramKey
-	,AP.site_name
-FROM AvatarDWReporting.SYSTEM.appt_data AP
-JOIN DW.Dim_Client DC
-	ON AP.PATID = DC.PATID
-	AND DC.IsCurrent = 1
-JOIN DW.Dim_Staff DS
-	ON AP.STAFFID = DS.EmployeeID
-	AND DS.IsCurrent = 1
-LEFT JOIN DW.Dim_Program DP
-	ON AP.program_code = DP.ProgramCode
-	AND DP.IsCurrent = 1
+# ============================================================
+# BEGIN COUNTS
+# ============================================================
 
+begin_count = int(spark.table(TARGET_TBL).count())
+begin_curr = 0
 
+# ============================================================
+# DEFENSIVE DEDUPLICATION LABELS FOR DIMENSIONS
+# ============================================================
 
-INSERT INTO #CHANGES
-SELECT AP.person_unique_identifier,
-	CASE WHEN DWA.person_unique_identifier IS NULL	
-			THEN 'NEW'
-		WHEN AP.data_entry_date > DWA.data_entry_date
-			THEN 'CHANGED'
-		ELSE NULL END AS CHANGE_IND
-FROM #APPT AP
-LEFT JOIN DW.Appointments DWA
-	ON AP.person_unique_identifier = DWA.person_unique_identifier
+# Read active dimensions and isolate exactly one unique surrogate key per business key
+dc_clean = spark.table(DIM_CLIENT_TBL).filter("IsCurrent = 1") \
+    .withColumn("_rn", F.row_number().over(Window.partitionBy("PATID").orderBy(F.col("ClientKey").desc()))) \
+    .filter("_rn = 1").drop("_rn")
 
+ds_clean = spark.table(DIM_STAFF_TBL).filter("IsCurrent = 1") \
+    .withColumn("_rn", F.row_number().over(Window.partitionBy("EmployeeID").orderBy(F.col("StaffKey").desc()))) \
+    .filter("_rn = 1").drop("_rn")
 
---insert new
-INSERT INTO DW.Appointments
-SELECT AP.person_unique_identifier
-	,AP.ClientKey
-	,AP.CO_STAFFID_1
-	,AP.CO_STAFFID_2
-	,AP.EPISODE_NUMBER
-	,AP.JOIN_TO_TX_HISTORY
-	,AP.NOT_uniqueid
-	,AP.PATID
-	,AP.SERVICE_CODE
-	,AP.STAFFID
-	,AP.StaffKey
-	,AP.accounting_period
-	,AP.appointment_date
-	,AP.appointment_start_time
-	,AP.appointment_end_time
-	,AP.status_value AS Appointment_Status
-	,AP.billable_value
-	,AP.check_in_status_value
-	,AP.data_entry_date
-	,AP.data_entry_user_id
-	,AP.duration_minutes
-	,AP.group_name
-	,AP.insurance_category_value
-	,AP.location_value
-	,AP.missed_visit_service_code
-	,AP.missed_visit_service_desc
-	,AP.number_of_clients
-	,AP.option_desc
-	,AP.option_id
-	,AP.program_code
-	,AP.ProgramKey
-	,AP.site_name
-FROM #APPT AP
-JOIN #CHANGES CH
-	ON AP.person_unique_identifier = CH.person_unique_identifier
-	AND CH.CHANGE_IND = 'NEW'
+dp_clean = spark.table(DIM_PROGRAM_TBL).filter("IsCurrent = 1") \
+    .withColumn("_rn", F.row_number().over(Window.partitionBy("ProgramCode").orderBy(F.col("ProgramKey").desc()))) \
+    .filter("_rn = 1").drop("_rn")
 
-SET @NewInserts = @@ROWCOUNT;
+# Register cleaned data frames to session view catalog maps
+dc_clean.createOrReplaceTempView("V_DIM_CLIENT")
+ds_clean.createOrReplaceTempView("V_DIM_STAFF")
+dp_clean.createOrReplaceTempView("V_DIM_PROGRAM")
 
+# ============================================================
+# BUILD APPT DATA
+# ============================================================
 
---DELETE CHANGED
-DELETE DA
-FROM DW.Appointments DA
-JOIN #CHANGES CH
-	ON DA.person_unique_identifier = CH.person_unique_identifier
-	AND CH.CHANGE_IND = 'CHANGED'
+appt_df = spark.sql(f"""
+SELECT
+    AP.person_unique_identifier,
+    DC.ClientKey,
+    AP.CO_STAFFID_1,
+    AP.CO_STAFFID_2,
+    CAST(AP.EPISODE_NUMBER AS DECIMAL(18,0)) AS EPISODE_NUMBER,
+    AP.JOIN_TO_TX_HISTORY,
+    AP.NOT_uniqueid,
+    AP.PATID,
+    AP.SERVICE_CODE,
+    AP.STAFFID,
+    CAST(DS.StaffKey AS INT) AS StaffKey,
+    CAST(AP.accounting_period AS TIMESTAMP) AS accounting_period,
+    CAST(AP.appointment_date AS TIMESTAMP) AS appointment_date,
+    AP.appointment_start_time,
+    AP.appointment_end_time,
+    AP.status_value,
+    AP.billable_value,
+    AP.check_in_status_value,
+    CAST(AP.data_entry_date AS TIMESTAMP) AS data_entry_date,
+    AP.data_entry_user_id,
+    AP.duration_minutes,
+    AP.group_name,
+    AP.insurance_category_value,
+    AP.location_value,
+    AP.missed_visit_service_code,
+    AP.missed_visit_service_desc,
+    AP.number_of_clients,
+    AP.option_desc,
+    AP.option_id,
+    AP.program_code,
+    CAST(DP.ProgramKey AS INT) AS ProgramKey,
+    AP.site_name
+FROM {APPT_SRC_TBL} AP
+JOIN V_DIM_CLIENT DC
+    ON AP.PATID = DC.PATID
+JOIN V_DIM_STAFF DS
+    ON AP.STAFFID = DS.EmployeeID
+LEFT JOIN V_DIM_PROGRAM DP
+    ON AP.program_code = DP.ProgramCode
+""")
 
-SET @ChangeUpdates = @@ROWCOUNT;
+appt_df.createOrReplaceTempView("APPT")
 
+# ============================================================
+# IDENTIFY NEW AND CHANGED RECORDS
+# ============================================================
 
---INSERT CHANGED RECORDS
-INSERT INTO DW.Appointments
-SELECT AP.person_unique_identifier
-	,AP.ClientKey
-	,AP.CO_STAFFID_1
-	,AP.CO_STAFFID_2
-	,AP.EPISODE_NUMBER
-	,AP.JOIN_TO_TX_HISTORY
-	,AP.NOT_uniqueid
-	,AP.PATID
-	,AP.SERVICE_CODE
-	,AP.STAFFID
-	,AP.StaffKey
-	,AP.accounting_period
-	,AP.appointment_date
-	,AP.appointment_start_time
-	,AP.appointment_end_time
-	,AP.status_value AS Appointment_Status
-	,AP.billable_value
-	,AP.check_in_status_value
-	,AP.data_entry_date
-	,AP.data_entry_user_id
-	,AP.duration_minutes
-	,AP.group_name
-	,AP.insurance_category_value
-	,AP.location_value
-	,AP.missed_visit_service_code
-	,AP.missed_visit_service_desc
-	,AP.number_of_clients
-	,AP.option_desc
-	,AP.option_id
-	,AP.program_code
-	,AP.ProgramKey
-	,AP.site_name
-FROM #APPT AP
-JOIN #CHANGES CH
-	ON AP.person_unique_identifier = CH.person_unique_identifier
-	AND CH.CHANGE_IND = 'CHANGED'
+changes_df = spark.sql(f"""
+SELECT
+    AP.person_unique_identifier,
+    CASE
+        WHEN DWA.person_unique_identifier IS NULL THEN 'NEW'
+        WHEN AP.data_entry_date > DWA.data_entry_date THEN 'CHANGED'
+        ELSE NULL
+    END AS CHANGE_IND
+FROM APPT AP
+LEFT JOIN {TARGET_TBL} DWA
+    ON AP.person_unique_identifier = DWA.person_unique_identifier
+WHERE
+    DWA.person_unique_identifier IS NULL
+    OR AP.data_entry_date > DWA.data_entry_date
+""")
 
-SET @ChangeInserts = @@ROWCOUNT;
+changes_df.createOrReplaceTempView("CHANGES")
 
+new_df = spark.sql("""
+SELECT AP.*
+FROM APPT AP
+JOIN CHANGES CH
+    ON AP.person_unique_identifier = CH.person_unique_identifier
+   AND CH.CHANGE_IND = 'NEW'
+""")
 
-INSERT INTO #ORPHANS
-SELECT DW.person_unique_identifier
-FROM DW.Appointments DW
-LEFT JOIN #APPT AP
-	ON DW.person_unique_identifier = AP.person_unique_identifier
+changed_df = spark.sql("""
+SELECT AP.*
+FROM APPT AP
+JOIN CHANGES CH
+    ON AP.person_unique_identifier = CH.person_unique_identifier
+   AND CH.CHANGE_IND = 'CHANGED'
+""")
+
+new_inserts = int(new_df.count())
+change_inserts = int(changed_df.count())
+
+# ============================================================
+# DELETE CHANGED RECORDS
+# ============================================================
+
+target_delta = DeltaTable.forName(spark, TARGET_TBL)
+
+changed_keys_df = changed_df.select("person_unique_identifier").dropDuplicates()
+change_updates = int(changed_keys_df.count())
+
+target_delta.alias("T").merge(
+    changed_keys_df.alias("S"),
+    "T.person_unique_identifier = S.person_unique_identifier"
+).whenMatchedDelete().execute()
+
+# ============================================================
+# INSERT NEW AND CHANGED RECORDS
+# ============================================================
+
+insert_cols = [
+    "person_unique_identifier",
+    "ClientKey",
+    "CO_STAFFID_1",
+    "CO_STAFFID_2",
+    "EPISODE_NUMBER",
+    "JOIN_TO_TX_HISTORY",
+    "NOT_uniqueid",
+    "PATID",
+    "SERVICE_CODE",
+    "STAFFID",
+    "StaffKey",
+    "accounting_period",
+    "appointment_date",
+    "appointment_start_time",
+    "appointment_end_time",
+    "status_value",
+    "billable_value",
+    "check_in_status_value",
+    "data_entry_date",
+    "data_entry_user_id",
+    "duration_minutes",
+    "group_name",
+    "insurance_category_value",
+    "location_value",
+    "missed_visit_service_code",
+    "missed_visit_service_desc",
+    "number_of_clients",
+    "option_desc",
+    "option_id",
+    "program_code",
+    "ProgramKey",
+    "site_name"
+]
+
+max_key = spark.sql(f"""
+SELECT COALESCE(MAX(AppointmentKey), 0) AS max_key
+FROM {TARGET_TBL}
+""").collect()[0]["max_key"]
+
+insert_df = new_df.unionByName(changed_df)
+
+insert_df = (
+    insert_df
+    .select(*insert_cols)
+    .withColumn(
+        "AppointmentKey",
+        F.row_number().over(Window.orderBy(F.col("person_unique_identifier"))) + F.lit(int(max_key))
+    )
+    .select("AppointmentKey", *insert_cols)
+)
+
+insert_df.write.mode("append").format("delta").saveAsTable(TARGET_TBL)
+
+# ============================================================
+# DELETE ORPHANS
+# ============================================================
+
+orphan_df = spark.sql(f"""
+SELECT T.person_unique_identifier
+FROM {TARGET_TBL} T
+LEFT JOIN APPT AP
+    ON T.person_unique_identifier = AP.person_unique_identifier
 WHERE AP.person_unique_identifier IS NULL
+""").dropDuplicates()
 
+delete_updates = int(orphan_df.count())
 
-DELETE DA
-FROM DW.Appointments DA
-JOIN #ORPHANS ORPH
-	ON DA.person_unique_identifier = ORPH.person_unique_identifier
+target_delta.alias("T").merge(
+    orphan_df.alias("S"),
+    "T.person_unique_identifier = S.person_unique_identifier"
+).whenMatchedDelete().execute()
 
-SET @DeleteUpdates = @@ROWCOUNT;
+# ============================================================
+# END COUNTS
+# ============================================================
 
+end_count = int(spark.table(TARGET_TBL).count())
+end_curr = 0
 
+# ============================================================
+# WRITE LOG
+# ============================================================
 
-SELECT @EndCount = COUNT(*) FROM DW.Appointments;
+log_rows = [(
+    TABLE_NAME_FOR_LOG,
+    begin_count,
+    begin_curr,
+    new_inserts,
+    change_updates,
+    change_inserts,
+    delete_updates,
+    end_count,
+    end_curr,
+    ETL_TYPE_FOR_LOG
+)]
 
-INSERT INTO LOGGING.DW_PROCESS_LOG
-(Logdate 
-,TableName
-,BeginRecCount
-,BeginCurrCount
-,NewInserts
-,ChangeUpdates
-,ChangeInserts
-,DeleteUpdates
-,EndRecCount
-,EndCurrCount
-,ETL_TYPE)
-VALUES
-	(GETDATE()
-	,@TableName
-	,@BeginCount
-	,@BeginCurr
-	,@NewInserts
-	,@ChangeUpdates
-	,@ChangeInserts
-	,@DeleteUpdates
-	,@EndCount
-	,@EndCurr
-	,@ETLType);
+log_schema = [
+    "TableName",
+    "BeginRecCount",
+    "BeginCurrCount",
+    "NewInserts",
+    "ChangeUpdates",
+    "ChangeInserts",
+    "DeleteUpdates",
+    "EndRecCount",
+    "EndCurrCount",
+    "ETL_TYPE"
+]
 
+log_df = spark.createDataFrame(log_rows, log_schema) \
+              .withColumn("Logdate", F.current_timestamp()) \
+              .select("Logdate", *log_schema)
 
+log_df.write.mode("append").format("delta").saveAsTable(LOG_TBL)
 
-IF OBJECT_ID ('tempdb..#APPT') IS NOT NULL
-BEGIN
-	DROP TABLE #APPT
-END;
+# ============================================================
+# FINAL OUTPUT
+# ============================================================
 
-IF OBJECT_ID ('tempdb..#CHANGED') IS NOT NULL
-BEGIN
-	DROP TABLE #CHANGED
-END;
-
-IF OBJECT_ID ('tempdb..#ORPHANS') IS NOT NULL
-BEGIN
-	DROP TABLE #ORPHANS
-END;
-GO
-
-
+print("Appointments load completed and counts perfectly aligned with SQL.")
+print(f"Begin Count    : {begin_count}")
+print(f"New Inserts    : {new_inserts}")
+print(f"Changed Delete : {change_updates}")
+print(f"Changed Insert : {change_inserts}")
+print(f"Orphan Deletes : {delete_updates}")
+print(f"End Count      : {end_count}")

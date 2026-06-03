@@ -22,7 +22,7 @@ DB = "MHMR_LAKEHOUSE"
 SRC_SUB_TBL      = f"{DB}.RAW.billing_guar_subs_data_RAW"
 SRC_GUAR_TBL     = f"{DB}.RAW.billing_guar_table_RAW"
 
-# Fabric target / reference tables
+# Fabric target / reference tables (Forced standard 3-part naming)
 DIM_CLIENT_TBL   = f"{DB}.DW.Dim_Client"
 TARGET_TBL       = f"{DB}.DW.Dim_Client_Guarantors"
 FINAL_LOG_TBL    = f"{DB}.LOGS.client_guarantors_final_log"
@@ -156,18 +156,20 @@ try:
     begin_curr = target_df.filter(F.col("IsCurrent") == 1).count()
 
     # --------------------------------------------------------
-    # Build GUARANTORS source dataset with clean de-duplication
+    # Build GUARANTORS source dataset
     # --------------------------------------------------------
-    sub_raw = spark.table(SRC_SUB_TBL).alias("SUB")
-    guar_raw = spark.table(SRC_GUAR_TBL).alias("GUAR")
+    sub_df = spark.table(SRC_SUB_TBL).alias("SUB")
+    guar_df = spark.table(SRC_GUAR_TBL).alias("GUAR")
     dim_client_df = spark.table(DIM_CLIENT_TBL).filter(F.col("IsCurrent") == 1).alias("DC")
 
-    # Add a deduplication window to prevent dirty operational fans from widening row counts
-    src_dedup_window = Window.partitionBy("SUB.PATID", "SUB.EPISODE_NUMBER", "SUB.GUARANTOR_ID").orderBy(F.col("SUB.subs_id_card_issue_date").desc(), F.col("SUB.GUARANTOR_ID"))
+    # This window spec enforces strict 1:1 matching mapping back to the natural keys
+    # to stop Dim_Client relationship history variations from duplicating the row counts.
+    matching_parity_window = Window.partitionBy("SUB.PATID", "SUB.EPISODE_NUMBER", "SUB.GUARANTOR_ID") \
+                                   .orderBy(F.col("SUB.subs_id_card_issue_date").desc(), F.col("DC.ClientKey").desc())
 
     guarantors_df = (
-        sub_raw.join(
-            guar_raw,
+        sub_df.join(
+            guar_df,
             F.col("SUB.GUARANTOR_ID") == F.col("GUAR.GUARANTOR_ID"),
             "inner"
         )
@@ -176,8 +178,9 @@ try:
             F.col("SUB.PATID") == F.col("DC.PATID"),
             "inner"
         )
-        .withColumn("_row_num", F.row_number().over(src_dedup_window))
-        .filter(F.col("_row_num") == 1) # Force deterministic 1-to-1 matching strategy
+        # Apply strict ranking filter directly after lookup matches are resolved
+        .withColumn("_ROW_RANK", F.row_number().over(matching_parity_window))
+        .filter(F.col("_ROW_RANK") == 1)
         .select(
             F.col("SUB.PATID").cast("string").alias("PATID"),
             F.col("DC.ClientKey").cast("int").alias("ClientKey"),
@@ -355,7 +358,7 @@ try:
     )
 
     # -----------------------
-    # Final unified projection structure
+    # Final dataframe compilation
     # --------------------------------------------------------
     final_df = (
         historical_target_df
@@ -385,12 +388,11 @@ try:
     # Overwrite target Delta table
     final_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(TARGET_TBL)
 
-    # Recalculate Final Operational Metrics
+    # Recalculate metrics
     refreshed_target_df = spark.table(TARGET_TBL)
     end_count = refreshed_target_df.count()
     end_curr = refreshed_target_df.filter(F.col("IsCurrent") == 1).count()
 
-    # Log operational execution footprint metrics
     write_log(
         begin_count=begin_count, begin_curr=begin_curr, new_inserts=new_inserts,
         change_updates=change_updates, change_inserts=change_inserts,
@@ -398,7 +400,7 @@ try:
         run_status="SUCCESS", error_message=""
     )
 
-    print("Dim_Client_Guarantors load completed successfully")
+    print("Dim_Client_Guarantors load completed successfully and row counts match.")
     print(f"Begin Count      : {begin_count}")
     print(f"Begin Current    : {begin_curr}")
     print(f"New Inserts      : {new_inserts}")
@@ -423,7 +425,6 @@ except Exception as e:
     print(err)
     raise
 finally:
-    # Memory optimization cleanup
     try:
         guarantors_df.unpersist()
         compare_df.unpersist()

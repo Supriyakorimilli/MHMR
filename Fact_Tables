@@ -98,7 +98,6 @@ def write_log(begin_count, begin_curr, new_inserts, change_updates, change_inser
     df = spark.createDataFrame(log_row, schema=log_schema).withColumn("Logdate", F.current_timestamp())
     df.write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
 
-# Replicating T-SQL CONCAT behavior exactly (No delimiters, NULLs become empty strings)
 def build_sql_concat_string(df_alias_prefix=""):
     p = f"{df_alias_prefix}." if df_alias_prefix else ""
     return F.concat(
@@ -110,33 +109,10 @@ def build_sql_concat_string(df_alias_prefix=""):
     )
 
 # ============================================================
-# Create target table if not exists
+# Main logic execution
 # ============================================================
-if not table_exists(TARGET_TBL):
-    target_schema = StructType([
-        StructField("GuarantorKey", LongType(), False),
-        StructField("PATID", StringType(), False),
-        StructField("ClientKey", IntegerType(), False),
-        StructField("EPISODE_NUMBER", LongType(), False),
-        StructField("GuarantorID", StringType(), False),
-        StructField("GuarantorName", StringType(), True),
-        StructField("FinancialClass", StringType(), True),
-        StructField("SubscriberName", StringType(), True),
-        StructField("ClientRelationToSub", StringType(), True),
-        StructField("SubsPolicy", StringType(), True),
-        StructField("SubsReleaseInfoCode", StringType(), True),
-        StructField("SubsIDCardIssueDate", DateType(), True),
-        StructField("SCD_Start_Date", TimestampType(), True),
-        StructField("SCD_End_Date", TimestampType(), True),
-        StructField("IsCurrent", IntegerType(), True)
-    ])
-    spark.createDataFrame([], target_schema).write.format("delta").mode("overwrite").saveAsTable(TARGET_TBL)
-
 create_log_table_if_not_exists()
 
-# ============================================================
-# Main logic
-# ============================================================
 begin_count = 0
 begin_curr = 0
 new_inserts = 0
@@ -147,20 +123,14 @@ end_count = 0
 end_curr = 0
 
 try:
-    # --------------------------------------------------------
-    # Beginning counts
-    # --------------------------------------------------------
     target_df = spark.table(TARGET_TBL)
     begin_count = target_df.count()
     begin_curr = target_df.filter(F.col("IsCurrent") == 1).count()
 
-    # --------------------------------------------------------
-    # Build GUARANTORS source dataset (#GUARANTORS)
-    # --------------------------------------------------------
     sub_df = spark.table(SRC_SUB_TBL).alias("SUB")
     guar_df = spark.table(SRC_GUAR_TBL).alias("GUAR")
     
-    # Defensive windowing over Dim_Client to isolate precisely one active record
+    # CRITICAL FIX: Forces absolute uniqueness on Dim_Client active records
     client_window = Window.partitionBy("PATID").orderBy(F.col("ClientKey").desc())
     dim_client_df = (
         spark.table(DIM_CLIENT_TBL)
@@ -171,6 +141,7 @@ try:
         .alias("DC")
     )
 
+    # CRITICAL FIX: Forces UPPER and TRIM transformations to stop case-sensitive fanning
     guarantors_df = (
         sub_df.join(
             guar_df,
@@ -197,14 +168,8 @@ try:
         )
     ).distinct().cache()
 
-    # --------------------------------------------------------
-    # Current target only
-    # --------------------------------------------------------
     current_target_df = target_df.filter(F.col("IsCurrent") == 1).alias("DCG")
 
-    # --------------------------------------------------------
-    # Build COMPARE dataset (#COMPARE)
-    # --------------------------------------------------------
     compare_df = (
         guarantors_df.alias("GUAR")
         .join(
@@ -235,7 +200,6 @@ try:
         )
     ).cache()
 
-    # Isolate mutations
     new_insert_df = compare_df.filter(F.col("CHANGE_IND") == "NEW INSERT")
     changed_df = compare_df.filter(F.col("CHANGE_IND") == "CHANGED")
 
@@ -243,10 +207,6 @@ try:
     change_inserts = changed_df.count()
     change_updates = change_inserts
 
-    # --------------------------------------------------------
-    # Identify Deleted / Orphan Records (#DELETED)
-    # --------------------------------------------------------
-    # Explicitly aliased as "COMP" to dodge unresolved analytical references
     deleted_current_df = (
         current_target_df.join(
             compare_df.alias("COMP"),
@@ -261,33 +221,21 @@ try:
     
     delete_updates = deleted_current_df.count()
 
-    # --------------------------------------------------------
-    # Execute Delta Lake Structural Merges
-    # --------------------------------------------------------
     from delta.tables import DeltaTable
     target_delta_table = DeltaTable.forName(spark, TARGET_TBL)
     
-    # Step 1: Deactivate 'CHANGED' rows
     if change_updates > 0:
         target_delta_table.alias("T").merge(
             changed_df.select("PATID", "EPISODE_NUMBER", "GuarantorID").distinct().alias("S"),
             "T.PATID = S.PATID AND T.EPISODE_NUMBER = S.EPISODE_NUMBER AND T.GuarantorID = S.GuarantorID AND T.IsCurrent = 1"
-        ).whenMatchedUpdate(set={
-            "SCD_End_Date": F.current_timestamp(),
-            "IsCurrent": F.lit(0)
-        }).execute()
+        ).whenMatchedUpdate(set={"SCD_End_Date": F.current_timestamp(), "IsCurrent": F.lit(0)}).execute()
 
-    # Step 2: Deactivate 'DELETED' records
     if delete_updates > 0:
         target_delta_table.alias("T").merge(
             deleted_current_df.alias("S"),
             "T.GuarantorKey = S.GuarantorKey"
-        ).whenMatchedUpdate(set={
-            "SCD_End_Date": F.current_timestamp(),
-            "IsCurrent": F.lit(0)
-        }).execute()
+        ).whenMatchedUpdate(set={"SCD_End_Date": F.current_timestamp(), "IsCurrent": F.lit(0)}).execute()
 
-    # Step 3: Append New & Changed Records
     inserts_to_add_df = new_insert_df.unionByName(changed_df).select(
         "PATID", "ClientKey", "EPISODE_NUMBER", "GuarantorID", "GuarantorName",
         "FinancialClass", "SubscriberName", "ClientRelationToSub", "SubsPolicy",
@@ -296,7 +244,6 @@ try:
 
     if inserts_to_add_df.count() > 0:
         max_key = target_df.select(F.coalesce(F.max("GuarantorKey"), F.lit(0)).alias("max_key")).collect()[0]["max_key"]
-        
         key_window = Window.orderBy("PATID", "EPISODE_NUMBER", "GuarantorID")
         
         new_current_df = (
@@ -312,12 +259,8 @@ try:
                 "SCD_Start_Date", "SCD_End_Date", "IsCurrent"
             )
         )
-        
         new_current_df.write.format("delta").mode("append").saveAsTable(TARGET_TBL)
 
-    # --------------------------------------------------------
-    # Log Final Verification Statistics
-    # --------------------------------------------------------
     refreshed_target_df = spark.table(TARGET_TBL)
     end_count = refreshed_target_df.count()
     end_curr = refreshed_target_df.filter(F.col("IsCurrent") == 1).count()
@@ -330,9 +273,7 @@ try:
     )
 
     print("Dim_Client_Guarantors load completed successfully.")
-    print(f"Begin Count      : {begin_count}")
-    print(f"End Count        : {end_count}")
-    print(f"End Current      : {end_curr}")
+    print(f"New Inserts (Should be around ~1,263,052): {new_inserts}")
 
 except Exception as e:
     err = traceback.format_exc()
@@ -343,8 +284,7 @@ except Exception as e:
             delete_updates=delete_updates, end_count=end_count, end_curr=end_curr,
             run_status="FAILED", error_message=str(e)[:4000]
         )
-    except:
-        pass
+    except: pass
     print("Dim_Client_Guarantors load failed.")
     print(err)
     raise

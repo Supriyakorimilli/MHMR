@@ -105,10 +105,10 @@ begin_count = int(spark.table(TARGET_TBL).count())
 begin_curr = 0
 
 # ============================================================
-# DEFENSIVE DEDUPLICATION LABELS FOR DIMENSIONS
+# DEFENSIVE DEDUPLICATION FOR LOOKUP DIMENSIONS
 # ============================================================
 
-# Read active dimensions and isolate exactly one unique surrogate key per business key
+# Isolate exactly one unique active surrogate key per business key to prevent cross-join fanning
 dc_clean = spark.table(DIM_CLIENT_TBL).filter("IsCurrent = 1") \
     .withColumn("_rn", F.row_number().over(Window.partitionBy("PATID").orderBy(F.col("ClientKey").desc()))) \
     .filter("_rn = 1").drop("_rn")
@@ -121,7 +121,7 @@ dp_clean = spark.table(DIM_PROGRAM_TBL).filter("IsCurrent = 1") \
     .withColumn("_rn", F.row_number().over(Window.partitionBy("ProgramCode").orderBy(F.col("ProgramKey").desc()))) \
     .filter("_rn = 1").drop("_rn")
 
-# Register cleaned data frames to session view catalog maps
+# Register cleanly isolated dimension frames back into local session catalogs
 dc_clean.createOrReplaceTempView("V_DIM_CLIENT")
 ds_clean.createOrReplaceTempView("V_DIM_STAFF")
 dp_clean.createOrReplaceTempView("V_DIM_PROGRAM")

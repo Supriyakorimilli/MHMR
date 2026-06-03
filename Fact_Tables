@@ -1,293 +1,281 @@
-from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
-from delta.tables import DeltaTable
-from datetime import datetime
+USE [DimensionDW]
+GO
 
-# =========================================================================================
-# STEP 1: ENGINE INITIALIZATION & PARAMETER PARITY
-# =========================================================================================
-spark = SparkSession.builder.appName("DW_Service_Fact_Perfect_Parity_Load").getOrCreate()
+/****** Object:  StoredProcedure [DW].[usp_update_Dim_Client_Guarantors]    Script Date: 6/3/2026 2:31:35 PM ******/
+DROP PROCEDURE [DW].[usp_update_Dim_Client_Guarantors]
+GO
 
-# Ensure strict timezone and metadata merge alignment
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
-spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
-spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+/****** Object:  StoredProcedure [DW].[usp_update_Dim_Client_Guarantors]    Script Date: 6/3/2026 2:31:35 PM ******/
+SET ANSI_NULLS ON
+GO
 
-# =========================================================================================
-# STEP 2: METASTORE CONFIGURATION & VARIABLES (3-Part Namespace Compliant)
-# =========================================================================================
-DB = "MHMR_LAKEHOUSE"
+SET QUOTED_IDENTIFIER OFF
+GO
 
-# Target Fact Tables (Directly targeting your DW schema folder)
-TARGET_DELIVERY_TBL = f"{DB}.DW.ServiceDelivery"
-TARGET_BILLING_TBL  = f"{DB}.DW.ServiceBilling"
-TARGET_INFO_TBL     = f"{DB}.DW.ServiceInfo"
 
-# Dimension Tables Lookups
-DIM_CLIENT_TBL      = f"{DB}.DW.Dim_Client"
-DIM_STAFF_TBL       = f"{DB}.DW.Dim_Staff"
-DIM_PROGRAM_TBL     = f"{DBTH}.DW.Dim_Program"
-DIM_GUARANTOR_TBL   = f"{DB}.DW.Dim_Client_Guarantors"
-DIM_APPT_TBL        = f"{DB}.DW.Dim_Appointments"  # Switched to true warehouse dimension lookup
 
-# Primary Transaction Source Table
-SERVICE_SRC_TBL     = f"{DB}.RAW.ServiceDelivery_Master_RAW_SQL"
 
-# Logging Configurations
-LOG_TBL             = f"{DB}.LOGS.fact_process_log"
-ETL_TYPE_FOR_LOG    = "PARTIAL MERGE"
 
-# =========================================================================================
-# STEP 3: BASELINE METRICS CAPTURE
-# =========================================================================================
-def get_row_count(table_path):
-    try:
-        return int(spark.read.table(table_path).count())
-    except Exception:
-        return 0
+CREATE PROCEDURE [DW].[usp_update_Dim_Client_Guarantors]
+/********************************************************************************************************************************************
+PROCEDURE NAME	: DW.usp_update_Dim_Client_Guarantors
+DESCRIPTION		:
+SAMPLE CALL		: EXEC DW.usp_update_Dim_Client_Guarantors;
+VERSION			: 2.0
+COMMENT			: DATE			USER				COMMENT:
+				  3/1/2024	C. Sherrill			Procedure Creation
+********************************************************************************************************************************************/
 
-begin_count_d = get_row_count(TARGET_DELIVERY_TBL)
-begin_count_b = get_row_count(TARGET_BILLING_TBL)
-begin_count_i = get_row_count(TARGET_INFO_TBL)
+AS
 
-# =========================================================================================
-# STEP 4: ISOLATED, DEDUPLICATED DIMENSION VIEWS (Defeats Row Fanning)
-# =========================================================================================
-# Standardize keys, filter active records, and enforce true 1:1 business key integrity
-client_window = Window.partitionBy(F.upper(F.trim(F.col("PATID")))).orderBy(F.col("ClientKey").desc())
-v_dim_client = (
-    spark.read.table(DIM_CLIENT_TBL)
-    .filter("IsCurrent = 1")
-    .withColumn("rn", F.row_number().over(client_window))
-    .filter("rn = 1")
-    .drop("rn")
+SET NOCOUNT ON;
+
+-- ##########################################################################################################################
+-- Drop / Truncate Temp Holding Tables if the exist
+
+IF OBJECT_ID ('tempdb..#GUARANTORS') IS NOT NULL
+BEGIN
+	DROP TABLE #GUARANTORS
+END;
+
+IF OBJECT_ID ('tempdb..#COMPARE') IS NOT NULL
+BEGIN
+	DROP TABLE #COMPARE
+END;
+
+IF OBJECT_ID ('tempdb..#DELETED') IS NOT NULL
+BEGIN
+	DROP TABLE #DELETED
+END;
+
+
+DECLARE  @TableName VARCHAR(40) = 'Dim_Client_Guarantors'
+		,@BeginCount INT = 0
+		,@BeginCurr INT = 0
+		,@NewInserts INT = 0
+		,@ChangeUpdates INT = 0
+		,@ChangeInserts INT = 0
+		,@DeleteUpdates INT = 0
+		,@EndCount INT = 0
+		,@EndCurr INT = 0
+		,@ETLType VARCHAR(40) = 'SCD MERGE'
+
+SELECT @BeginCount = COUNT(*) FROM DW.Dim_Client_Guarantors;
+
+SELECT @BeginCurr = COUNT(*) FROM DW.Dim_Client_Guarantors WHERE IsCurrent = 1;
+
+
+
+CREATE TABLE #GUARANTORS
+(	PATID	VARCHAR(20) NOT NULL,
+	ClientKey	INT NOT NULL,
+	EPISODE_NUMBER NUMERIC(10,0) NOT NULL,
+	GuarantorID VARCHAR(40) NOT NULL,
+	GuarantorName VARCHAR(40) NULL,
+	FinancialClass	VARCHAR(40) NULL,
+	SubscriberName	VARCHAR(87) NULL,
+	ClientRelationToSub	VARCHAR(40) NULL,
+	SubsPolicy	VARCHAR(20) NULL,
+	SubsReleaseInfoCode	VARCHAR(5) NULL,
+	SubsIDCardIssueDate	DATE NULL
+ )
+
+
+CREATE TABLE #COMPARE
+(
+	PATID	VARCHAR(20) NOT NULL,
+	ClientKey	INT NOT NULL,
+	EPISODE_NUMBER NUMERIC(10,0) NOT NULL,
+	GuarantorID VARCHAR(40) NOT NULL,
+	GuarantorName VARCHAR(40) NULL,
+	FinancialClass	VARCHAR(40) NULL,
+	SubscriberName	VARCHAR(87) NULL,
+	ClientRelationToSub	VARCHAR(40) NULL,
+	SubsPolicy	VARCHAR(20) NULL,
+	SubsReleaseInfoCode	VARCHAR(5) NULL,
+	SubsIDCardIssueDate	DATE NULL,
+	GuarantorKey	INT NULL,
+	CHANGE_IND	VARCHAR(20) NULL
 )
 
-staff_window = Window.partitionBy(F.upper(F.trim(F.col("EmployeeID")))).orderBy(F.col("StaffKey").desc())
-v_dim_staff = (
-    spark.read.table(DIM_STAFF_TBL)
-    .filter("IsCurrent = 1")
-    .withColumn("rn", F.row_number().over(staff_window))
-    .filter("rn = 1")
-    .drop("rn")
+CREATE TABLE #DELETED
+(
+	GuarantorKey	INT NOT NULL
 )
 
-program_window = Window.partitionBy(F.upper(F.trim(F.col("ProgramCode")))).orderBy(F.col("ProgramKey").desc())
-v_dim_program = (
-    spark.read.table(DIM_PROGRAM_TBL)
-    .filter("IsCurrent = 1")
-    .withColumn("rn", F.row_number().over(program_window))
-    .filter("rn = 1")
-    .drop("rn")
-)
 
-guarantor_window = Window.partitionBy(
-    F.upper(F.trim(F.col("PATID"))), 
-    F.upper(F.trim(F.col("GuarantorID"))), 
-    F.col("EPISODE_NUMBER")
-).orderBy(F.col("GuarantorKey").desc())
-v_dim_guarantor = (
-    spark.read.table(DIM_GUARANTOR_TBL)
-    .filter("IsCurrent = 1")
-    .withColumn("rn", F.row_number().over(guarantor_window))
-    .filter("rn = 1")
-    .drop("rn")
-)
+INSERT INTO #GUARANTORS
+SELECT  SUB.PATID
+		,DC.ClientKey
+		,SUB.EPISODE_NUMBER
+		,SUB.GUARANTOR_ID AS GuarantorID
+		,SUB.guarantor_name AS GuarantorName
+		,GUAR.financial_class_value AS FinancialClass
+		,SUB.subs_name AS SubscriberName
+		,SUB.client_relation_to_subs_value AS ClientRelationToSub
+		,SUB.subs_policy
+		,SUB.subs_release_info_code
+		,SUB.subs_id_card_issue_date
+  FROM AvatarDWReporting.SYSTEM.billing_guar_subs_data SUB
+  JOIN AvatarDWReporting.SYSTEM.billing_guar_table GUAR
+	ON SUB.GUARANTOR_ID = GUAR.GUARANTOR_ID
+JOIN DW.Dim_Client DC
+	ON SUB.PATID = DC.PATID
+	AND DC.IsCurrent = 1
 
-# =========================================================================================
-# STEP 5: STAGE 1 — SOURCE JOIN WITH STRICT DEDUPLICATION RANKING
-# =========================================================================================
-sdm_df = spark.read.table(SERVICE_SRC_TBL)
-ap_df = spark.read.table(DIM_APPT_TBL)  # Reading from standard scheduling lookup asset
+INSERT INTO #COMPARE
+SELECT GUAR.PATID
+	,GUAR.ClientKey
+	,GUAR.EPISODE_NUMBER
+	,GUAR.GuarantorID
+	,GUAR.GuarantorName
+	,GUAR.FinancialClass
+	,GUAR.SubscriberName
+	,GUAR.ClientRelationToSub
+	,GUAR.SubsPolicy
+	,GUAR.SubsReleaseInfoCode
+	,GUAR.SubsIDCardIssueDate
+	,DCG.GuarantorKey
+	,CASE WHEN DCG.PATID IS NULL THEN 'NEW INSERT'
+		WHEN CONCAT(GUAR.SubscriberName
+	,GUAR.ClientRelationToSub
+	,GUAR.SubsPolicy
+	,GUAR.SubsReleaseInfoCode
+	,GUAR.SubsIDCardIssueDate) <>
+			CONCAT(DCG.SubscriberName
+	,DCG.ClientRelationToSub
+	,DCG.SubsPolicy
+	,DCG.SubsReleaseInfoCode
+	,DCG.SubsIDCardIssueDate) THEN 'CHANGED'
+	ELSE NULL END AS CHANGE_IND
+FROM #GUARANTORS GUAR
+LEFT JOIN DW.Dim_Client_Guarantors DCG
+	ON GUAR.PATID = DCG.PATID
+	AND GUAR.EPISODE_NUMBER = DCG.EPISODE_NUMBER
+	AND GUAR.GuarantorID = DCG.GuarantorID
+	AND DCG.IsCurrent = 1
 
-# Replicating T-SQL Case Statement logic for Episode Numbers
-sdm_df = sdm_df.withColumn(
-    "EPISODE_NUMBER",
-    F.when(F.substring("EpisodeNumAndName", 1, 2).cast("int").isNotNull(), F.substring("EpisodeNumAndName", 1, 2).cast("long"))
-     .otherwise(F.substring("EpisodeNumAndName", 1, 1).cast("long"))
-)
 
-# Safely run complex string evaluations using native Spark SQL expressions to avoid PySparkTypeError
-sdm_df = sdm_df.withColumn("join_tx_hist", F.expr("substring(ID, locate('||', ID, 4) + 2, 20)")) \
-               .withColumn("tx_note_uid_slice", F.expr("substring(Tx_Note_UniqueId, locate('N', Tx_Note_UniqueId, 1), 15)"))
 
-# Join standard operational tables utilizing normalized string parameters
-joined_part1 = sdm_df.alias("sdm").join(
-    ap_df.alias("ap"),
-    (F.upper(F.trim(F.col("sdm.PatientID"))) == F.upper(F.trim(F.col("ap.PATID")))) &
-    (F.upper(F.trim(F.col("sdm.join_tx_hist"))) == F.upper(F.trim(F.col("ap.JOIN_TO_TX_HISTORY")))) &
-    (F.upper(F.trim(F.col("sdm.tx_note_uid_slice"))) == F.upper(F.trim(F.col("ap.NOT_uniqueid")))),
-    "left"
-).select(
-    F.col("sdm.ID").alias("ID"),
-    "sdm.PatientID", "sdm.DateofService", "sdm.Facility", "sdm.AdmittedProgram", "sdm.DataEntrySource", 
-    "sdm.DataEntryDate", "sdm.DataEntryUser", "sdm.AccountingPeriod", "sdm.CrisisIndicator", "sdm.COPSD", 
-    "sdm.RecipientCode", "sdm.EncounterType", "sdm.PatientAgeonService", "sdm.ServiceStatusCode", "sdm.ServiceStatus", 
-    "sdm.ProviderID", "sdm.CoverageCode", "sdm.Co_Practitioner_ID", "sdm.Co_Practitioner2_ID", "sdm.Tx_Note_UniqueId", 
-    "sdm.ServiceUnits", "sdm.ServiceCost", "sdm.BalanceOfFeeOnService", "sdm.PrimaryGuarantorID", 
-    "sdm.PrimaryGuarantorLiability", "sdm.IsBillable", "sdm.InsuranceCategoryCode", "sdm.Service", "sdm.ServiceCode", 
-    "sdm.ServiceLocationCode", "sdm.ServiceLocation", "sdm.ServiceDuration", "sdm.TreatmentSettingCode", 
-    "sdm.TreatmentSetting", "sdm.ServiceStartTime", "sdm.ServiceEndTime", "sdm.ProgramCode", "sdm.EPISODE_NUMBER",
-    "sdm.join_tx_hist", "sdm.tx_note_uid_slice",
-    "ap.AppointmentKey", "ap.appointment_date", "ap.appointment_start_time"
-)
+INSERT INTO DW.Dim_Client_Guarantors
+select PATID
+	,ClientKey
+	,EPISODE_NUMBER
+	,GuarantorID
+	,GuarantorName
+	,FinancialClass
+	,SubscriberName
+	,ClientRelationToSub
+	,SubsPolicy
+	,SubsReleaseInfoCode
+	,SubsIDCardIssueDate
+	,GETDATE() 
+	,'2199-12-31'
+	,1
+from #COMPARE 
+where CHANGE_IND = 'NEW INSERT'
 
-# Apply rigorous window compression over operational anchors to enforce absolute count parity
-stage1_window = Window.partitionBy("PatientID", "join_tx_hist", "tx_note_uid_slice") \
-    .orderBy(F.to_timestamp(F.concat_ws(" ", F.date_format("appointment_date", "yyyy-MM-dd"), "appointment_start_time")))
+SET @NewInserts = @@ROWCOUNT;
 
-part1_df = joined_part1.withColumn("RANK_NUM", F.row_number().over(stage1_window)) \
-                       .filter(F.col("RANK_NUM") == 1) \
-                       .drop("join_tx_hist", "tx_note_uid_slice", "appointment_date", "appointment_start_time", "RANK_NUM")
+UPDATE DCG
+SET	DCG.SCD_End_Date = GETDATE(),
+	DCG.IsCurrent = 0
+FROM DW.Dim_Client_Guarantors DCG
+JOIN #COMPARE COMP
+	ON DCG.PATID = COMP.PATID
+	AND DCG.EPISODE_NUMBER = COMP.EPISODE_NUMBER
+	AND DCG.GuarantorID = COMP.GuarantorID
+	AND COMP.CHANGE_IND = 'CHANGED'
 
-# =========================================================================================
-# STEP 6: STAGE 2 — CLEAN DIMENSION KEY ASSIGNMENT
-# =========================================================================================
-part2_df = part1_df.alias("p1") \
-    .join(v_dim_client.alias("dc"), (F.upper(F.trim(F.col("p1.PatientID"))) == F.upper(F.trim(F.col("dc.PATID")))), "inner") \
-    .join(v_dim_staff.alias("ds"), (F.upper(F.trim(F.col("p1.ProviderID"))) == F.upper(F.trim(F.col("ds.EmployeeID")))), "left") \
-    .join(v_dim_program.alias("dp"), (F.upper(F.trim(F.col("p1.ProgramCode"))) == F.upper(F.trim(F.col("dp.ProgramCode")))), "left") \
-    .join(v_dim_guarantor.alias("cg"), 
-          (F.upper(F.trim(F.col("p1.PatientID"))) == F.upper(F.trim(F.col("cg.PATID")))) & 
-          (F.upper(F.trim(F.col("p1.PrimaryGuarantorID"))) == F.upper(F.trim(F.col("cg.GuarantorID")))) & 
-          (F.col("p1.EPISODE_NUMBER") == F.col("cg.EPISODE_NUMBER")), "left") \
-    .select(
-        F.col("p1.*"),
-        F.col("dc.ClientKey").cast("int").alias("ClientKey"),
-        F.col("ds.StaffKey").cast("int").alias("StaffKey"),
-        F.col("dp.ProgramKey").cast("int").alias("ProgramKey"),
-        F.col("cg.GuarantorKey").cast("int").alias("GuarantorKey")
-    )
+SET @ChangeUpdates = @@ROWCOUNT;
 
-# =========================================================================================
-# STEP 7: STAGE 3 — CHANGE TRACKING LOGIC & ATOMIC SCHEMAS CREATION
-# =========================================================================================
-try:
-    dw_delivery_df = spark.read.table(TARGET_DELIVERY_TBL).select("ServiceFactID", F.col("DataEntryDate").alias("dw_DataEntryDate"))
-    
-    staging_df = part2_df.alias("stg").join(
-        dw_delivery_df.alias("dw"),
-        F.col("stg.ID") == F.col("dw.ServiceFactID"),
-        "left"
-    ).withColumn(
-        "CHANGE_IND",
-        F.when(F.col("dw.ServiceFactID").isNull(), "NEW")
-         .when(F.col("stg.DataEntryDate") > F.col("dw_DataEntryDate"), "CHANGE")
-         .otherwise(F.lit(None))
-    ).filter(F.col("CHANGE_IND").isNotNull()).cache()
-    
-except Exception:
-    staging_df = part2_df.withColumn("CHANGE_IND", F.lit("NEW")).cache()
 
-# Splitting out individual fact structures
-final_delivery = staging_df.select(
-    F.col("ID").alias("ServiceFactID"), "PatientID", "DateofService", "EPISODE_NUMBER", "Facility", "AdmittedProgram", 
-    "DataEntrySource", "DataEntryDate", "DataEntryUser", "AccountingPeriod", "CrisisIndicator", "COPSD", 
-    "RecipientCode", "EncounterType", "PatientAgeonService", "ServiceStatusCode", "ServiceStatus", "ProviderID", 
-    "CoverageCode", "Co_Practitioner_ID", "Co_Practitioner2_ID", "Tx_Note_UniqueId", "ClientKey", "StaffKey", 
-    "ProgramKey", "AppointmentKey", "CHANGE_IND"
-)
+INSERT INTO DW.Dim_Client_Guarantors
+select PATID
+	,ClientKey
+	,EPISODE_NUMBER
+	,GuarantorID
+	,GuarantorName
+	,FinancialClass
+	,SubscriberName
+	,ClientRelationToSub
+	,SubsPolicy
+	,SubsReleaseInfoCode
+	,SubsIDCardIssueDate
+	,GETDATE() 
+	,'2199-12-31'
+	,1
+from #COMPARE 
+where CHANGE_IND = 'CHANGED'
 
-final_billing = staging_df.select(
-    F.col("ID").alias("ServiceFactID"), "ServiceUnits", "ServiceCost", "BalanceOfFeeOnService", "GuarantorKey", 
-    "PrimaryGuarantorLiability", "IsBillable", "InsuranceCategoryCode", "PatientID", "DateofService", 
-    "EPISODE_NUMBER", "ClientKey", "CHANGE_IND"
-)
+SET @ChangeInserts = @@ROWCOUNT;
 
-final_info = staging_df.select(
-    F.col("ID").alias("ServiceFactID"), "Service", "ServiceCode", "ServiceLocationCode", "ServiceLocation", 
-    "ServiceDuration", "TreatmentSettingCode", "TreatmentSetting", "ServiceStartTime", "ServiceEndTime", 
-    "PatientID", "DateofService", "ClientKey", "CHANGE_IND"
-)
 
-# =========================================================================================
-# STEP 8: STAGE 4 — ATOMIC WRITE EXECUTION (DELTA LAKE MERGE MECHANICS)
-# =========================================================================================
-def execute_upsert(df, target_table_path):
-    if not spark.catalog.tableExists(target_table_path):
-        df.drop("CHANGE_IND").write.format("delta").saveAsTable(target_table_path)
-        return int(df.count()), 0
-    
-    delta_obj = DeltaTable.forName(spark, target_table_path)
-    upsert_df = df.filter((F.col("CHANGE_IND") == "NEW") | (F.col("CHANGE_IND") == "CHANGE"))
-    
-    ins_cnt = int(upsert_df.filter(F.col("CHANGE_IND") == "NEW").count())
-    upd_cnt = int(upsert_df.filter(F.col("CHANGE_IND") == "CHANGE").count())
-    
-    delta_obj.alias("tgt").merge(
-        source=upsert_df.alias("src"),
-        condition="tgt.ServiceFactID = src.ServiceFactID"
-    ).whenMatchedUpdateAll() \
-     .whenNotMatchedInsertAll() \
-     .execute()
-     
-    return ins_cnt, upd_cnt
+INSERT INTO #DELETED
+SELECT DCG.GuarantorKey
+FROM DW.Dim_Client_Guarantors DCG
+LEFT JOIN #COMPARE COMP
+	ON DCG.PATID = COMP.PATID
+	AND DCG.EPISODE_NUMBER = COMP.EPISODE_NUMBER
+	AND DCG.GuarantorID = COMP.GuarantorID
+WHERE COMP.PATID IS NULL
 
-new_inserts_d, change_updates_d = execute_upsert(final_delivery, TARGET_DELIVERY_TBL)
-new_inserts_b, change_updates_b = execute_upsert(final_billing, TARGET_BILLING_TBL)
-new_inserts_i, change_updates_i = execute_upsert(final_info, TARGET_INFO_TBL)
 
-# =========================================================================================
-# STEP 9: STAGE 5 — PURGE ABSENT RECORDS FROM HISTORICAL REPOSITORIES
-# =========================================================================================
-del_d, del_b, del_i = 0, 0, 0
+UPDATE DCG
+SET DCG.SCD_End_Date = GETDATE(),
+	DCG.IsCurrent = 0
+FROM DW.Dim_Client_Guarantors DCG
+JOIN #DELETED DEL
+	ON DCG.GuarantorKey = DEL.GuarantorKey
 
-if spark.catalog.tableExists(TARGET_DELIVERY_TBL):
-    orphans_df = spark.read.table(TARGET_DELIVERY_TBL).select("ServiceFactID").join(
-        staging_df.select(F.col("ID").alias("ServiceFactID")), "ServiceFactID", "left_anti"
-    ).cache()
-    
-    orphan_count = int(orphans_df.count())
-    if orphan_count > 0:
-        for t_path in [TARGET_DELIVERY_TBL, TARGET_BILLING_TBL, TARGET_INFO_TBL]:
-            dt = DeltaTable.forName(spark, t_path)
-            dt.alias("tgt").merge(orphans_df.alias("src"), "tgt.ServiceFactID = src.ServiceFactID") \
-              .whenMatchedDelete().execute()
-        del_d, del_b, del_i = orphan_count, orphan_count, orphan_count
+SET @DeleteUpdates = @@ROWCOUNT;
 
-# =========================================================================================
-# STEP 10: STAGE 6 — AUDIT LOG RECORDS APPEND (PREVENTS TYPE CORRUPTION ERRORS)
-# =========================================================================================
-end_count_d = get_row_count(TARGET_DELIVERY_TBL)
-end_count_b = get_row_count(TARGET_BILLING_TBL)
-end_count_i = get_row_count(TARGET_INFO_TBL)
 
-b_cnt_d = int(begin_count_d) if 'begin_count_d' in locals() else 0
-b_cnt_b = int(begin_count_b) if 'begin_count_b' in locals() else 0
-b_cnt_i = int(begin_count_i) if 'begin_count_i' in locals() else 0
+SELECT @EndCount = COUNT(*) FROM DW.Dim_Client_Guarantors;
 
-n_ins_d = int(new_inserts_d) if 'new_inserts_d' in locals() else 0
-n_ins_b = int(new_inserts_b) if 'new_inserts_b' in locals() else 0
-n_ins_i = int(new_inserts_i) if 'new_inserts_i' in locals() else 0
+SELECT @EndCurr = COUNT(*) FROM DW.Dim_Client_Guarantors WHERE IsCurrent = 1;
 
-c_upd_d = int(change_updates_d) if 'change_updates_d' in locals() else 0
-c_upd_b = int(change_updates_b) if 'change_updates_b' in locals() else 0
-c_upd_i = int(change_updates_i) if 'change_updates_i' in locals() else 0
+INSERT INTO LOGGING.DW_PROCESS_LOG
+(Logdate 
+,TableName
+,BeginRecCount
+,BeginCurrCount
+,NewInserts
+,ChangeUpdates
+,ChangeInserts
+,DeleteUpdates
+,EndRecCount
+,EndCurrCount
+,ETL_TYPE)
+VALUES
+	(GETDATE()
+	,@TableName
+	,@BeginCount
+	,@BeginCurr
+	,@NewInserts
+	,@ChangeUpdates
+	,@ChangeInserts
+	,@DeleteUpdates
+	,@EndCount
+	,@EndCurr
+	,@ETLType)
 
-d_upd_d = int(del_d) if 'del_d' in locals() else 0
-d_upd_b = int(del_b) if 'del_b' in locals() else 0
-d_upd_i = int(del_i) if 'del_i' in locals() else 0
 
-e_cnt_d = int(end_count_d) if 'end_count_d' in locals() else 0
-e_cnt_b = int(end_count_b) if 'end_count_b' in locals() else 0
-e_cnt_i = int(end_count_i) if 'end_count_i' in locals() else 0
 
-log_rows = [
-    (datetime.now(), "ServiceDelivery", b_cnt_d, 0, n_ins_d, c_upd_d, c_upd_d, d_upd_d, e_cnt_d, 0, ETL_TYPE_FOR_LOG),
-    (datetime.now(), "ServiceBilling", b_cnt_b, 0, n_ins_b, c_upd_b, c_upd_b, d_upd_b, e_cnt_b, 0, ETL_TYPE_FOR_LOG),
-    (datetime.now(), "ServiceInfo", b_cnt_i, 0, n_ins_i, c_upd_i, c_upd_i, d_upd_i, e_cnt_i, 0, ETL_TYPE_FOR_LOG)
-]
+IF OBJECT_ID ('tempdb..#GUARANTORS') IS NOT NULL
+BEGIN
+	DROP TABLE #GUARANTORS
+END;
 
-log_schema = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE"]
-log_df = spark.createDataFrame(log_rows, log_schema)
-log_df.write.format("delta").mode("append").saveAsTable(LOG_TBL)
+IF OBJECT_ID ('tempdb..#COMPARE') IS NOT NULL
+BEGIN
+	DROP TABLE #COMPARE
+END;
 
-# Evict cached states completely out of your workspace cluster RAM
-staging_df.unpersist()
-try:
-    orphans_df.unpersist()
-except Exception:
-    pass
+IF OBJECT_ID ('tempdb..#DELETED') IS NOT NULL
+BEGIN
+	DROP TABLE #DELETED
+END;
+GO
 
-print("Fabric Folder-Based Fact Load Completed Successfully with Parity Constraints enforced.")
+

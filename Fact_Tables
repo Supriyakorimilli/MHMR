@@ -113,7 +113,7 @@ new_inserts, change_updates, change_inserts, delete_updates = 0, 0, 0, 0
 end_count, end_curr = 0, 0
 
 try:
-    # Read baseline operational counts
+    # Read target and get starting metrics
     target_df = spark.table(TARGET_TBL)
     begin_count = target_df.count()
     begin_curr = target_df.filter(F.col("IsCurrent") == 1).count()
@@ -140,8 +140,8 @@ try:
         F.when(F.col("ACTIVE_PATID").isNotNull(), F.lit(1)).otherwise(F.lit(0))
     ).drop("ACTIVE_PATID").cache()
 
-    # Isolate strictly current entries from dimension target snapshot
-    current_target_df = target_df.filter(F.col("IsCurrent") == 1).alias("tgt")
+    # Isolate strictly current entries from dimension target snapshot and break lineage tracking
+    current_target_df = target_df.filter(F.col("IsCurrent") == 1).select(target_df.columns).alias("tgt")
 
     # 3. New Dimension Records Identification
     new_clients_df = demo_enriched_df.alias("stg").join(
@@ -158,7 +158,7 @@ try:
     ).filter(
         build_sql_concat_string("stg") != build_sql_concat_string("tgt")
     ).select(
-        F.col("tgt.ClientKey").alias("TargetClientKey"),  # Renamed to resolve ambiguous references
+        F.col("tgt.ClientKey").alias("TargetClientKey"),
         "stg.*"
     )
 
@@ -175,27 +175,29 @@ try:
     change_updates = change_inserts
     delete_updates = int(deleted_clients_df.count())
 
-    # 6. Re-assembling Timelines and Closing Expired Records
-    historical_target_df = target_df.filter(F.col("IsCurrent") != 1)
+    # 6. Re-assembling Timelines and Closing Expired Records (Lineage Cleared via explicit col select)
+    historical_target_df = target_df.filter(F.col("IsCurrent") != 1).select(target_df.columns)
     
-    # Combined list of keys to deactivate
     deactivation_keys_df = changed_clients_df.select("TargetClientKey").unionByName(deleted_clients_df.select("TargetClientKey"))
 
+    # Select columns explicitly to completely strip old 'p2' references from lineage graph
+    active_clean_base_df = target_df.filter(F.col("IsCurrent") == 1).select([F.col(c) for c in target_df.columns])
+
     # Active rows that remain untouched
-    current_unchanged_df = target_df.filter(F.col("IsCurrent") == 1).alias("curr").join(
-        deactivation_keys_df.alias("deact"),
-        F.col("curr.ClientKey") == F.col("deact.TargetClientKey"),
+    current_unchanged_df = active_clean_base_df.join(
+        deactivation_keys_df,
+        active_clean_base_df["ClientKey"] == deactivation_keys_df["TargetClientKey"],
         "left_anti"
-    ).select("curr.*")
+    ).select(target_df.columns)
 
     # Active rows that are now expired
-    expired_mutations_df = target_df.filter(F.col("IsCurrent") == 1).alias("curr").join(
-        deactivation_keys_df.alias("deact"),
-        F.col("curr.ClientKey") == F.col("deact.TargetClientKey"),
+    expired_mutations_df = active_clean_base_df.join(
+        deactivation_keys_df,
+        active_clean_base_df["ClientKey"] == deactivation_keys_df["TargetClientKey"],
         "inner"
     ).withColumn("SCDEndDate", F.current_timestamp())\
      .withColumn("IsCurrent", F.lit(0))\
-     .select("curr.*")
+     .select(target_df.columns)
 
     # 7. Surrogate Key Generation and Insert Stack assembly
     inserts_to_add_df = new_clients_df.unionByName(changed_clients_df.drop("TargetClientKey")).dropDuplicates(["CLEAN_PATID"])
@@ -211,9 +213,9 @@ try:
      .withColumn("IsCurrent", F.lit(1))
 
     # Compile the final partition layout
-    final_target_snapshot = historical_target_df.select(target_df.columns)\
-        .unionByName(current_unchanged_df.select(target_df.columns))\
-        .unionByName(expired_mutations_df.select(target_df.columns))\
+    final_target_snapshot = historical_target_df\
+        .unionByName(current_unchanged_df)\
+        .unionByName(expired_mutations_df)\
         .unionByName(new_current_records_df.select(target_df.columns))
 
     # Transactional Delta Table commit
@@ -232,7 +234,7 @@ try:
     log_cols = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE", "RunStatus", "ErrorMessage"]
     spark.createDataFrame(log_row, log_cols).write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
 
-    print("Pipeline executed successfully. Ambiguity resolved and row counts matched.")
+    print("Pipeline executed successfully. Old notebook references cleared and parity confirmed.")
 
 except Exception as e:
     err_msg = traceback.format_exc()

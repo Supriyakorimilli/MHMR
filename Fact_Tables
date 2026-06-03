@@ -28,7 +28,7 @@ TARGET_TBL       = f"{DB}.DW.Dim_Client_Guarantors"
 FINAL_LOG_TBL    = f"{DB}.LOGS.client_guarantors_final_log"
 
 TABLE_NAME_FOR_LOG = "Dim_Client_Guarantors"
-ETL_TYPE_FOR_LOG   = "Incremental"
+ETL_TYPE_FOR_LOG   = "SCD MERGE"
 
 FUTURE_END_DATE = "2199-12-31"
 
@@ -61,7 +61,7 @@ def create_log_table_if_not_exists():
         ])
         spark.createDataFrame([], log_schema).write.format("delta").mode("overwrite").saveAsTable(FINAL_LOG_TBL)
 
-def write_log(begin_count, begin_curr, new_inserts, change_updates, change_inserts,
+def write_log(begin_count, begin_curr, new_inserts, change_updates, change_inserts, 
               delete_updates, end_count, end_curr, run_status, error_message):
     log_row = [(
         None,
@@ -78,7 +78,7 @@ def write_log(begin_count, begin_curr, new_inserts, change_updates, change_inser
         run_status,
         error_message
     )]
-
+    
     log_schema = StructType([
         StructField("Logdate", TimestampType(), True),
         StructField("TableName", StringType(), True),
@@ -94,18 +94,18 @@ def write_log(begin_count, begin_curr, new_inserts, change_updates, change_inser
         StructField("RunStatus", StringType(), True),
         StructField("ErrorMessage", StringType(), True)
     ])
-
+    
     df = spark.createDataFrame(log_row, schema=log_schema).withColumn("Logdate", F.current_timestamp())
     df.write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
 
-def build_compare_string(df_alias_prefix=""):
+# Replicating T-SQL CONCAT behavior exactly (No delimiters, NULLs become empty strings)
+def build_sql_concat_string(df_alias_prefix=""):
     p = f"{df_alias_prefix}." if df_alias_prefix else ""
-    return F.concat_ws(
-        "||",
-        F.coalesce(F.col(f"{p}SubscriberName").cast("string"), F.lit("")),
-        F.coalesce(F.col(f"{p}ClientRelationToSub").cast("string"), F.lit("")),
-        F.coalesce(F.col(f"{p}SubsPolicy").cast("string"), F.lit("")),
-        F.coalesce(F.col(f"{p}SubsReleaseInfoCode").cast("string"), F.lit("")),
+    return F.concat(
+        F.coalesce(F.trim(F.col(f"{p}SubscriberName").cast("string")), F.lit("")),
+        F.coalesce(F.trim(F.col(f"{p}ClientRelationToSub").cast("string")), F.lit("")),
+        F.coalesce(F.trim(F.col(f"{p}SubsPolicy").cast("string")), F.lit("")),
+        F.coalesce(F.trim(F.col(f"{p}SubsReleaseInfoCode").cast("string")), F.lit("")),
         F.coalesce(F.date_format(F.col(f"{p}SubsIDCardIssueDate"), "yyyy-MM-dd"), F.lit(""))
     )
 
@@ -151,86 +151,68 @@ try:
     # Beginning counts
     # --------------------------------------------------------
     target_df = spark.table(TARGET_TBL)
-
     begin_count = target_df.count()
     begin_curr = target_df.filter(F.col("IsCurrent") == 1).count()
 
     # --------------------------------------------------------
-    # Build GUARANTORS source dataset
-    # SQL equivalent of #GUARANTORS
+    # Build GUARANTORS source dataset (#GUARANTORS)
     # --------------------------------------------------------
     sub_df = spark.table(SRC_SUB_TBL).alias("SUB")
     guar_df = spark.table(SRC_GUAR_TBL).alias("GUAR")
+    
+    # Defensive windowing over Dim_Client to isolate precisely one active record
+    client_window = Window.partitionBy("PATID").orderBy(F.col("ClientKey").desc())
     dim_client_df = (
         spark.table(DIM_CLIENT_TBL)
         .filter(F.col("IsCurrent") == 1)
+        .withColumn("rn", F.row_number().over(client_window))
+        .filter(F.col("rn") == 1)
+        .drop("rn")
         .alias("DC")
     )
 
     guarantors_df = (
         sub_df.join(
             guar_df,
-            F.col("SUB.GUARANTOR_ID") == F.col("GUAR.GUARANTOR_ID"),
+            F.upper(F.trim(F.col("SUB.GUARANTOR_ID"))) == F.upper(F.trim(F.col("GUAR.GUARANTOR_ID"))),
             "inner"
         )
         .join(
             dim_client_df,
-            F.col("SUB.PATID") == F.col("DC.PATID"),
+            F.upper(F.trim(F.col("SUB.PATID"))) == F.upper(F.trim(F.col("DC.PATID"))),
             "inner"
         )
         .select(
-            F.col("SUB.PATID").cast("string").alias("PATID"),
+            F.trim(F.col("SUB.PATID")).cast("string").alias("PATID"),
             F.col("DC.ClientKey").cast("int").alias("ClientKey"),
             F.col("SUB.EPISODE_NUMBER").cast("long").alias("EPISODE_NUMBER"),
-            F.col("SUB.GUARANTOR_ID").cast("string").alias("GuarantorID"),
-            F.col("SUB.guarantor_name").cast("string").alias("GuarantorName"),
-            F.col("GUAR.financial_class_value").cast("string").alias("FinancialClass"),
-            F.col("SUB.subs_name").cast("string").alias("SubscriberName"),
-            F.col("SUB.client_relation_to_subs_value").cast("string").alias("ClientRelationToSub"),
-            F.col("SUB.subs_policy").cast("string").alias("SubsPolicy"),
-            F.col("SUB.subs_release_info_code").cast("string").alias("SubsReleaseInfoCode"),
+            F.trim(F.col("SUB.GUARANTOR_ID")).cast("string").alias("GuarantorID"),
+            F.trim(F.col("SUB.guarantor_name")).cast("string").alias("GuarantorName"),
+            F.trim(F.col("GUAR.financial_class_value")).cast("string").alias("FinancialClass"),
+            F.trim(F.col("SUB.subs_name")).cast("string").alias("SubscriberName"),
+            F.trim(F.col("SUB.client_relation_to_subs_value")).cast("string").alias("ClientRelationToSub"),
+            F.trim(F.col("SUB.subs_policy")).cast("string").alias("SubsPolicy"),
+            F.trim(F.col("SUB.subs_release_info_code")).cast("string").alias("SubsReleaseInfoCode"),
             F.to_date(F.col("SUB.subs_id_card_issue_date")).alias("SubsIDCardIssueDate")
         )
-    )
+    ).distinct().cache()
 
-    # --------------------
+    # --------------------------------------------------------
     # Current target only
     # --------------------------------------------------------
-    current_target_df = (
-        target_df
-        .filter(F.col("IsCurrent") == 1)
-        .select(
-            "GuarantorKey",
-            "PATID",
-            "ClientKey",
-            "EPISODE_NUMBER",
-            "GuarantorID",
-            "GuarantorName",
-            "FinancialClass",
-            "SubscriberName",
-            "ClientRelationToSub",
-            "SubsPolicy",
-            "SubsReleaseInfoCode",
-            "SubsIDCardIssueDate",
-            "SCD_Start_Date",
-            "SCD_End_Date",
-            "IsCurrent"
-        )
-        .alias("DCG")
-    )
+    current_target_df = target_df.filter(F.col("IsCurrent") == 1).alias("DCG")
 
     # --------------------------------------------------------
-    # Build COMPARE dataset
-    # SQL equivalent of #COMPARE
+    # Build COMPARE dataset (#COMPARE)
     # --------------------------------------------------------
     compare_df = (
         guarantors_df.alias("GUAR")
         .join(
             current_target_df,
             on=[
-                F.col("GUAR.PATID") == F.col("DCG.PATID"),
+                F.upper(F.trim(F.col("GUAR.PATID"))) == F.upper(F.trim(F.col("DCG.PATID"))),
                 F.col("GUAR.EPISODE_NUMBER") == F.col("DCG.EPISODE_NUMBER"),
-                F.col("GUAR.GuarantorID") == F.col("DCG.GuarantorID")
+                F.upper(F.trim(F.col("GUAR.GuarantorID"))) == F.upper(F.trim(F.col("DCG.GuarantorID")))
             ],
             how="left"
         )
@@ -247,234 +229,129 @@ try:
             F.col("GUAR.SubsReleaseInfoCode").alias("SubsReleaseInfoCode"),
             F.col("GUAR.SubsIDCardIssueDate").alias("SubsIDCardIssueDate"),
             F.col("DCG.GuarantorKey").alias("GuarantorKey"),
-            F.when(
-                F.col("DCG.PATID").isNull(),
-                F.lit("NEW INSERT")
-            ).when(
-                build_compare_string("GUAR") != build_compare_string("DCG"),
-                F.lit("CHANGED")
-            ).otherwise(F.lit(None)).alias("CHANGE_IND")
+            F.when(F.col("DCG.PATID").isNull(), F.lit("NEW INSERT"))
+            .when(build_sql_concat_string("GUAR") != build_sql_concat_string("DCG"), F.lit("CHANGED"))
+            .otherwise(F.lit(None)).alias("CHANGE_IND")
         )
-    )
+    ).cache()
 
-    # --------------------------------------------------------
-    # New Inserts and Changed records
-    # --------------------------------------------------------
+    # Isolate mutations
     new_insert_df = compare_df.filter(F.col("CHANGE_IND") == "NEW INSERT")
     changed_df = compare_df.filter(F.col("CHANGE_IND") == "CHANGED")
 
     new_inserts = new_insert_df.count()
     change_inserts = changed_df.count()
-    change_updates = changed_df.count()
+    change_updates = change_inserts
 
     # --------------------------------------------------------
-    # Deleted current records
-    # SQL intent of #DELETED
+    # Identify Deleted / Orphan Records (#DELETED)
     # --------------------------------------------------------
-    compare_keys_df = compare_df.select("PATID", "EPISODE_NUMBER", "GuarantorID").dropDuplicates()
-
+    # Explicitly aliased as "COMP" to dodge unresolved analytical references
     deleted_current_df = (
-        current_target_df.alias("DCG")
-        .join(
-            compare_keys_df.alias("COMP"),
+        current_target_df.join(
+            compare_df.alias("COMP"),
             on=[
-                F.col("DCG.PATID") == F.col("COMP.PATID"),
+                F.upper(F.trim(F.col("DCG.PATID"))) == F.upper(F.trim(F.col("COMP.PATID"))),
                 F.col("DCG.EPISODE_NUMBER") == F.col("COMP.EPISODE_NUMBER"),
-                F.col("DCG.GuarantorID") == F.col("COMP.GuarantorID")
+                F.upper(F.trim(F.col("DCG.GuarantorID"))) == F.upper(F.trim(F.col("COMP.GuarantorID")))
             ],
             how="left_anti"
-        )
-    )
-
+        ).select("DCG.GuarantorKey")
+    ).cache()
+    
     delete_updates = deleted_current_df.count()
 
     # --------------------------------------------------------
-    # Existing target split
+    # Execute Delta Lake Structural Merges
     # --------------------------------------------------------
-    historical_target_df = target_df.filter(F.col("IsCurrent") != 1)
+    from delta.tables import DeltaTable
+    target_delta_table = DeltaTable.forName(spark, TARGET_TBL)
+    
+    # Step 1: Deactivate 'CHANGED' rows
+    if change_updates > 0:
+        target_delta_table.alias("T").merge(
+            changed_df.select("PATID", "EPISODE_NUMBER", "GuarantorID").distinct().alias("S"),
+            "T.PATID = S.PATID AND T.EPISODE_NUMBER = S.EPISODE_NUMBER AND T.GuarantorID = S.GuarantorID AND T.IsCurrent = 1"
+        ).whenMatchedUpdate(set={
+            "SCD_End_Date": F.current_timestamp(),
+            "IsCurrent": F.lit(0)
+        }).execute()
 
-    current_unchanged_df = (
-        current_target_df.alias("CURR")
-        .join(
-            changed_df.select("PATID", "EPISODE_NUMBER", "GuarantorID").dropDuplicates().alias("CHG"),
-            on=[
-                F.col("CURR.PATID") == F.col("CHG.PATID"),
-                F.col("CURR.EPISODE_NUMBER") == F.col("CHG.EPISODE_NUMBER"),
-                F.col("CURR.GuarantorID") == F.col("CHG.GuarantorID")
-            ],
-            how="left_anti"
+    # Step 2: Deactivate 'DELETED' records
+    if delete_updates > 0:
+        target_delta_table.alias("T").merge(
+            deleted_current_df.alias("S"),
+            "T.GuarantorKey = S.GuarantorKey"
+        ).whenMatchedUpdate(set={
+            "SCD_End_Date": F.current_timestamp(),
+            "IsCurrent": F.lit(0)
+        }).execute()
+
+    # Step 3: Append New & Changed Records
+    inserts_to_add_df = new_insert_df.unionByName(changed_df).select(
+        "PATID", "ClientKey", "EPISODE_NUMBER", "GuarantorID", "GuarantorName",
+        "FinancialClass", "SubscriberName", "ClientRelationToSub", "SubsPolicy",
+        "SubsReleaseInfoCode", "SubsIDCardIssueDate"
+    )
+
+    if inserts_to_add_df.count() > 0:
+        max_key = target_df.select(F.coalesce(F.max("GuarantorKey"), F.lit(0)).alias("max_key")).collect()[0]["max_key"]
+        
+        key_window = Window.orderBy("PATID", "EPISODE_NUMBER", "GuarantorID")
+        
+        new_current_df = (
+            inserts_to_add_df
+            .withColumn("GuarantorKey", F.row_number().over(key_window) + F.lit(int(max_key)))
+            .withColumn("SCD_Start_Date", F.current_timestamp())
+            .withColumn("SCD_End_Date", F.to_timestamp(F.lit(FUTURE_END_DATE)))
+            .withColumn("IsCurrent", F.lit(1))
+            .select(
+                "GuarantorKey", "PATID", "ClientKey", "EPISODE_NUMBER", "GuarantorID",
+                "GuarantorName", "FinancialClass", "SubscriberName", "ClientRelationToSub",
+                "SubsPolicy", "SubsReleaseInfoCode", "SubsIDCardIssueDate",
+                "SCD_Start_Date", "SCD_End_Date", "IsCurrent"
+            )
         )
-        .join(
-            deleted_current_df.select("GuarantorKey").dropDuplicates().alias("DEL"),
-            F.col("CURR.GuarantorKey") == F.col("DEL.GuarantorKey"),
-            "left_anti"
-        )
-        .select("CURR.*")
-    )
-
-    expired_changed_df = (
-        current_target_df.alias("CURR")
-        .join(
-            changed_df.select("PATID", "EPISODE_NUMBER", "GuarantorID").dropDuplicates().alias("CHG"),
-            on=[
-                F.col("CURR.PATID") == F.col("CHG.PATID"),
-                F.col("CURR.EPISODE_NUMBER") == F.col("CHG.EPISODE_NUMBER"),
-                F.col("CURR.GuarantorID") == F.col("CHG.GuarantorID")
-            ],
-            how="inner"
-        )
-        .select("CURR.*")
-        .withColumn("SCD_End_Date", F.current_timestamp())
-        .withColumn("IsCurrent", F.lit(0))
-    )
-
-    expired_deleted_df = (
-        deleted_current_df
-        .withColumn("SCD_End_Date", F.current_timestamp())
-        .withColumn("IsCurrent", F.lit(0))
-    )
+        
+        new_current_df.write.format("delta").mode("append").saveAsTable(TARGET_TBL)
 
     # --------------------------------------------------------
-    # Prepare new current rows for NEW INSERT and CHANGED
-    # --------------------------------------------------------
-    inserts_to_add_df = (
-        new_insert_df.unionByName(changed_df)
-        .select(
-            "PATID",
-            "ClientKey",
-            "EPISODE_NUMBER",
-            "GuarantorID",
-            "GuarantorName",
-            "FinancialClass",
-            "SubscriberName",
-            "ClientRelationToSub",
-            "SubsPolicy",
-            "SubsReleaseInfoCode",
-            "SubsIDCardIssueDate"
-        )
-        .dropDuplicates(["PATID", "EPISODE_NUMBER", "GuarantorID", "SubscriberName",
-                         "ClientRelationToSub", "SubsPolicy", "SubsReleaseInfoCode", "SubsIDCardIssueDate"])
-    )
-
-    max_key = target_df.select(F.coalesce(F.max("GuarantorKey"), F.lit(0)).alias("max_key")).collect()[0]["max_key"]
-
-    key_window = Window.orderBy(
-        F.col("PATID"),
-        F.col("EPISODE_NUMBER"),
-        F.col("GuarantorID"),
-        F.col("ClientKey")
-    )
-
-    new_current_df = (
-        inserts_to_add_df
-        .withColumn("GuarantorKey", F.row_number().over(key_window) + F.lit(int(max_key)))
-        .withColumn("SCD_Start_Date", F.current_timestamp())
-        .withColumn("SCD_End_Date", F.to_timestamp(F.lit(FUTURE_END_DATE)))
-        .withColumn("IsCurrent", F.lit(1))
-        .select(
-            "GuarantorKey",
-            "PATID",
-            "ClientKey",
-            "EPISODE_NUMBER",
-            "GuarantorID",
-            "GuarantorName",
-            "FinancialClass",
-            "SubscriberName",
-            "ClientRelationToSub",
-            "SubsPolicy",
-            "SubsReleaseInfoCode",
-            "SubsIDCardIssueDate",
-            "SCD_Start_Date",
-            "SCD_End_Date",
-            "IsCurrent"
-        )
-    )
-
-    # -----------------------
-    # Final dataframe with exact final column names
-    # --------------------------------------------------------
-    final_df = (
-        historical_target_df
-        .unionByName(current_unchanged_df.select(historical_target_df.columns))
-        .unionByName(expired_changed_df.select(historical_target_df.columns))
-        .unionByName(expired_deleted_df.select(historical_target_df.columns))
-        .unionByName(new_current_df.select(historical_target_df.columns))
-        .select(
-            F.col("GuarantorKey").cast("long").alias("GuarantorKey"),
-            F.col("PATID").cast("string").alias("PATID"),
-            F.col("ClientKey").cast("int").alias("ClientKey"),
-            F.col("EPISODE_NUMBER").cast("long").alias("EPISODE_NUMBER"),
-            F.col("GuarantorID").cast("string").alias("GuarantorID"),
-            F.col("GuarantorName").cast("string").alias("GuarantorName"),
-            F.col("FinancialClass").cast("string").alias("FinancialClass"),
-            F.col("SubscriberName").cast("string").alias("SubscriberName"),
-            F.col("ClientRelationToSub").cast("string").alias("ClientRelationToSub"),
-            F.col("SubsPolicy").cast("string").alias("SubsPolicy"),
-            F.col("SubsReleaseInfoCode").cast("string").alias("SubsReleaseInfoCode"),
-            F.col("SubsIDCardIssueDate").cast("date").alias("SubsIDCardIssueDate"),
-            F.col("SCD_Start_Date").cast("timestamp").alias("SCD_Start_Date"),
-            F.col("SCD_End_Date").cast("timestamp").alias("SCD_End_Date"),
-            F.col("IsCurrent").cast("int").alias("IsCurrent")
-        )
-    )
-
-    # --------------------------------------------------------
-    # Overwrite target
-    # --------------------------------------------------------
-    final_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(TARGET_TBL)
-
-    # --------------------------------------------------------
-    # Ending counts
+    # Log Final Verification Statistics
     # --------------------------------------------------------
     refreshed_target_df = spark.table(TARGET_TBL)
     end_count = refreshed_target_df.count()
     end_curr = refreshed_target_df.filter(F.col("IsCurrent") == 1).count()
 
-    # --------------------------------------------------------
-    # Write success log
-    # --------------------------------------------------------
     write_log(
-        begin_count=begin_count,
-        begin_curr=begin_curr,
-        new_inserts=new_inserts,
-        change_updates=change_updates,
-        change_inserts=change_inserts,
-        delete_updates=delete_updates,
-        end_count=end_count,
-        end_curr=end_curr,
-        run_status="SUCCESS",
-        error_message=""
+        begin_count=begin_count, begin_curr=begin_curr,
+        new_inserts=new_inserts, change_updates=change_updates, change_inserts=change_inserts,
+        delete_updates=delete_updates, end_count=end_count, end_curr=end_curr,
+        run_status="SUCCESS", error_message=""
     )
 
-    print("Dim_Client_Guarantors load completed successfully")
+    print("Dim_Client_Guarantors load completed successfully.")
     print(f"Begin Count      : {begin_count}")
-    print(f"Begin Current    : {begin_curr}")
-    print(f"New Inserts      : {new_inserts}")
-    print(f"Change Updates   : {change_updates}")
-    print(f"Change Inserts   : {change_inserts}")
-    print(f"Delete Updates   : {delete_updates}")
     print(f"End Count        : {end_count}")
     print(f"End Current      : {end_curr}")
 
 except Exception as e:
     err = traceback.format_exc()
-
     try:
         write_log(
-            begin_count=begin_count,
-            begin_curr=begin_curr,
-            new_inserts=new_inserts,
-            change_updates=change_updates,
-            change_inserts=change_inserts,
-            delete_updates=delete_updates,
-            end_count=end_count,
-            end_curr=end_curr,
-            run_status="FAILED",
-            error_message=str(e)[:4000]
+            begin_count=begin_count, begin_curr=begin_curr,
+            new_inserts=new_inserts, change_updates=change_updates, change_inserts=change_inserts,
+            delete_updates=delete_updates, end_count=end_count, end_curr=end_curr,
+            run_status="FAILED", error_message=str(e)[:4000]
         )
     except:
         pass
-
-    print("Dim_Client_Guarantors load failed")
+    print("Dim_Client_Guarantors load failed.")
     print(err)
     raise
+finally:
+    try: guarantors_df.unpersist()
+    except: pass
+    try: compare_df.unpersist()
+    except: pass
+    try: deleted_current_df.unpersist()
+    except: pass

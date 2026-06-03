@@ -1,281 +1,431 @@
-USE [DimensionDW]
-GO
-
-/****** Object:  StoredProcedure [DW].[usp_update_Dim_Client_Guarantors]    Script Date: 6/2/2026 11:44:06 PM ******/
-DROP PROCEDURE [DW].[usp_update_Dim_Client_Guarantors]
-GO
-
-/****** Object:  StoredProcedure [DW].[usp_update_Dim_Client_Guarantors]    Script Date: 6/2/2026 11:44:06 PM ******/
-SET ANSI_NULLS ON
-GO
-
-SET QUOTED_IDENTIFIER OFF
-GO
-
-
-
-
-
-CREATE PROCEDURE [DW].[usp_update_Dim_Client_Guarantors]
-/********************************************************************************************************************************************
-PROCEDURE NAME	: DW.usp_update_Dim_Client_Guarantors
-DESCRIPTION		:
-SAMPLE CALL		: EXEC DW.usp_update_Dim_Client_Guarantors;
-VERSION			: 2.0
-COMMENT			: DATE			USER				COMMENT:
-				  3/1/2024	C. Sherrill			Procedure Creation
-********************************************************************************************************************************************/
-
-AS
-
-SET NOCOUNT ON;
-
--- ##########################################################################################################################
--- Drop / Truncate Temp Holding Tables if the exist
-
-IF OBJECT_ID ('tempdb..#GUARANTORS') IS NOT NULL
-BEGIN
-	DROP TABLE #GUARANTORS
-END;
-
-IF OBJECT_ID ('tempdb..#COMPARE') IS NOT NULL
-BEGIN
-	DROP TABLE #COMPARE
-END;
-
-IF OBJECT_ID ('tempdb..#DELETED') IS NOT NULL
-BEGIN
-	DROP TABLE #DELETED
-END;
-
-
-DECLARE  @TableName VARCHAR(40) = 'Dim_Client_Guarantors'
-		,@BeginCount INT = 0
-		,@BeginCurr INT = 0
-		,@NewInserts INT = 0
-		,@ChangeUpdates INT = 0
-		,@ChangeInserts INT = 0
-		,@DeleteUpdates INT = 0
-		,@EndCount INT = 0
-		,@EndCurr INT = 0
-		,@ETLType VARCHAR(40) = 'SCD MERGE'
-
-SELECT @BeginCount = COUNT(*) FROM DW.Dim_Client_Guarantors;
-
-SELECT @BeginCurr = COUNT(*) FROM DW.Dim_Client_Guarantors WHERE IsCurrent = 1;
-
-
-
-CREATE TABLE #GUARANTORS
-(	PATID	VARCHAR(20) NOT NULL,
-	ClientKey	INT NOT NULL,
-	EPISODE_NUMBER NUMERIC(10,0) NOT NULL,
-	GuarantorID VARCHAR(40) NOT NULL,
-	GuarantorName VARCHAR(40) NULL,
-	FinancialClass	VARCHAR(40) NULL,
-	SubscriberName	VARCHAR(87) NULL,
-	ClientRelationToSub	VARCHAR(40) NULL,
-	SubsPolicy	VARCHAR(20) NULL,
-	SubsReleaseInfoCode	VARCHAR(5) NULL,
-	SubsIDCardIssueDate	DATE NULL
- )
-
-
-CREATE TABLE #COMPARE
-(
-	PATID	VARCHAR(20) NOT NULL,
-	ClientKey	INT NOT NULL,
-	EPISODE_NUMBER NUMERIC(10,0) NOT NULL,
-	GuarantorID VARCHAR(40) NOT NULL,
-	GuarantorName VARCHAR(40) NULL,
-	FinancialClass	VARCHAR(40) NULL,
-	SubscriberName	VARCHAR(87) NULL,
-	ClientRelationToSub	VARCHAR(40) NULL,
-	SubsPolicy	VARCHAR(20) NULL,
-	SubsReleaseInfoCode	VARCHAR(5) NULL,
-	SubsIDCardIssueDate	DATE NULL,
-	GuarantorKey	INT NULL,
-	CHANGE_IND	VARCHAR(20) NULL
+from pyspark.sql import SparkSession, functions as F, Window
+from pyspark.sql.types import (
+    StructType, StructField, IntegerType, LongType, StringType, DateType, TimestampType
 )
+import traceback
 
-CREATE TABLE #DELETED
-(
-	GuarantorKey	INT NOT NULL
-)
+# ============================================================
+# Spark session / configs
+# ============================================================
+spark = SparkSession.builder.appName("Build DW.Dim_Client_Guarantors").getOrCreate()
 
+spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
+spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 
-INSERT INTO #GUARANTORS
-SELECT  SUB.PATID
-		,DC.ClientKey
-		,SUB.EPISODE_NUMBER
-		,SUB.GUARANTOR_ID AS GuarantorID
-		,SUB.guarantor_name AS GuarantorName
-		,GUAR.financial_class_value AS FinancialClass
-		,SUB.subs_name AS SubscriberName
-		,SUB.client_relation_to_subs_value AS ClientRelationToSub
-		,SUB.subs_policy
-		,SUB.subs_release_info_code
-		,SUB.subs_id_card_issue_date
-  FROM AvatarDWReporting.SYSTEM.billing_guar_subs_data SUB
-  JOIN AvatarDWReporting.SYSTEM.billing_guar_table GUAR
-	ON SUB.GUARANTOR_ID = GUAR.GUARANTOR_ID
-JOIN DW.Dim_Client DC
-	ON SUB.PATID = DC.PATID
-	AND DC.IsCurrent = 1
+# ============================================================
+# Config
+# ============================================================
+DB = "MHMR_LAKEHOUSE"
 
-INSERT INTO #COMPARE
-SELECT GUAR.PATID
-	,GUAR.ClientKey
-	,GUAR.EPISODE_NUMBER
-	,GUAR.GuarantorID
-	,GUAR.GuarantorName
-	,GUAR.FinancialClass
-	,GUAR.SubscriberName
-	,GUAR.ClientRelationToSub
-	,GUAR.SubsPolicy
-	,GUAR.SubsReleaseInfoCode
-	,GUAR.SubsIDCardIssueDate
-	,DCG.GuarantorKey
-	,CASE WHEN DCG.PATID IS NULL THEN 'NEW INSERT'
-		WHEN CONCAT(GUAR.SubscriberName
-	,GUAR.ClientRelationToSub
-	,GUAR.SubsPolicy
-	,GUAR.SubsReleaseInfoCode
-	,GUAR.SubsIDCardIssueDate) <>
-			CONCAT(DCG.SubscriberName
-	,DCG.ClientRelationToSub
-	,DCG.SubsPolicy
-	,DCG.SubsReleaseInfoCode
-	,DCG.SubsIDCardIssueDate) THEN 'CHANGED'
-	ELSE NULL END AS CHANGE_IND
-FROM #GUARANTORS GUAR
-LEFT JOIN DW.Dim_Client_Guarantors DCG
-	ON GUAR.PATID = DCG.PATID
-	AND GUAR.EPISODE_NUMBER = DCG.EPISODE_NUMBER
-	AND GUAR.GuarantorID = DCG.GuarantorID
-	AND DCG.IsCurrent = 1
+# Source tables
+SRC_SUB_TBL      = f"{DB}.RAW.billing_guar_subs_data_RAW"
+SRC_GUAR_TBL     = f"{DB}.RAW.billing_guar_table_RAW"
 
+# Fabric target / reference tables
+DIM_CLIENT_TBL   = f"{DB}.DW.Dim_Client"
+TARGET_TBL       = f"{DB}.DW.Dim_Client_Guarantors"
+FINAL_LOG_TBL    = f"{DB}.LOGS.client_guarantors_final_log"
 
+TABLE_NAME_FOR_LOG = "Dim_Client_Guarantors"
+ETL_TYPE_FOR_LOG   = "Incremental"
 
-INSERT INTO DW.Dim_Client_Guarantors
-select PATID
-	,ClientKey
-	,EPISODE_NUMBER
-	,GuarantorID
-	,GuarantorName
-	,FinancialClass
-	,SubscriberName
-	,ClientRelationToSub
-	,SubsPolicy
-	,SubsReleaseInfoCode
-	,SubsIDCardIssueDate
-	,GETDATE() 
-	,'2199-12-31'
-	,1
-from #COMPARE 
-where CHANGE_IND = 'NEW INSERT'
+FUTURE_END_DATE = "2199-12-31"
 
-SET @NewInserts = @@ROWCOUNT;
+# ============================================================
+# Helper functions
+# ============================================================
+def table_exists(table_name: str) -> bool:
+    try:
+        spark.table(table_name)
+        return True
+    except:
+        return False
 
-UPDATE DCG
-SET	DCG.SCD_End_Date = GETDATE(),
-	DCG.IsCurrent = 0
-FROM DW.Dim_Client_Guarantors DCG
-JOIN #COMPARE COMP
-	ON DCG.PATID = COMP.PATID
-	AND DCG.EPISODE_NUMBER = COMP.EPISODE_NUMBER
-	AND DCG.GuarantorID = COMP.GuarantorID
-	AND COMP.CHANGE_IND = 'CHANGED'
+def create_log_table_if_not_exists():
+    if not table_exists(FINAL_LOG_TBL):
+        log_schema = StructType([
+            StructField("Logdate", TimestampType(), True),
+            StructField("TableName", StringType(), True),
+            StructField("BeginRecCount", LongType(), True),
+            StructField("BeginCurrCount", LongType(), True),
+            StructField("NewInserts", LongType(), True),
+            StructField("ChangeUpdates", LongType(), True),
+            StructField("ChangeInserts", LongType(), True),
+            StructField("DeleteUpdates", LongType(), True),
+            StructField("EndRecCount", LongType(), True),
+            StructField("EndCurrCount", LongType(), True),
+            StructField("ETL_TYPE", StringType(), True),
+            StructField("RunStatus", StringType(), True),
+            StructField("ErrorMessage", StringType(), True)
+        ])
+        spark.createDataFrame([], log_schema).write.format("delta").mode("overwrite").saveAsTable(FINAL_LOG_TBL)
 
-SET @ChangeUpdates = @@ROWCOUNT;
+def write_log(begin_count, begin_curr, new_inserts, change_updates, change_inserts,
+              delete_updates, end_count, end_curr, run_status, error_message):
+    log_row = [(
+        None,
+        TABLE_NAME_FOR_LOG,
+        int(begin_count),
+        int(begin_curr),
+        int(new_inserts),
+        int(change_updates),
+        int(change_inserts),
+        int(delete_updates),
+        int(end_count),
+        int(end_curr),
+        ETL_TYPE_FOR_LOG,
+        run_status,
+        error_message
+    )]
 
+    log_schema = StructType([
+        StructField("Logdate", TimestampType(), True),
+        StructField("TableName", StringType(), True),
+        StructField("BeginRecCount", LongType(), True),
+        StructField("BeginCurrCount", LongType(), True),
+        StructField("NewInserts", LongType(), True),
+        StructField("ChangeUpdates", LongType(), True),
+        StructField("ChangeInserts", LongType(), True),
+        StructField("DeleteUpdates", LongType(), True),
+        StructField("EndRecCount", LongType(), True),
+        StructField("EndCurrCount", LongType(), True),
+        StructField("ETL_TYPE", StringType(), True),
+        StructField("RunStatus", StringType(), True),
+        StructField("ErrorMessage", StringType(), True)
+    ])
 
-INSERT INTO DW.Dim_Client_Guarantors
-select PATID
-	,ClientKey
-	,EPISODE_NUMBER
-	,GuarantorID
-	,GuarantorName
-	,FinancialClass
-	,SubscriberName
-	,ClientRelationToSub
-	,SubsPolicy
-	,SubsReleaseInfoCode
-	,SubsIDCardIssueDate
-	,GETDATE() 
-	,'2199-12-31'
-	,1
-from #COMPARE 
-where CHANGE_IND = 'CHANGED'
+    df = spark.createDataFrame(log_row, schema=log_schema).withColumn("Logdate", F.current_timestamp())
+    df.write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
 
-SET @ChangeInserts = @@ROWCOUNT;
+def build_compare_string(df_alias_prefix=""):
+    p = f"{df_alias_prefix}." if df_alias_prefix else ""
+    return F.concat_ws(
+        "||",
+        F.coalesce(F.col(f"{p}SubscriberName").cast("string"), F.lit("")),
+        F.coalesce(F.col(f"{p}ClientRelationToSub").cast("string"), F.lit("")),
+        F.coalesce(F.col(f"{p}SubsPolicy").cast("string"), F.lit("")),
+        F.coalesce(F.col(f"{p}SubsReleaseInfoCode").cast("string"), F.lit("")),
+        F.coalesce(F.date_format(F.col(f"{p}SubsIDCardIssueDate"), "yyyy-MM-dd"), F.lit(""))
+    )
 
+# ============================================================
+# Create target table if not exists
+# ============================================================
+if not table_exists(TARGET_TBL):
+    target_schema = StructType([
+        StructField("GuarantorKey", LongType(), False),
+        StructField("PATID", StringType(), False),
+        StructField("ClientKey", IntegerType(), False),
+        StructField("EPISODE_NUMBER", LongType(), False),
+        StructField("GuarantorID", StringType(), False),
+        StructField("GuarantorName", StringType(), True),
+        StructField("FinancialClass", StringType(), True),
+        StructField("SubscriberName", StringType(), True),
+        StructField("ClientRelationToSub", StringType(), True),
+        StructField("SubsPolicy", StringType(), True),
+        StructField("SubsReleaseInfoCode", StringType(), True),
+        StructField("SubsIDCardIssueDate", DateType(), True),
+        StructField("SCD_Start_Date", TimestampType(), True),
+        StructField("SCD_End_Date", TimestampType(), True),
+        StructField("IsCurrent", IntegerType(), True)
+    ])
+    spark.createDataFrame([], target_schema).write.format("delta").mode("overwrite").saveAsTable(TARGET_TBL)
 
-INSERT INTO #DELETED
-SELECT DCG.GuarantorKey
-FROM DW.Dim_Client_Guarantors DCG
-LEFT JOIN #COMPARE COMP
-	ON DCG.PATID = COMP.PATID
-	AND DCG.EPISODE_NUMBER = COMP.EPISODE_NUMBER
-	AND DCG.GuarantorID = COMP.GuarantorID
-WHERE COMP.PATID IS NULL
+create_log_table_if_not_exists()
 
+# ============================================================
+# Main logic
+# ============================================================
+begin_count = 0
+begin_curr = 0
+new_inserts = 0
+change_updates = 0
+change_inserts = 0
+delete_updates = 0
+end_count = 0
+end_curr = 0
 
-UPDATE DCG
-SET DCG.SCD_End_Date = GETDATE(),
-	DCG.IsCurrent = 0
-FROM DW.Dim_Client_Guarantors DCG
-JOIN #DELETED DEL
-	ON DCG.GuarantorKey = DEL.GuarantorKey
+try:
+    # --------------------------------------------------------
+    # Beginning counts
+    # --------------------------------------------------------
+    target_df = spark.table(TARGET_TBL)
 
-SET @DeleteUpdates = @@ROWCOUNT;
+    begin_count = target_df.count()
+    begin_curr = target_df.filter(F.col("IsCurrent") == 1).count()
 
+    # --------------------------------------------------------
+    # Build GUARANTORS source dataset with clean de-duplication
+    # --------------------------------------------------------
+    sub_raw = spark.table(SRC_SUB_TBL).alias("SUB")
+    guar_raw = spark.table(SRC_GUAR_TBL).alias("GUAR")
+    dim_client_df = spark.table(DIM_CLIENT_TBL).filter(F.col("IsCurrent") == 1).alias("DC")
 
-SELECT @EndCount = COUNT(*) FROM DW.Dim_Client_Guarantors;
+    # Add a deduplication window to prevent dirty operational fans from widening row counts
+    src_dedup_window = Window.partitionBy("SUB.PATID", "SUB.EPISODE_NUMBER", "SUB.GUARANTOR_ID").orderBy(F.col("SUB.subs_id_card_issue_date").desc(), F.col("SUB.GUARANTOR_ID"))
 
-SELECT @EndCurr = COUNT(*) FROM DW.Dim_Client_Guarantors WHERE IsCurrent = 1;
+    guarantors_df = (
+        sub_raw.join(
+            guar_raw,
+            F.col("SUB.GUARANTOR_ID") == F.col("GUAR.GUARANTOR_ID"),
+            "inner"
+        )
+        .join(
+            dim_client_df,
+            F.col("SUB.PATID") == F.col("DC.PATID"),
+            "inner"
+        )
+        .withColumn("_row_num", F.row_number().over(src_dedup_window))
+        .filter(F.col("_row_num") == 1) # Force deterministic 1-to-1 matching strategy
+        .select(
+            F.col("SUB.PATID").cast("string").alias("PATID"),
+            F.col("DC.ClientKey").cast("int").alias("ClientKey"),
+            F.col("SUB.EPISODE_NUMBER").cast("long").alias("EPISODE_NUMBER"),
+            F.col("SUB.GUARANTOR_ID").cast("string").alias("GuarantorID"),
+            F.col("SUB.guarantor_name").cast("string").alias("GuarantorName"),
+            F.col("GUAR.financial_class_value").cast("string").alias("FinancialClass"),
+            F.col("SUB.subs_name").cast("string").alias("SubscriberName"),
+            F.col("SUB.client_relation_to_subs_value").cast("string").alias("ClientRelationToSub"),
+            F.col("SUB.subs_policy").cast("string").alias("SubsPolicy"),
+            F.col("SUB.subs_release_info_code").cast("string").alias("SubsReleaseInfoCode"),
+            F.to_date(F.col("SUB.subs_id_card_issue_date")).alias("SubsIDCardIssueDate")
+        )
+    ).cache()
 
-INSERT INTO LOGGING.DW_PROCESS_LOG
-(Logdate 
-,TableName
-,BeginRecCount
-,BeginCurrCount
-,NewInserts
-,ChangeUpdates
-,ChangeInserts
-,DeleteUpdates
-,EndRecCount
-,EndCurrCount
-,ETL_TYPE)
-VALUES
-	(GETDATE()
-	,@TableName
-	,@BeginCount
-	,@BeginCurr
-	,@NewInserts
-	,@ChangeUpdates
-	,@ChangeInserts
-	,@DeleteUpdates
-	,@EndCount
-	,@EndCurr
-	,@ETLType)
+    # --------------------------------------------------------
+    # Current target only
+    # --------------------------------------------------------
+    current_target_df = (
+        target_df
+        .filter(F.col("IsCurrent") == 1)
+        .select(
+            "GuarantorKey", "PATID", "ClientKey", "EPISODE_NUMBER", "GuarantorID",
+            "GuarantorName", "FinancialClass", "SubscriberName", "ClientRelationToSub",
+            "SubsPolicy", "SubsReleaseInfoCode", "SubsIDCardIssueDate",
+            "SCD_Start_Date", "SCD_End_Date", "IsCurrent"
+        )
+        .alias("DCG")
+    )
 
+    # --------------------------------------------------------
+    # Build COMPARE dataset
+    # --------------------------------------------------------
+    compare_df = (
+        guarantors_df.alias("GUAR")
+        .join(
+            current_target_df,
+            on=[
+                F.col("GUAR.PATID") == F.col("DCG.PATID"),
+                F.col("GUAR.EPISODE_NUMBER") == F.col("DCG.EPISODE_NUMBER"),
+                F.col("GUAR.GuarantorID") == F.col("DCG.GuarantorID")
+            ],
+            how="left"
+        )
+        .select(
+            F.col("GUAR.PATID").alias("PATID"),
+            F.col("GUAR.ClientKey").alias("ClientKey"),
+            F.col("GUAR.EPISODE_NUMBER").alias("EPISODE_NUMBER"),
+            F.col("GUAR.GuarantorID").alias("GuarantorID"),
+            F.col("GUAR.GuarantorName").alias("GuarantorName"),
+            F.col("GUAR.FinancialClass").alias("FinancialClass"),
+            F.col("GUAR.SubscriberName").alias("SubscriberName"),
+            F.col("GUAR.ClientRelationToSub").alias("ClientRelationToSub"),
+            F.col("GUAR.SubsPolicy").alias("SubsPolicy"),
+            F.col("GUAR.SubsReleaseInfoCode").alias("SubsReleaseInfoCode"),
+            F.col("GUAR.SubsIDCardIssueDate").alias("SubsIDCardIssueDate"),
+            F.col("DCG.GuarantorKey").alias("GuarantorKey"),
+            F.when(
+                F.col("DCG.PATID").isNull(),
+                F.lit("NEW INSERT")
+            ).when(
+                build_compare_string("GUAR") != build_compare_string("DCG"),
+                F.lit("CHANGED")
+            ).otherwise(F.lit(None)).alias("CHANGE_IND")
+        )
+    ).cache()
 
+    # --------------------------------------------------------
+    # New Inserts and Changed records
+    # --------------------------------------------------------
+    new_insert_df = compare_df.filter(F.col("CHANGE_IND") == "NEW INSERT")
+    changed_df = compare_df.filter(F.col("CHANGE_IND") == "CHANGED")
 
-IF OBJECT_ID ('tempdb..#GUARANTORS') IS NOT NULL
-BEGIN
-	DROP TABLE #GUARANTORS
-END;
+    new_inserts = new_insert_df.count()
+    change_inserts = changed_df.count()
+    change_updates = changed_df.count()
 
-IF OBJECT_ID ('tempdb..#COMPARE') IS NOT NULL
-BEGIN
-	DROP TABLE #COMPARE
-END;
+    # --------------------------------------------------------
+    # Deleted current records
+    # --------------------------------------------------------
+    compare_keys_df = compare_df.select("PATID", "EPISODE_NUMBER", "GuarantorID").dropDuplicates()
 
-IF OBJECT_ID ('tempdb..#DELETED') IS NOT NULL
-BEGIN
-	DROP TABLE #DELETED
-END;
-GO
+    deleted_current_df = (
+        current_target_df.alias("DCG")
+        .join(
+            compare_keys_df.alias("COMP"),
+            on=[
+                F.col("DCG.PATID") == F.col("COMP.PATID"),
+                F.col("DCG.EPISODE_NUMBER") == F.col("COMP.EPISODE_NUMBER"),
+                F.col("DCG.GuarantorID") == F.col("COMP.GuarantorID")
+            ],
+            how="left_anti"
+        )
+    )
 
+    delete_updates = deleted_current_df.count()
 
+    # --------------------------------------------------------
+    # Existing target split
+    # --------------------------------------------------------
+    historical_target_df = target_df.filter(F.col("IsCurrent") != 1)
+
+    current_unchanged_df = (
+        current_target_df.alias("CURR")
+        .join(
+            changed_df.select("PATID", "EPISODE_NUMBER", "GuarantorID").dropDuplicates().alias("CHG"),
+            on=[
+                F.col("CURR.PATID") == F.col("CHG.PATID"),
+                F.col("CURR.EPISODE_NUMBER") == F.col("CHG.EPISODE_NUMBER"),
+                F.col("CURR.GuarantorID") == F.col("CHG.GuarantorID")
+            ],
+            how="left_anti"
+        )
+        .join(
+            deleted_current_df.select("GuarantorKey").dropDuplicates().alias("DEL"),
+            F.col("CURR.GuarantorKey") == F.col("DEL.GuarantorKey"),
+            "left_anti"
+        )
+        .select("CURR.*")
+    )
+
+    expired_changed_df = (
+        current_target_df.alias("CURR")
+        .join(
+            changed_df.select("PATID", "EPISODE_NUMBER", "GuarantorID").dropDuplicates().alias("CHG"),
+            on=[
+                F.col("CURR.PATID") == F.col("CHG.PATID"),
+                F.col("CURR.EPISODE_NUMBER") == F.col("CHG.EPISODE_NUMBER"),
+                F.col("CURR.GuarantorID") == F.col("CHG.GuarantorID")
+            ],
+            how="inner"
+        )
+        .select("CURR.*")
+        .withColumn("SCD_End_Date", F.current_timestamp())
+        .withColumn("IsCurrent", F.lit(0))
+    )
+
+    expired_deleted_df = (
+        deleted_current_df
+        .withColumn("SCD_End_Date", F.current_timestamp())
+        .withColumn("IsCurrent", F.lit(0))
+    )
+
+    # --------------------------------------------------------
+    # Prepare new current rows for NEW INSERT and CHANGED
+    # --------------------------------------------------------
+    inserts_to_add_df = (
+        new_insert_df.unionByName(changed_df)
+        .select(
+            "PATID", "ClientKey", "EPISODE_NUMBER", "GuarantorID", "GuarantorName",
+            "FinancialClass", "SubscriberName", "ClientRelationToSub", "SubsPolicy",
+            "SubsReleaseInfoCode", "SubsIDCardIssueDate"
+        )
+        .dropDuplicates(["PATID", "EPISODE_NUMBER", "GuarantorID"])
+    )
+
+    max_key = target_df.select(F.coalesce(F.max("GuarantorKey"), F.lit(0)).alias("max_key")).collect()[0]["max_key"]
+
+    key_window = Window.orderBy(
+        F.col("PATID"), F.col("EPISODE_NUMBER"), F.col("GuarantorID"), F.col("ClientKey")
+    )
+
+    new_current_df = (
+        inserts_to_add_df
+        .withColumn("GuarantorKey", F.row_number().over(key_window) + F.lit(int(max_key)))
+        .withColumn("SCD_Start_Date", F.current_timestamp())
+        .withColumn("SCD_End_Date", F.to_timestamp(F.lit(FUTURE_END_DATE)))
+        .withColumn("IsCurrent", F.lit(1))
+        .select(
+            "GuarantorKey", "PATID", "ClientKey", "EPISODE_NUMBER", "GuarantorID",
+            "GuarantorName", "FinancialClass", "SubscriberName", "ClientRelationToSub",
+            "SubsPolicy", "SubsReleaseInfoCode", "SubsIDCardIssueDate",
+            "SCD_Start_Date", "SCD_End_Date", "IsCurrent"
+        )
+    )
+
+    # -----------------------
+    # Final unified projection structure
+    # --------------------------------------------------------
+    final_df = (
+        historical_target_df
+        .unionByName(current_unchanged_df.select(historical_target_df.columns))
+        .unionByName(expired_changed_df.select(historical_target_df.columns))
+        .unionByName(expired_deleted_df.select(historical_target_df.columns))
+        .unionByName(new_current_df.select(historical_target_df.columns))
+        .select(
+            F.col("GuarantorKey").cast("long").alias("GuarantorKey"),
+            F.col("PATID").cast("string").alias("PATID"),
+            F.col("ClientKey").cast("int").alias("ClientKey"),
+            F.col("EPISODE_NUMBER").cast("long").alias("EPISODE_NUMBER"),
+            F.col("GuarantorID").cast("string").alias("GuarantorID"),
+            F.col("GuarantorName").cast("string").alias("GuarantorName"),
+            F.col("FinancialClass").cast("string").alias("FinancialClass"),
+            F.col("SubscriberName").cast("string").alias("SubscriberName"),
+            F.col("ClientRelationToSub").cast("string").alias("ClientRelationToSub"),
+            F.col("SubsPolicy").cast("string").alias("SubsPolicy"),
+            F.col("SubsReleaseInfoCode").cast("string").alias("SubsReleaseInfoCode"),
+            F.col("SubsIDCardIssueDate").cast("date").alias("SubsIDCardIssueDate"),
+            F.col("SCD_Start_Date").cast("timestamp").alias("SCD_Start_Date"),
+            F.col("SCD_End_Date").cast("timestamp").alias("SCD_End_Date"),
+            F.col("IsCurrent").cast("int").alias("IsCurrent")
+        )
+    )
+
+    # Overwrite target Delta table
+    final_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(TARGET_TBL)
+
+    # Recalculate Final Operational Metrics
+    refreshed_target_df = spark.table(TARGET_TBL)
+    end_count = refreshed_target_df.count()
+    end_curr = refreshed_target_df.filter(F.col("IsCurrent") == 1).count()
+
+    # Log operational execution footprint metrics
+    write_log(
+        begin_count=begin_count, begin_curr=begin_curr, new_inserts=new_inserts,
+        change_updates=change_updates, change_inserts=change_inserts,
+        delete_updates=delete_updates, end_count=end_count, end_curr=end_curr,
+        run_status="SUCCESS", error_message=""
+    )
+
+    print("Dim_Client_Guarantors load completed successfully")
+    print(f"Begin Count      : {begin_count}")
+    print(f"Begin Current    : {begin_curr}")
+    print(f"New Inserts      : {new_inserts}")
+    print(f"Change Updates   : {change_updates}")
+    print(f"Change Inserts   : {change_inserts}")
+    print(f"Delete Updates   : {delete_updates}")
+    print(f"End Count        : {end_count}")
+    print(f"End Current      : {end_curr}")
+
+except Exception as e:
+    err = traceback.format_exc()
+    try:
+        write_log(
+            begin_count=begin_count, begin_curr=begin_curr, new_inserts=new_inserts,
+            change_updates=change_updates, change_inserts=change_inserts,
+            delete_updates=delete_updates, end_count=end_count, end_curr=end_curr,
+            run_status="FAILED", error_message=str(e)[:4000]
+        )
+    except:
+        pass
+    print("Dim_Client_Guarantors load failed")
+    print(err)
+    raise
+finally:
+    # Memory optimization cleanup
+    try:
+        guarantors_df.unpersist()
+        compare_df.unpersist()
+    except:
+        pass

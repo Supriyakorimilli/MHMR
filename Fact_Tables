@@ -1,454 +1,356 @@
-USE [DimensionDW]
-GO
+from pyspark.sql import SparkSession, functions as F, Window
+from pyspark.sql.types import (
+    StructType, StructField, IntegerType, LongType, StringType, DateType, TimestampType
+)
+import traceback
 
-/****** Object:  StoredProcedure [DW].[usp_update_Dim_Client]    Script Date: 6/3/2026 4:11:02 PM ******/
-DROP PROCEDURE [DW].[usp_update_Dim_Client]
-GO
+# ============================================================
+# Spark session / configs
+# ============================================================
+spark = SparkSession.builder.appName("Build DW.Dim_Client_Guarantors").getOrCreate()
 
-/****** Object:  StoredProcedure [DW].[usp_update_Dim_Client]    Script Date: 6/3/2026 4:11:02 PM ******/
-SET ANSI_NULLS ON
-GO
+spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
+spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 
-SET QUOTED_IDENTIFIER OFF
-GO
+# ============================================================
+# Config
+# ============================================================
+DB = "MHMR_LAKEHOUSE"
 
+# Source tables
+SRC_SUB_TBL      = f"{DB}.RAW.billing_guar_subs_data_RAW"
+SRC_GUAR_TBL     = f"{DB}.RAW.billing_guar_table_RAW"
 
+# Fabric target / reference tables
+DIM_CLIENT_TBL   = f"{DB}.DW.Dim_Client"
+TARGET_TBL       = f"{DB}.DW.Dim_Client_Guarantors"
+FINAL_LOG_TBL    = f"{DB}.LOGS.client_guarantors_final_log"
 
+TABLE_NAME_FOR_LOG = "Dim_Client_Guarantors"
+ETL_TYPE_FOR_LOG   = "SCD MERGE"
 
+FUTURE_END_DATE = "2199-12-31"
 
-CREATE PROCEDURE [DW].[usp_update_Dim_Client]
-/********************************************************************************************************************************************
-PROCEDURE NAME	: DW.usp_update_Dim_Client
-DESCRIPTION		:
-SAMPLE CALL		: EXEC DW.usp_update_Dim_Client;
-VERSION			: 2.0
-COMMENT			: DATE			USER				COMMENT:
-				  1/9/2024	C. Sherrill			Procedure Creation
-				  10/21/2024 C. Sherrill		Added code to help auto-correct in the even all clients get marked as not current
-********************************************************************************************************************************************/
+# ============================================================
+# Helper functions
+# ============================================================
+def table_exists(table_name: str) -> bool:
+    try:
+        spark.table(table_name)
+        return True
+    except:
+        return False
 
-AS
+def create_log_table_if_not_exists():
+    if not table_exists(FINAL_LOG_TBL):
+        log_schema = StructType([
+            StructField("Logdate", TimestampType(), True),
+            StructField("TableName", StringType(), True),
+            StructField("BeginRecCount", LongType(), True),
+            StructField("BeginCurrCount", LongType(), True),
+            StructField("NewInserts", LongType(), True),
+            StructField("ChangeUpdates", LongType(), True),
+            StructField("ChangeInserts", LongType(), True),
+            StructField("DeleteUpdates", LongType(), True),
+            StructField("EndRecCount", LongType(), True),
+            StructField("EndCurrCount", LongType(), True),
+            StructField("ETL_TYPE", StringType(), True),
+            StructField("RunStatus", StringType(), True),
+            StructField("ErrorMessage", StringType(), True)
+        ])
+        spark.createDataFrame([], log_schema).write.format("delta").mode("overwrite").saveAsTable(FINAL_LOG_TBL)
 
-SET NOCOUNT ON;
+def write_log(begin_count, begin_curr, new_inserts, change_updates, change_inserts, 
+              delete_updates, end_count, end_curr, run_status, error_message):
+    log_row = [(
+        None,
+        TABLE_NAME_FOR_LOG,
+        int(begin_count),
+        int(begin_curr),
+        int(new_inserts),
+        int(change_updates),
+        int(change_inserts),
+        int(delete_updates),
+        int(end_count),
+        int(end_curr),
+        ETL_TYPE_FOR_LOG,
+        run_status,
+        error_message
+    )]
+    
+    log_schema = StructType([
+        StructField("Logdate", TimestampType(), True),
+        StructField("TableName", StringType(), True),
+        StructField("BeginRecCount", LongType(), True),
+        StructField("BeginCurrCount", LongType(), True),
+        StructField("NewInserts", LongType(), True),
+        StructField("ChangeUpdates", LongType(), True),
+        StructField("ChangeInserts", LongType(), True),
+        StructField("DeleteUpdates", LongType(), True),
+        StructField("EndRecCount", LongType(), True),
+        StructField("EndCurrCount", LongType(), True),
+        StructField("ETL_TYPE", StringType(), True),
+        StructField("RunStatus", StringType(), True),
+        StructField("ErrorMessage", StringType(), True)
+    ])
+    
+    df = spark.createDataFrame(log_row, schema=log_schema).withColumn("Logdate", F.current_timestamp())
+    df.write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
 
--- ##########################################################################################################################
--- Drop / Truncate Temp Holding Tables if the exist
+# Replicating T-SQL CONCAT behavior exactly (No delimiters, NULLs become empty strings)
+def build_sql_concat_string(df_alias_prefix=""):
+    p = f"{df_alias_prefix}." if df_alias_prefix else ""
+    return F.concat(
+        F.coalesce(F.trim(F.col(f"{p}SubscriberName").cast("string")), F.lit("")),
+        F.coalesce(F.trim(F.col(f"{p}ClientRelationToSub").cast("string")), F.lit("")),
+        F.coalesce(F.trim(F.col(f"{p}SubsPolicy").cast("string")), F.lit("")),
+        F.coalesce(F.trim(F.col(f"{p}SubsReleaseInfoCode").cast("string")), F.lit("")),
+        F.coalesce(F.date_format(F.col(f"{p}SubsIDCardIssueDate"), "yyyy-MM-dd"), F.lit(""))
+    )
 
-IF OBJECT_ID ('tempdb..#Active_clients') IS NOT NULL
-BEGIN
-	DROP TABLE #Active_clients
-END;
+# ============================================================
+# Create target table if not exists
+# ============================================================
+if not table_exists(TARGET_TBL):
+    target_schema = StructType([
+        StructField("GuarantorKey", LongType(), False),
+        StructField("PATID", StringType(), False),
+        StructField("ClientKey", IntegerType(), False),
+        StructField("EPISODE_NUMBER", LongType(), False),
+        StructField("GuarantorID", StringType(), False),
+        StructField("GuarantorName", StringType(), True),
+        StructField("FinancialClass", StringType(), True),
+        StructField("SubscriberName", StringType(), True),
+        StructField("ClientRelationToSub", StringType(), True),
+        StructField("SubsPolicy", StringType(), True),
+        StructField("SubsReleaseInfoCode", StringType(), True),
+        StructField("SubsIDCardIssueDate", DateType(), True),
+        StructField("SCD_Start_Date", TimestampType(), True),
+        StructField("SCD_End_Date", TimestampType(), True),
+        StructField("IsCurrent", IntegerType(), True)
+    ])
+    spark.createDataFrame([], target_schema).write.format("delta").mode("overwrite").saveAsTable(TARGET_TBL)
 
-IF OBJECT_ID ('tempdb..#New_clients') IS NOT NULL
-BEGIN
-	DROP TABLE #New_clients
-END;
+create_log_table_if_not_exists()
 
-IF OBJECT_ID ('tempdb..#Changed_clients') IS NOT NULL
-BEGIN
-	DROP TABLE #Changed_clients
-END;
+# ============================================================
+# Main logic
+# ============================================================
+begin_count = 0
+begin_curr = 0
+new_inserts = 0
+change_updates = 0
+change_inserts = 0
+delete_updates = 0
+end_count = 0
+end_curr = 0
 
-IF OBJECT_ID ('tempdb..#Deleted_clients') IS NOT NULL
-BEGIN
-	DROP TABLE #Deleted_clients
-END;
+try:
+    # --------------------------------------------------------
+    # Beginning counts
+    # --------------------------------------------------------
+    target_df = spark.table(TARGET_TBL)
+    begin_count = target_df.count()
+    begin_curr = target_df.filter(F.col("IsCurrent") == 1).count()
 
-DECLARE  @TableName VARCHAR(40) = 'Dim_Client'
-		,@BeginCount INT = 0
-		,@BeginCurr INT = 0
-		,@NewInserts INT = 0
-		,@ChangeUpdates INT = 0
-		,@ChangeInserts INT = 0
-		,@DeleteUpdates INT = 0
-		,@EndCount INT = 0
-		,@EndCurr INT = 0
-		,@ETLType VARCHAR(40) = 'SCD MERGE'
+    # --------------------------------------------------------
+    # Build GUARANTORS source dataset (#GUARANTORS)
+    # --------------------------------------------------------
+    sub_df = spark.table(SRC_SUB_TBL).alias("SUB")
+    guar_df = spark.table(SRC_GUAR_TBL).alias("GUAR")
+    
+    # Defensive windowing over Dim_Client to isolate precisely one active record
+    client_window = Window.partitionBy("PATID").orderBy(F.col("ClientKey").desc())
+    dim_client_df = (
+        spark.table(DIM_CLIENT_TBL)
+        .filter(F.col("IsCurrent") == 1)
+        .withColumn("rn", F.row_number().over(client_window))
+        .filter(F.col("rn") == 1)
+        .drop("rn")
+        .alias("DC")
+    )
 
-SELECT @BeginCount = COUNT(*) FROM DW.Dim_Client;
+    guarantors_df = (
+        sub_df.join(
+            guar_df,
+            F.upper(F.trim(F.col("SUB.GUARANTOR_ID"))) == F.upper(F.trim(F.col("GUAR.GUARANTOR_ID"))),
+            "inner"
+        )
+        .join(
+            dim_client_df,
+            F.upper(F.trim(F.col("SUB.PATID"))) == F.upper(F.trim(F.col("DC.PATID"))),
+            "inner"
+        )
+        .select(
+            F.trim(F.col("SUB.PATID")).cast("string").alias("PATID"),
+            F.col("DC.ClientKey").cast("int").alias("ClientKey"),
+            F.col("SUB.EPISODE_NUMBER").cast("long").alias("EPISODE_NUMBER"),
+            F.trim(F.col("SUB.GUARANTOR_ID")).cast("string").alias("GuarantorID"),
+            F.trim(F.col("SUB.guarantor_name")).cast("string").alias("GuarantorName"),
+            F.trim(F.col("GUAR.financial_class_value")).cast("string").alias("FinancialClass"),
+            F.trim(F.col("SUB.subs_name")).cast("string").alias("SubscriberName"),
+            F.trim(F.col("SUB.client_relation_to_subs_value")).cast("string").alias("ClientRelationToSub"),
+            F.trim(F.col("SUB.subs_policy")).cast("string").alias("SubsPolicy"),
+            F.trim(F.col("SUB.subs_release_info_code")).cast("string").alias("SubsReleaseInfoCode"),
+            F.to_date(F.col("SUB.subs_id_card_issue_date")).alias("SubsIDCardIssueDate")
+        )
+    ).distinct().cache()
 
-SELECT @BeginCurr = COUNT(*) FROM DW.Dim_Client WHERE IsCurrent = 1;
+    # --------------------------------------------------------
+    # Current target only
+    # --------------------------------------------------------
+    current_target_df = target_df.filter(F.col("IsCurrent") == 1).alias("DCG")
 
-CREATE TABLE #Active_clients
-(PATID	VARCHAR(10))
+    # --------------------------------------------------------
+    # Build COMPARE dataset (#COMPARE)
+    # --------------------------------------------------------
+    compare_df = (
+        guarantors_df.alias("GUAR")
+        .join(
+            current_target_df,
+            on=[
+                F.upper(F.trim(F.col("GUAR.PATID"))) == F.upper(F.trim(F.col("DCG.PATID"))),
+                F.col("GUAR.EPISODE_NUMBER") == F.col("DCG.EPISODE_NUMBER"),
+                F.upper(F.trim(F.col("GUAR.GuarantorID"))) == F.upper(F.trim(F.col("DCG.GuarantorID")))
+            ],
+            how="left"
+        )
+        .select(
+            F.col("GUAR.PATID").alias("PATID"),
+            F.col("GUAR.ClientKey").alias("ClientKey"),
+            F.col("GUAR.EPISODE_NUMBER").alias("EPISODE_NUMBER"),
+            F.col("GUAR.GuarantorID").alias("GuarantorID"),
+            F.col("GUAR.GuarantorName").alias("GuarantorName"),
+            F.col("GUAR.FinancialClass").alias("FinancialClass"),
+            F.col("GUAR.SubscriberName").alias("SubscriberName"),
+            F.col("GUAR.ClientRelationToSub").alias("ClientRelationToSub"),
+            F.col("GUAR.SubsPolicy").alias("SubsPolicy"),
+            F.col("GUAR.SubsReleaseInfoCode").alias("SubsReleaseInfoCode"),
+            F.col("GUAR.SubsIDCardIssueDate").alias("SubsIDCardIssueDate"),
+            F.col("DCG.GuarantorKey").alias("GuarantorKey"),
+            F.when(F.col("DCG.PATID").isNull(), F.lit("NEW INSERT"))
+            .when(build_sql_concat_string("GUAR") != build_sql_concat_string("DCG"), F.lit("CHANGED"))
+            .otherwise(F.lit(None)).alias("CHANGE_IND")
+        )
+    ).cache()
 
-CREATE TABLE #New_Clients
-	(
-	[PATID] [varchar](20) NOT NULL,
-	[patient_name] [varchar](100) NULL,
-	[patient_add_zipcode] [varchar](60) NULL,
-	[client_alias] [varchar](80) NULL,
-	[employment_status_value] [varchar](255) NULL,
-	[education_code] [varchar](10) NULL,
-	[marital_status_code] [varchar](15) NULL,
-	[facility_chart_number] [varchar](40) NULL,
-	[patient_sex_value] [varchar](40) NULL,
-	[race_value] [varchar](255) NULL,
-	[client_alias_7] [varchar](80) NULL,
-	[client_alias_8] [varchar](80) NULL,
-	[ethnic_origin_X_NRI_value] [varchar](255) NULL,
-	[medicaid_number] [varchar](20) NULL,
-	[patient_name_first] [varchar](40) NULL,
-	[patient_name_last] [varchar](40) NULL,
-	[patient_name_middle] [varchar](40) NULL,
-	[patient_name_prefix_code] [varchar](40) NULL,
-	[patient_name_prefix_value] [varchar](40) NULL,
-	[patient_name_suffix_code] [varchar](40) NULL,
-	[patient_name_suffix_value] [varchar](40) NULL,
-	[primary_language_value] [varchar](50) NULL,
-	[smoker_value] [varchar](50) NULL,
-	[IsActiveClient] [bit] NULL
-	)
+    # Isolate mutations
+    new_insert_df = compare_df.filter(F.col("CHANGE_IND") == "NEW INSERT")
+    changed_df = compare_df.filter(F.col("CHANGE_IND") == "CHANGED")
 
-CREATE TABLE #Changed_clients
-(	[ClientKey] INT NOT NULL,
-	[PATID] [varchar](20) NOT NULL,
-	[patient_name] [varchar](100) NULL,
-	[patient_add_zipcode] [varchar](60) NULL,
-	[client_alias] [varchar](80) NULL,
-	[employment_status_value] [varchar](255) NULL,
-	[education_code] [varchar](10) NULL,
-	[marital_status_code] [varchar](15) NULL,
-	[facility_chart_number] [varchar](40) NULL,
-	[patient_sex_value] [varchar](40) NULL,
-	[race_value] [varchar](255) NULL,
-	[client_alias_7] [varchar](80) NULL,
-	[client_alias_8] [varchar](80) NULL,
-	[ethnic_origin_X_NRI_value] [varchar](255) NULL,
-	[medicaid_number] [varchar](20) NULL,
-	[patient_name_first] [varchar](40) NULL,
-	[patient_name_last] [varchar](40) NULL,
-	[patient_name_middle] [varchar](40) NULL,
-	[patient_name_prefix_code] [varchar](40) NULL,
-	[patient_name_prefix_value] [varchar](40) NULL,
-	[patient_name_suffix_code] [varchar](40) NULL,
-	[patient_name_suffix_value] [varchar](40) NULL,
-	[primary_language_value] [varchar](50) NULL,
-	[smoker_value] [varchar](50) NULL,
-	[IsActiveClient] [bit] NULL
-	)
+    new_inserts = new_insert_df.count()
+    change_inserts = changed_df.count()
+    change_updates = change_inserts
 
-CREATE TABLE #Deleted_clients
-	(
-	[ClientKey] INT NOT NULL
-	)
+    # --------------------------------------------------------
+    # Identify Deleted / Orphan Records (#DELETED)
+    # --------------------------------------------------------
+    deleted_current_df = (
+        current_target_df.join(
+            compare_df.alias("COMP"),
+            on=[
+                F.upper(F.trim(F.col("DCG.PATID"))) == F.upper(F.trim(F.col("COMP.PATID"))),
+                F.col("DCG.EPISODE_NUMBER") == F.col("COMP.EPISODE_NUMBER"),
+                F.upper(F.trim(F.col("DCG.GuarantorID"))) == F.upper(F.trim(F.col("COMP.GuarantorID")))
+            ],
+            how="left_anti"
+        ).select("DCG.GuarantorKey")
+    ).cache()
+    
+    delete_updates = deleted_current_df.count()
 
---Active clients
-INSERT INTO #Active_clients
-SELECT DISTINCT PATID
---INTO #Active_clients
-from AvatarDWReporting.system.episode_history
-where isnull(date_of_discharge, '2199-12-31') >= DATEADD(MONTH,-13,GETDATE())
-  
-INSERT INTO #New_clients
-select p1.PATID
-      ,p1.patient_name
-      ,p1.patient_add_zipcode
-      ,p1.client_alias
-      ,p1.employment_status_value
-      ,p1.education_code
-      ,p1.marital_status_code
-      ,p1.facility_chart_number
-      ,p1.patient_sex_value
-      ,p1.race_value
-      ,p1.client_alias_7
-      ,p1.client_alias_8
-      ,p1.ethnic_origin_X_NRI_value
-      ,p1.medicaid_number
-      ,p1.patient_name_first
-      ,p1.patient_name_last
-      ,p1.patient_name_middle
-      ,p1.patient_name_prefix_code
-      ,p1.patient_name_prefix_value
-      ,p1.patient_name_suffix_code
-      ,p1.patient_name_suffix_value
-      ,p1.primary_language_value
-      ,p1.smoker_value  
-	  ,CASE WHEN ACT.PATID IS NOT NULL THEN 1 ELSE 0 END AS IsActiveClient
---INTO #New_clients
-from AvatarDWReporting.system.patient_current_demographics p1
-LEFT JOIN #Active_clients ACT
-	ON P1.PATID = ACT.PATID
-left join dw.Dim_Client p2
-on p1.patid = p2.patid
-AND P2.IsCurrent = 1
-where p2.patid is null
- 
-INSERT INTO #Changed_clients
-select P2.ClientKey 
-	  ,p1.PATID
-      ,p1.patient_name
-      ,p1.patient_add_zipcode
-      ,p1.client_alias
-      ,p1.employment_status_value
-      ,p1.education_code
-      ,p1.marital_status_code
-      ,p1.facility_chart_number
-      ,p1.patient_sex_value
-      ,p1.race_value
-      ,p1.client_alias_7
-      ,p1.client_alias_8
-      ,p1.ethnic_origin_X_NRI_value
-      ,p1.medicaid_number
-      ,p1.patient_name_first
-      ,p1.patient_name_last
-      ,p1.patient_name_middle
-      ,p1.patient_name_prefix_code
-      ,p1.patient_name_prefix_value
-      ,p1.patient_name_suffix_code
-      ,p1.patient_name_suffix_value
-      ,p1.primary_language_value
-      ,p1.smoker_value 
-	  ,CASE WHEN ACT.PATID IS NOT NULL THEN 1 ELSE 0 END AS IsActiveClient
---INTO #Changed_clients
-from AvatarDWReporting.system.patient_current_demographics p1
-LEFT JOIN #Active_clients ACT
-	ON P1.PATID = ACT.PATID
-join dw.Dim_Client p2
-on p1.patid = p2.patid
-and concat(p1.patient_name      
-      ,p1.patient_add_zipcode
-      ,p1.client_alias
-      ,p1.employment_status_value
-      ,p1.education_code
-      ,p1.marital_status_code
-	  ,p1.client_alias_7
-      ,p1.client_alias_8
-	  ,p1.medicaid_number
-      ,p1.patient_name_first
-      ,p1.patient_name_last
-      ,p1.patient_name_middle
-      ,p1.patient_name_prefix_code
-      ,p1.patient_name_prefix_value
-      ,p1.patient_name_suffix_code
-      ,p1.patient_name_suffix_value
-      ,p1.primary_language_value
-      ,p1.smoker_value
-	  ,CASE WHEN ACT.PATID IS NOT NULL THEN 1 ELSE 0 END) <>
-	  concat(p2.patient_name
-      ,p2.patient_add_zipcode
-      ,p2.client_alias
-      ,p2.employment_status_value
-      ,p2.education_code
-      ,p2.marital_status_code
-	  ,p2.client_alias_7
-      ,p2.client_alias_8
-	  ,p2.medicaid_number
-      ,p2.patient_name_first
-      ,p2.patient_name_last
-      ,p2.patient_name_middle
-      ,p2.patient_name_prefix_code
-      ,p2.patient_name_prefix_value
-      ,p2.patient_name_suffix_code
-      ,p2.patient_name_suffix_value
-      ,p2.primary_language_value
-      ,p2.smoker_value 
-	  ,p2.IsActiveClient)
-WHERE P2.IsCurrent = 1
+    # --------------------------------------------------------
+    # Execute Delta Lake Structural Merges
+    # --------------------------------------------------------
+    from delta.tables import DeltaTable
+    target_delta_table = DeltaTable.forName(spark, TARGET_TBL)
+    
+    # Step 1: Deactivate 'CHANGED' rows
+    if change_updates > 0:
+        target_delta_table.alias("T").merge(
+            changed_df.select("PATID", "EPISODE_NUMBER", "GuarantorID").distinct().alias("S"),
+            "T.PATID = S.PATID AND T.EPISODE_NUMBER = S.EPISODE_NUMBER AND T.GuarantorID = S.GuarantorID AND T.IsCurrent = 1"
+        ).whenMatchedUpdate(set={
+            "SCD_End_Date": F.current_timestamp(),
+            "IsCurrent": F.lit(0)
+        }).execute()
 
+    # Step 2: Deactivate 'DELETED' records
+    if delete_updates > 0:
+        target_delta_table.alias("T").merge(
+            deleted_current_df.alias("S"),
+            "T.GuarantorKey = S.GuarantorKey"
+        ).whenMatchedUpdate(set={
+            "SCD_End_Date": F.current_timestamp(),
+            "IsCurrent": F.lit(0)
+        }).execute()
 
-INSERT INTO #Deleted_clients
-select DIM.ClientKey 
---INTO #Deleted_clients
-from dw.Dim_Client DIM
-LEFT JOIN AvatarDWReporting.system.patient_current_demographics PCD
-	ON DIM.PATID = PCD.PATID
-where PCD.PATID IS NULL
-	AND DIM.IsCurrent = 1
+    # Step 3: Append New & Changed Records
+    inserts_to_add_df = new_insert_df.unionByName(changed_df).select(
+        "PATID", "ClientKey", "EPISODE_NUMBER", "GuarantorID", "GuarantorName",
+        "FinancialClass", "SubscriberName", "ClientRelationToSub", "SubsPolicy",
+        "SubsReleaseInfoCode", "SubsIDCardIssueDate"
+    )
 
+    if inserts_to_add_df.count() > 0:
+        max_key = target_df.select(F.coalesce(F.max("GuarantorKey"), F.lit(0)).alias("max_key")).collect()[0]["max_key"]
+        
+        key_window = Window.orderBy("PATID", "EPISODE_NUMBER", "GuarantorID")
+        
+        new_current_df = (
+            inserts_to_add_df
+            .withColumn("GuarantorKey", F.row_number().over(key_window) + F.lit(int(max_key)))
+            .withColumn("SCD_Start_Date", F.current_timestamp())
+            .withColumn("SCD_End_Date", F.to_timestamp(F.lit(FUTURE_END_DATE)))
+            .withColumn("IsCurrent", F.lit(1))
+            .select(
+                "GuarantorKey", "PATID", "ClientKey", "EPISODE_NUMBER", "GuarantorID",
+                "GuarantorName", "FinancialClass", "SubscriberName", "ClientRelationToSub",
+                "SubsPolicy", "SubsReleaseInfoCode", "SubsIDCardIssueDate",
+                "SCD_Start_Date", "SCD_End_Date", "IsCurrent"
+            )
+        )
+        
+        new_current_df.write.format("delta").mode("append").saveAsTable(TARGET_TBL)
 
---SET SCD END DATE TO TODAY AND ISCURRENT TO 0 FOR CHANGED RECORDS
-UPDATE DC
-SET DC.SCDEndDate = GETDATE()
-	,DC.IsCurrent = 0
-FROM DW.Dim_Client DC
-JOIN #Changed_clients CC
-	ON DC.ClientKey = CC.ClientKey
+    # --------------------------------------------------------
+    # Log Final Verification Statistics
+    # --------------------------------------------------------
+    refreshed_target_df = spark.table(TARGET_TBL)
+    end_count = refreshed_target_df.count()
+    end_curr = refreshed_target_df.filter(F.col("IsCurrent") == 1).count()
 
-SET @ChangeUpdates = @@ROWCOUNT;
+    write_log(
+        begin_count=begin_count, begin_curr=begin_curr,
+        new_inserts=new_inserts, change_updates=change_updates, change_inserts=change_inserts,
+        delete_updates=delete_updates, end_count=end_count, end_curr=end_curr,
+        run_status="SUCCESS", error_message=""
+    )
 
---SET END DATE AND ISCURRENT FOR DELETED RECORDS
-UPDATE DC
-SET DC.SCDEndDate = GETDATE()
-	,DC.IsCurrent = 0
-FROM DW.Dim_Client DC
-JOIN #Deleted_clients DEL
-	ON DC.ClientKey = DEL.ClientKey
+    print("Dim_Client_Guarantors load completed successfully.")
+    print(f"Begin Count      : {begin_count}")
+    print(f"End Count        : {end_count}")
+    print(f"End Current      : {end_curr}")
 
-SET @DeleteUpdates = @@ROWCOUNT;
-
---Add new clients
-INSERT INTO DW.Dim_Client
-(
-      PATID
-      ,patient_name
-      ,patient_add_zipcode
-      ,client_alias
-      ,employment_status_value
-      ,education_code
-      ,marital_status_code
-      ,facility_chart_number
-      ,patient_sex_value
-      ,race_value
-      ,client_alias_7
-      ,client_alias_8
-      ,ethnic_origin_X_NRI_value
-      ,medicaid_number
-      ,patient_name_first
-      ,patient_name_last
-      ,patient_name_middle
-      ,patient_name_prefix_code
-      ,patient_name_prefix_value
-      ,patient_name_suffix_code
-      ,patient_name_suffix_value
-      ,primary_language_value
-      ,smoker_value
-      ,IsActiveClient
-      ,SCDStartDate
-      ,SCDEndDate
-	  ,IsCurrent)
-SELECT
-	  PATID
-      ,patient_name
-      ,patient_add_zipcode
-      ,client_alias
-      ,employment_status_value
-      ,education_code
-      ,marital_status_code
-      ,facility_chart_number
-      ,patient_sex_value
-      ,race_value
-      ,client_alias_7
-      ,client_alias_8
-      ,ethnic_origin_X_NRI_value
-      ,medicaid_number
-      ,patient_name_first
-      ,patient_name_last
-      ,patient_name_middle
-      ,patient_name_prefix_code
-      ,patient_name_prefix_value
-      ,patient_name_suffix_code
-      ,patient_name_suffix_value
-      ,primary_language_value
-      ,smoker_value
-      ,IsActiveClient
-      ,GETDATE() AS SCDStartDate
-      ,'2199-12-31' AS SCDEndDate
-	  ,1 AS IsCurrent
-FROM #New_clients NEW
-
-SET @NewInserts = @@ROWCOUNT;
-
--- add new changed records
-INSERT INTO DW.Dim_Client
-(
-      PATID
-      ,patient_name
-      ,patient_add_zipcode
-      ,client_alias
-      ,employment_status_value
-      ,education_code
-      ,marital_status_code
-      ,facility_chart_number
-      ,patient_sex_value
-      ,race_value
-      ,client_alias_7
-      ,client_alias_8
-      ,ethnic_origin_X_NRI_value
-      ,medicaid_number
-      ,patient_name_first
-      ,patient_name_last
-      ,patient_name_middle
-      ,patient_name_prefix_code
-      ,patient_name_prefix_value
-      ,patient_name_suffix_code
-      ,patient_name_suffix_value
-      ,primary_language_value
-      ,smoker_value
-      ,IsActiveClient
-      ,SCDStartDate
-      ,SCDEndDate
-	  ,IsCurrent)
-SELECT
-	  PATID
-      ,patient_name
-      ,patient_add_zipcode
-      ,client_alias
-      ,employment_status_value
-      ,education_code
-      ,marital_status_code
-      ,facility_chart_number
-      ,patient_sex_value
-      ,race_value
-      ,client_alias_7
-      ,client_alias_8
-      ,ethnic_origin_X_NRI_value
-      ,medicaid_number
-      ,patient_name_first
-      ,patient_name_last
-      ,patient_name_middle
-      ,patient_name_prefix_code
-      ,patient_name_prefix_value
-      ,patient_name_suffix_code
-      ,patient_name_suffix_value
-      ,primary_language_value
-      ,smoker_value
-      ,IsActiveClient
-      ,GETDATE() AS SCDStartDate
-      ,'2199-12-31' AS SCDEndDate
-	  ,1 AS IsCurrent
-FROM #Changed_clients
-
-SET @ChangeInserts = @@ROWCOUNT;
-
-SELECT @EndCount = COUNT(*) FROM DW.Dim_Client;
-
-SELECT @EndCurr = COUNT(*) FROM DW.Dim_Client WHERE IsCurrent = 1;
-
-INSERT INTO LOGGING.DW_PROCESS_LOG
-(Logdate 
-,TableName
-,BeginRecCount
-,BeginCurrCount
-,NewInserts
-,ChangeUpdates
-,ChangeInserts
-,DeleteUpdates
-,EndRecCount
-,EndCurrCount
-,ETL_TYPE)
-VALUES
-	(GETDATE()
-	,@TableName
-	,@BeginCount
-	,@BeginCurr
-	,@NewInserts
-	,@ChangeUpdates
-	,@ChangeInserts
-	,@DeleteUpdates
-	,@EndCount
-	,@EndCurr
-	,@ETLType)
-
-IF OBJECT_ID ('tempdb..#Active_clients') IS NOT NULL
-BEGIN
-	DROP TABLE #Active_clients
-END;
-
-IF OBJECT_ID ('tempdb..#Active_clients') IS NOT NULL
-BEGIN
-	DROP TABLE #New_clients
-END;
-
-IF OBJECT_ID ('tempdb..#Active_clients') IS NOT NULL
-BEGIN
-	DROP TABLE #Changed_clients
-END;
-
-IF OBJECT_ID ('tempdb..#Active_clients') IS NOT NULL
-BEGIN
-	DROP TABLE #Deleted_clients
-END;
-GO
-
-
+except Exception as e:
+    err = traceback.format_exc()
+    try:
+        write_log(
+            begin_count=begin_count, begin_curr=begin_curr,
+            new_inserts=new_inserts, change_updates=change_updates, change_inserts=change_inserts,
+            delete_updates=delete_updates, end_count=end_count, end_curr=end_curr,
+            run_status="FAILED", error_message=str(e)[:4000]
+        )
+    except:
+        pass
+    print("Dim_Client_Guarantors load failed.")
+    print(err)
+    raise
+finally:
+    try: guarantors_df.unpersist()
+    except: pass
+    try: compare_df.unpersist()
+    except: pass
+    try: deleted_current_df.unpersist()
+    except: pass

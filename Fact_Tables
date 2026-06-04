@@ -232,7 +232,7 @@ try:
     log_cols = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE", "RunStatus", "ErrorMessage"]
     spark.createDataFrame(log_row, log_cols).write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
 
-    print("Pipeline executed successfully. Parity confirmed and structural bugs cleared.")
+    print("Pipeline executed successfully. Parity confirmed and syntax fully corrected.")
 
 except Exception as e:
     err_msg = traceback.format_exc()

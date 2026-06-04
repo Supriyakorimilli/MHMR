@@ -2,6 +2,7 @@ from pyspark.sql import SparkSession, functions as F, Window
 from pyspark.sql.types import (
     StructType, StructField, IntegerType, LongType, StringType, TimestampType
 )
+from delta.tables import DeltaTable
 import traceback
 from datetime import datetime
 
@@ -12,9 +13,6 @@ spark = SparkSession.builder.appName("Build.DW.Dim_Client").getOrCreate()
 spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
 spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
-
-# Ensure checkpointing directory exists for breaking tough Spark lineages
-spark.sparkContext.setCheckpointDir("Files/checkpoint")
 
 # =========================================================================================
 # CONFIGURATION VARIABLES
@@ -116,7 +114,7 @@ new_inserts, change_updates, change_inserts, delete_updates = 0, 0, 0, 0
 end_count, end_curr = 0, 0
 
 try:
-    # Read initial target state metrics
+    # Read target initial stats
     base_target_df = spark.table(TARGET_TBL)
     begin_count = base_target_df.count()
     begin_curr = base_target_df.filter(F.col("IsCurrent") == 1).count()
@@ -143,90 +141,103 @@ try:
         F.when(F.col("ACTIVE_PATID").isNotNull(), F.lit(1)).otherwise(F.lit(0))
     ).drop("ACTIVE_PATID").cache()
 
-    # Isolate current records for comparison
+    # Isolate active dimension entries safely without structural metadata leaks
     comparison_target_df = base_target_df.filter(F.col("IsCurrent") == 1).alias("tgt")
 
-    # 3. New Dimension Records Identification
+    # 3. Detect New Inbound Records
     new_clients_df = demo_enriched_df.alias("stg").join(
         comparison_target_df,
         F.col("stg.CLEAN_PATID") == F.upper(F.trim(F.col("tgt.PATID"))),
         "left_anti"
     ).select("stg.*")
 
-    # 4. Version Change Identification (SCD Type 2 Tracked Mutations)
+    # 4. Detect Existing Tracked Versions with Changes (SCD Type 2 Changes)
     changed_clients_df = demo_enriched_df.alias("stg").join(
         comparison_target_df,
         F.col("stg.CLEAN_PATID") == F.upper(F.trim(F.col("tgt.PATID"))),
         "inner"
     ).filter(
         build_sql_concat_string("stg") != build_sql_concat_string("tgt")
-    ).select(
-        F.col("tgt.ClientKey").alias("DeactivateClientKey"),
-        "stg.*"
-    )
+    ).select("stg.*")
 
-    # 5. Missing / Closed Records Deletion Tracking
+    # 5. Track Deleted/Dropped Records
     deleted_clients_df = comparison_target_df.join(
         demo_enriched_df.alias("stg"),
         F.upper(F.trim(F.col("tgt.PATID"))) == F.col("stg.CLEAN_PATID"),
         "left_anti"
-    ).select(F.col("tgt.ClientKey").alias("DeactivateClientKey"))
+    ).select(F.col("tgt.PATID").alias("CLEAN_PATID"))
 
-    # Compute operational changes metrics
+    # Compute metric counts
     new_inserts = int(new_clients_df.count())
     change_inserts = int(changed_clients_df.count())
     change_updates = change_inserts
     delete_updates = int(deleted_clients_df.count())
 
-    # 6. Re-assembling Timelines and Closing Expired Records
-    # CRITICAL FIX: Local Checkpoint forces Spark to instantly evaluate these IDs and drop lineage tracking
-    deactivation_keys_df = changed_clients_df.select("DeactivateClientKey") \
-        .unionByName(deleted_clients_df.select("DeactivateClientKey")) \
-        .distinct() \
-        .localCheckpoint()
+    # =========================================================================================
+    # TRANSACTION STAGE: PREPARE DETERMINISTIC CHANGE STACK
+    # =========================================================================================
+    # Combine incoming inserts (New + Changed records)
+    inserts_combined_df = new_clients_df.unionByName(changed_clients_df).dropDuplicates(["CLEAN_PATID"])
 
-    # Historical items remain unmodified
-    historical_target_df = base_target_df.filter(F.col("IsCurrent") != 1)
-
-    # Current items that are remaining active and completely untouched
-    current_unchanged_df = base_target_df.filter(F.col("IsCurrent") == 1).join(
-        deactivation_keys_df,
-        base_target_df["ClientKey"] == deactivation_keys_df["DeactivateClientKey"],
-        "left_anti"
-    )
-
-    # Current items that must be expired now
-    expired_mutations_df = base_target_df.filter(F.col("IsCurrent") == 1).join(
-        deactivation_keys_df,
-        base_target_df["ClientKey"] == deactivation_keys_df["DeactivateClientKey"],
-        "inner"
-    ).withColumn("SCDEndDate", F.current_timestamp()) \
-     .withColumn("IsCurrent", F.lit(0)) \
-     .select(base_target_df.columns)
-
-    # 7. Surrogate Key Generation and Insert Stack assembly
-    inserts_to_add_df = new_clients_df.unionByName(changed_clients_df.drop("DeactivateClientKey")).dropDuplicates(["CLEAN_PATID"])
-    
+    # Extract maximum surrogate key to calculate serial extensions accurately
     max_key_val = base_target_df.select(F.coalesce(F.max("ClientKey"), F.lit(0)).alias("max_key")).collect()[0]["max_key"]
     surrogate_window = Window.orderBy("CLEAN_PATID")
 
-    new_current_records_df = inserts_to_add_df.withColumn(
+    # Build staging records with brand new keys
+    staged_inserts_df = inserts_combined_df.withColumn(
         "ClientKey",
         F.row_number().over(surrogate_window) + F.lit(int(max_key_val))
     ).withColumn("SCDStartDate", F.current_timestamp()) \
      .withColumn("SCDEndDate", F.to_timestamp(F.lit(FUTURE_END_DATE))) \
      .withColumn("IsCurrent", F.lit(1))
 
-    # Union all pieces together cleanly matching schema structure
-    final_target_snapshot = historical_target_df.select(base_target_df.columns) \
-        .unionByName(current_unchanged_df.select(base_target_df.columns)) \
-        .unionByName(expired_mutations_df.select(base_target_df.columns)) \
-        .unionByName(new_current_records_df.select(base_target_df.columns))
+    # Compile the updates to perform against the live dimension (Expired entries + Deleted entries)
+    staged_updates_df = changed_clients_df.select("CLEAN_PATID") \
+        .unionByName(deleted_clients_df.select("CLEAN_PATID")) \
+        .distinct() \
+        .withColumn("MergeKey", F.col("CLEAN_PATID")) \
+        .withColumn("ActionType", F.lit("EXPIRE"))
 
-    # Transactional Overwrite to the Delta Table file layer
-    final_target_snapshot.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(TARGET_TBL)
+    # Add null-placeholders to the insert stack so we can safely union them for a single-pass merge operation
+    staged_inserts_with_merge_key_df = staged_inserts_df \
+        .withColumn("MergeKey", F.lit(None).cast("string")) \
+        .withColumn("ActionType", F.lit("INSERT"))
 
-    # Post-execution logging metrics
+    # Select common columns and align names perfectly before the merge union block
+    common_columns = [c for c in staged_inserts_df.columns] + ["MergeKey", "ActionType"]
+    
+    aligned_updates_df = staged_updates_df.select(
+        *[F.lit(None).alias(c) for c in staged_inserts_df.columns], 
+        "MergeKey", 
+        "ActionType"
+    )
+    aligned_inserts_df = staged_inserts_with_merge_key_df.select(common_columns)
+
+    # Unified operational staging dataset
+    staging_master_df = aligned_inserts_df.unionByName(aligned_updates_df)
+
+    # =========================================================================================
+    # DELTA TABLE PROGRAMMATIC ATOMIC MERGE (Bypasses Spark Lineage Errors Completely)
+    # =========================================================================================
+    delta_target = DeltaTable.saveAsTable(spark, TARGET_TBL) if table_exists(TARGET_TBL) else DeltaTable.createIfNotExists(spark).tableName(TARGET_TBL).execute()
+    delta_target = DeltaTable.saveAsTable(spark, TARGET_TBL)
+
+    delta_target.alias("t") \
+        .merge(
+            source=staging_master_df.alias("s"),
+            condition="F.upper(F.trim(t.PATID)) == s.MergeKey AND t.IsCurrent = 1 AND s.ActionType = 'EXPIRE'"
+        ) \
+        .whenMatchedUpdate(set={
+            "SCDEndDate": F.current_timestamp(),
+            "IsCurrent": F.lit(0)
+        }) \
+        .execute()
+
+    # Append new insert rows safely to the table layer
+    final_inserts_only_df = staging_master_df.filter(F.col("ActionType") == "INSERT").drop("MergeKey", "ActionType")
+    final_inserts_only_df.select(base_target_df.columns).write.format("delta").mode("append").saveAsTable(TARGET_TBL)
+
+    # Post-execution logging calculation
     refreshed_target_df = spark.table(TARGET_TBL)
     end_count = refreshed_target_df.count()
     end_curr = refreshed_target_df.filter(F.col("IsCurrent") == 1).count()
@@ -239,7 +250,7 @@ try:
     log_cols = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE", "RunStatus", "ErrorMessage"]
     spark.createDataFrame(log_row, log_cols).write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
 
-    print("Pipeline executed successfully. Ambiguous lineage broken and parity confirmed.")
+    print("Pipeline executed successfully. Structural Lineage errors completely eliminated.")
 
 except Exception as e:
     err_msg = traceback.format_exc()

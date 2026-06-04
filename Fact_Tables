@@ -1,258 +1,279 @@
 from pyspark.sql import SparkSession, functions as F, Window
-from pyspark.sql.types import (
-    StructType, StructField, IntegerType, LongType, StringType, TimestampType
-)
+from pyspark.sql.types import *
 import traceback
 from datetime import datetime
 
-# =========================================================================================
-# SPARK SESSION CONFIGURATION
-# =========================================================================================
 spark = SparkSession.builder.appName("Build.DW.Dim_Client").getOrCreate()
 spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
 spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 
-# =========================================================================================
-# CONFIGURATION VARIABLES
-# =========================================================================================
 DB = "MHMR_LAKEHOUSE"
 
 SRC_EPISODE_TBL = f"{DB}.RAW.episode_history_RAW"
 SRC_DEMO_TBL    = f"{DB}.RAW.patient_current_demographics_RAW"
 
-TARGET_TBL         = f"{DB}.DW.Dim_Client"
-FINAL_LOG_TBL      = f"{DB}.LOGS.client_final_log"
+TARGET_TBL      = f"{DB}.DW.Dim_Client"
+FINAL_LOG_TBL   = f"{DB}.LOGS.client_final_log"
+
 TABLE_NAME_FOR_LOG = "Dim_Client"
 ETL_TYPE_FOR_LOG   = "SCD MERGE"
 FUTURE_END_DATE    = "2199-12-31"
 
-# =========================================================================================
-# AUTOMATED TABLE INITIALIZATION
-# =========================================================================================
-def table_exists(table_name: str) -> bool:
+
+def table_exists(t):
     try:
-        spark.table(table_name)
+        spark.table(t)
         return True
-    except Exception:
+    except:
         return False
 
+
+# ---------------- CREATE TARGET ----------------
 if not table_exists(TARGET_TBL):
-    target_schema = StructType([
+    schema = StructType([
         StructField("ClientKey", LongType(), False),
         StructField("PATID", StringType(), False),
-        StructField("patient_name", StringType(), True),
-        StructField("patient_add_zipcode", StringType(), True),
-        StructField("client_alias", StringType(), True),
-        StructField("employment_status_value", StringType(), True),
-        StructField("education_code", StringType(), True),
-        StructField("marital_status_code", StringType(), True),
-        StructField("facility_chart_number", StringType(), True),
-        StructField("patient_sex_value", StringType(), True),
-        StructField("race_value", StringType(), True),
-        StructField("client_alias_7", StringType(), True),
-        StructField("client_alias_8", StringType(), True),
-        StructField("ethnic_origin_X_NRI_value", StringType(), True),
-        StructField("medicaid_number", StringType(), True),
-        StructField("patient_name_first", StringType(), True),
-        StructField("patient_name_last", StringType(), True),
-        StructField("patient_name_middle", StringType(), True),
-        StructField("patient_name_prefix_code", StringType(), True),
-        StructField("patient_name_prefix_value", StringType(), True),
-        StructField("patient_name_suffix_code", StringType(), True),
-        StructField("patient_name_suffix_value", StringType(), True),
-        StructField("primary_language_value", StringType(), True),
-        StructField("smoker_value", StringType(), True),
-        StructField("IsActiveClient", IntegerType(), True),
-        StructField("SCDStartDate", TimestampType(), True),
-        StructField("SCDEndDate", TimestampType(), True),
-        StructField("IsCurrent", IntegerType(), True)
+        StructField("patient_name", StringType()),
+        StructField("patient_add_zipcode", StringType()),
+        StructField("client_alias", StringType()),
+        StructField("employment_status_value", StringType()),
+        StructField("education_code", StringType()),
+        StructField("marital_status_code", StringType()),
+        StructField("facility_chart_number", StringType()),
+        StructField("patient_sex_value", StringType()),
+        StructField("race_value", StringType()),
+        StructField("client_alias_7", StringType()),
+        StructField("client_alias_8", StringType()),
+        StructField("ethnic_origin_X_NRI_value", StringType()),
+        StructField("medicaid_number", StringType()),
+        StructField("patient_name_first", StringType()),
+        StructField("patient_name_last", StringType()),
+        StructField("patient_name_middle", StringType()),
+        StructField("patient_name_prefix_code", StringType()),
+        StructField("patient_name_prefix_value", StringType()),
+        StructField("patient_name_suffix_code", StringType()),
+        StructField("patient_name_suffix_value", StringType()),
+        StructField("primary_language_value", StringType()),
+        StructField("smoker_value", StringType()),
+        StructField("IsActiveClient", IntegerType()),
+        StructField("SCDStartDate", TimestampType()),
+        StructField("SCDEndDate", TimestampType()),
+        StructField("IsCurrent", IntegerType())
     ])
-    spark.createDataFrame([], target_schema).write.format("delta").mode("overwrite").saveAsTable(TARGET_TBL)
 
+    spark.createDataFrame([], schema)\
+        .write.format("delta")\
+        .mode("overwrite")\
+        .saveAsTable(TARGET_TBL)
+
+
+# ---------------- LOG TABLE ----------------
 if not table_exists(FINAL_LOG_TBL):
     log_schema = StructType([
-        StructField("Logdate", TimestampType(), True),
-        StructField("TableName", StringType(), True),
-        StructField("BeginRecCount", LongType(), True),
-        StructField("BeginCurrCount", LongType(), True),
-        StructField("NewInserts", LongType(), True),
-        StructField("ChangeUpdates", LongType(), True),
-        StructField("ChangeInserts", LongType(), True),
-        StructField("DeleteUpdates", LongType(), True),
-        StructField("EndRecCount", LongType(), True),
-        StructField("EndCurrCount", LongType(), True),
-        StructField("ETL_TYPE", StringType(), True),
-        StructField("RunStatus", StringType(), True),
-        StructField("ErrorMessage", StringType(), True)
+        StructField("Logdate", TimestampType()),
+        StructField("TableName", StringType()),
+        StructField("BeginRecCount", LongType()),
+        StructField("BeginCurrCount", LongType()),
+        StructField("NewInserts", LongType()),
+        StructField("ChangeUpdates", LongType()),
+        StructField("ChangeInserts", LongType()),
+        StructField("DeleteUpdates", LongType()),
+        StructField("EndRecCount", LongType()),
+        StructField("EndCurrCount", LongType()),
+        StructField("ETL_TYPE", StringType()),
+        StructField("RunStatus", StringType()),
+        StructField("ErrorMessage", StringType())
     ])
-    spark.createDataFrame([], log_schema).write.format("delta").mode("overwrite").saveAsTable(FINAL_LOG_TBL)
 
-# =========================================================================================
-# STRATEGIC T-SQL CONCAT MECHANISM REPLICATION
-# =========================================================================================
-def build_sql_concat_string(df_alias):
-    fields = [
-        "patient_name", "patient_add_zipcode", "client_alias", "employment_status_value",
-        "education_code", "marital_status_code", "client_alias_7", "client_alias_8",
-        "medicaid_number", "patient_name_first", "patient_name_last", "patient_name_middle",
-        "patient_name_prefix_code", "patient_name_prefix_value", "patient_name_suffix_code",
-        "patient_name_suffix_value", "primary_language_value", "smoker_value", "IsActiveClient"
+    spark.createDataFrame([], log_schema)\
+        .write.format("delta")\
+        .mode("overwrite")\
+        .saveAsTable(FINAL_LOG_TBL)
+
+
+# ---------------- CONCAT LOGIC ----------------
+def build_concat(df, alias):
+    cols = [
+        "patient_name","patient_add_zipcode","client_alias","employment_status_value",
+        "education_code","marital_status_code","client_alias_7","client_alias_8",
+        "medicaid_number","patient_name_first","patient_name_last","patient_name_middle",
+        "patient_name_prefix_code","patient_name_prefix_value","patient_name_suffix_code",
+        "patient_name_suffix_value","primary_language_value","smoker_value","IsActiveClient"
     ]
-    concat_exprs = []
-    for f in fields:
-        col_expr = F.coalesce(F.trim(F.col(f"{df_alias}.{f}").cast("string")), F.lit(""))
-        concat_exprs.append(col_expr)
-    return F.concat(*concat_exprs)
 
-# =========================================================================================
-# CORE EXECUTION PIPELINE
-# =========================================================================================
-begin_count, begin_curr = 0, 0
-new_inserts, change_updates, change_inserts, delete_updates = 0, 0, 0, 0
-end_count, end_curr = 0, 0
+    return F.concat(*[
+        F.coalesce(F.trim(F.col(f"{alias}.{c}").cast("string")), F.lit(""))
+        for c in cols
+    ])
+
+
+# ---------------- EXECUTION ----------------
+begin_count = begin_curr = 0
+new_inserts = change_updates = change_inserts = delete_updates = 0
+end_count = end_curr = 0
 
 try:
-    # Read target and get starting metrics
     target_df = spark.table(TARGET_TBL)
     begin_count = target_df.count()
     begin_curr = target_df.filter(F.col("IsCurrent") == 1).count()
 
-    # 1. Identify Active Status Flags (Episode Check)
     episode_df = spark.table(SRC_EPISODE_TBL)
-    active_clients_df = episode_df.withColumn(
+
+    active_clients = episode_df.withColumn(
         "clean_discharge_date",
-        F.coalesce(F.to_date(F.col("date_of_discharge")), F.to_date(F.lit("2199-12-31")))
+        F.coalesce(F.to_date("date_of_discharge"), F.to_date(F.lit("2199-12-31")))
     ).filter(
         F.col("clean_discharge_date") >= F.date_sub(F.current_date(), 13 * 30)
-    ).select(F.upper(F.trim(F.col("PATID"))).alias("ACTIVE_PATID")).distinct().cache()
+    ).select(
+        F.upper(F.trim("PATID")).alias("PATID")
+    ).distinct()
 
-    # 2. Enrich Demographics and Standardize Natural Keys
     demo_df = spark.table(SRC_DEMO_TBL)
-    demo_cleaned_df = demo_df.withColumn("CLEAN_PATID", F.upper(F.trim(F.col("PATID"))))
-    
-    demo_enriched_df = demo_cleaned_df.join(
-        active_clients_df,
-        demo_cleaned_df.CLEAN_PATID == active_clients_df.ACTIVE_PATID,
+
+    demo_clean = demo_df.withColumn(
+        "CLEAN_PATID",
+        F.upper(F.trim("PATID"))
+    )
+
+    demo_enriched = demo_clean.join(
+        active_clients,
+        demo_clean.CLEAN_PATID == active_clients.PATID,
         "left"
     ).withColumn(
         "IsActiveClient",
-        F.when(F.col("ACTIVE_PATID").isNotNull(), F.lit(1)).otherwise(F.lit(0))
-    ).drop("ACTIVE_PATID").cache()
+        F.when(F.col("PATID").isNotNull(), 1).otherwise(0)
+    ).drop("PATID")
 
-    # Isolate strictly current entries from dimension target snapshot and break lineage tracking
-    current_target_df = target_df.filter(F.col("IsCurrent") == 1).select(target_df.columns).alias("tgt")
 
-    # 3. New Dimension Records Identification
-    new_clients_df = demo_enriched_df.alias("stg").join(
-        current_target_df,
-        F.col("stg.CLEAN_PATID") == F.upper(F.trim(F.col("tgt.PATID"))),
+    current_tgt = target_df.filter(F.col("IsCurrent") == 1).alias("tgt")
+    stg = demo_enriched.alias("stg")
+
+
+    new_clients = stg.join(
+        current_tgt,
+        F.col("stg.CLEAN_PATID") == F.col("tgt.PATID"),
         "left_anti"
     ).select("stg.*")
 
-    # 4. Version Change Identification (SCD Type 2 Tracked Mutations)
-    changed_clients_df = demo_enriched_df.alias("stg").join(
-        current_target_df,
-        F.col("stg.CLEAN_PATID") == F.upper(F.trim(F.col("tgt.PATID"))),
+
+    changed_clients = stg.join(
+        current_tgt,
+        F.col("stg.CLEAN_PATID") == F.col("tgt.PATID"),
         "inner"
     ).filter(
-        build_sql_concat_string("stg") != build_sql_concat_string("tgt")
+        build_concat("stg") != build_concat("tgt")
     ).select(
         F.col("tgt.ClientKey").alias("TargetClientKey"),
         "stg.*"
     )
 
-    # 5. Missing / Closed Records Deletion Tracking
-    deleted_clients_df = current_target_df.join(
-        demo_enriched_df.alias("stg"),
-        F.upper(F.trim(F.col("tgt.PATID"))) == F.col("stg.CLEAN_PATID"),
-        "left_anti"
-    ).select(F.col("tgt.ClientKey").alias("TargetClientKey"))
 
-    # Track metrics
-    new_inserts = int(new_clients_df.count())
-    change_inserts = int(changed_clients_df.count())
+    deleted_clients = current_tgt.join(
+        stg,
+        F.col("tgt.PATID") == F.col("stg.CLEAN_PATID"),
+        "left_anti"
+    ).select(
+        F.col("tgt.ClientKey").alias("TargetClientKey")
+    )
+
+
+    new_inserts = new_clients.count()
+    change_inserts = changed_clients.count()
     change_updates = change_inserts
-    delete_updates = int(deleted_clients_df.count())
+    delete_updates = deleted_clients.count()
 
-    # 6. Re-assembling Timelines and Closing Expired Records (Lineage Cleared via explicit col select)
-    historical_target_df = target_df.filter(F.col("IsCurrent") != 1).select(target_df.columns)
-    
-    deactivation_keys_df = changed_clients_df.select("TargetClientKey").unionByName(deleted_clients_df.select("TargetClientKey"))
 
-    # Select columns explicitly to completely strip old 'p2' references from lineage graph
-    active_clean_base_df = target_df.filter(F.col("IsCurrent") == 1).select([F.col(c) for c in target_df.columns])
+    historical = target_df.filter(F.col("IsCurrent") != 1)
 
-    # Active rows that remain untouched
-    current_unchanged_df = active_clean_base_df.join(
-        deactivation_keys_df,
-        active_clean_base_df["ClientKey"] == deactivation_keys_df["TargetClientKey"],
+    deactivation_keys = changed_clients.select("TargetClientKey")\
+        .unionByName(deleted_clients.select("TargetClientKey"))
+
+
+    base = target_df.filter(F.col("IsCurrent") == 1).alias("a")
+
+
+    current_unchanged = base.join(
+        deactivation_keys.alias("d"),
+        F.col("a.ClientKey") == F.col("d.TargetClientKey"),
         "left_anti"
-    ).select(target_df.columns)
+    ).select("a.*")
 
-    # Active rows that are now expired
-    expired_mutations_df = active_clean_base_df.join(
-        deactivation_keys_df,
-        active_clean_base_df["ClientKey"] == deactivation_keys_df["TargetClientKey"],
+
+    expired = base.join(
+        deactivation_keys.alias("d"),
+        F.col("a.ClientKey") == F.col("d.TargetClientKey"),
         "inner"
-    ).withColumn("SCDEndDate", F.current_timestamp())\
-     .withColumn("IsCurrent", F.lit(0))\
-     .select(target_df.columns)
+    ).withColumn("IsCurrent", F.lit(0))\
+     .withColumn("SCDEndDate", F.current_timestamp())\
+     .select("a.*")
 
-    # 7. Surrogate Key Generation and Insert Stack assembly
-    inserts_to_add_df = new_clients_df.unionByName(changed_clients_df.drop("TargetClientKey")).dropDuplicates(["CLEAN_PATID"])
-    
-    max_key_val = target_df.select(F.coalesce(F.max("ClientKey"), F.lit(0)).alias("max_key")).collect()[0]["max_key"]
-    surrogate_window = Window.orderBy("CLEAN_PATID")
 
-    new_current_records_df = inserts_to_add_df.withColumn(
+    max_key = target_df.agg(F.max("ClientKey")).collect()[0][0] or 0
+    w = Window.orderBy("CLEAN_PATID")
+
+
+    inserts = new_clients.unionByName(
+        changed_clients.drop("TargetClientKey")
+    ).dropDuplicates(["CLEAN_PATID"])
+
+
+    new_current = inserts.withColumn(
         "ClientKey",
-        F.row_number().over(surrogate_window) + F.lit(int(max_key_val))
+        F.row_number().over(w) + F.lit(max_key)
     ).withColumn("SCDStartDate", F.current_timestamp())\
      .withColumn("SCDEndDate", F.to_timestamp(F.lit(FUTURE_END_DATE)))\
      .withColumn("IsCurrent", F.lit(1))
 
-    # Compile the final partition layout
-    final_target_snapshot = historical_target_df\
-        .unionByName(current_unchanged_df)\
-        .unionByName(expired_mutations_df)\
-        .unionByName(new_current_records_df.select(target_df.columns))
 
-    # Transactional Delta Table commit
-    final_target_snapshot.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(TARGET_TBL)
+    final_df = historical\
+        .unionByName(current_unchanged)\
+        .unionByName(expired)\
+        .unionByName(new_current.select(target_df.columns))
 
-    # Post-execution logging
-    refreshed_target_df = spark.table(TARGET_TBL)
-    end_count = refreshed_target_df.count()
-    end_curr = refreshed_target_df.filter(F.col("IsCurrent") == 1).count()
 
-    log_row = [(
-        datetime.now(), TABLE_NAME_FOR_LOG, int(begin_count), int(begin_curr),
-        int(new_inserts), int(change_updates), int(change_inserts), int(delete_updates),
-        int(end_count), int(end_curr), ETL_TYPE_FOR_LOG, "SUCCESS", ""
-    )]
-    log_cols = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE", "RunStatus", "ErrorMessage"]
-    spark.createDataFrame(log_row, log_cols).write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
+    final_df.write.format("delta")\
+        .mode("overwrite")\
+        .option("overwriteSchema", "true")\
+        .saveAsTable(TARGET_TBL)
 
-    print("Pipeline executed successfully. Old notebook references cleared and parity confirmed.")
+
+    end_df = spark.table(TARGET_TBL)
+    end_count = end_df.count()
+    end_curr = end_df.filter(F.col("IsCurrent") == 1).count()
+
+
+    log = [(datetime.now(), TABLE_NAME_FOR_LOG, begin_count, begin_curr,
+            new_inserts, change_updates, change_inserts, delete_updates,
+            end_count, end_curr, ETL_TYPE_FOR_LOG, "SUCCESS", "")]
+
+    log_cols = ["Logdate","TableName","BeginRecCount","BeginCurrCount",
+                "NewInserts","ChangeUpdates","ChangeInserts","DeleteUpdates",
+                "EndRecCount","EndCurrCount","ETL_TYPE","RunStatus","ErrorMessage"]
+
+    spark.createDataFrame(log, log_cols)\
+        .write.format("delta")\
+        .mode("append")\
+        .saveAsTable(FINAL_LOG_TBL)
+
+    print("SUCCESS")
 
 except Exception as e:
-    err_msg = traceback.format_exc()
-    try:
-        log_row = [(
-            datetime.now(), TABLE_NAME_FOR_LOG, int(begin_count), int(begin_curr),
-            int(new_inserts), int(change_updates), int(change_inserts), int(delete_updates),
-            int(end_count), int(end_curr), ETL_TYPE_FOR_LOG, "FAILED", str(e)[:4000]
-        )]
-        log_cols = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE", "RunStatus", "ErrorMessage"]
-        spark.createDataFrame(log_row, log_cols).write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
-    except Exception:
-        pass
-    print(err_msg)
+    err = traceback.format_exc()
+
+    log = [(datetime.now(), TABLE_NAME_FOR_LOG, begin_count, begin_curr,
+            new_inserts, change_updates, change_inserts, delete_updates,
+            end_count, end_curr, ETL_TYPE_FOR_LOG, "FAILED", str(err)[:4000])]
+
+    spark.createDataFrame(log, log_cols)\
+        .write.format("delta")\
+        .mode("append")\
+        .saveAsTable(FINAL_LOG_TBL)
+
     raise
 
 finally:
-    try: active_clients_df.unpersist()
-    except Exception: pass
-    try: demo_enriched_df.unpersist()
-    except Exception: pass
+    try: active_clients.unpersist()
+    except: pass
+    try: demo_enriched.unpersist()
+    except: pass

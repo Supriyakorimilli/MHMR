@@ -116,7 +116,7 @@ new_inserts, change_updates, change_inserts, delete_updates = 0, 0, 0, 0
 end_count, end_curr = 0, 0
 
 try:
-    # 1. Fetch initial operational counts from target snapshot instance
+    # 1. Fetch initial operational counts from raw target storage instance
     base_target_df = spark.table(TARGET_TBL)
     begin_count = base_target_df.count()
     begin_curr = base_target_df.filter(F.col("IsCurrent") == 1).count()
@@ -152,7 +152,6 @@ try:
         F.when(F.col("ACTIVE_PATID").isNotNull(), F.lit(1)).otherwise(F.lit(0))
     ).drop("ACTIVE_PATID").cache()
 
-    # Active target view mapping context references
     comparison_target_df = base_target_df.filter(F.col("IsCurrent") == 1).alias("tgt")
 
     # 4. Detect Brand New Inbound Records (Stage 3)
@@ -181,7 +180,7 @@ try:
         "left_anti"
     ).select(F.col("tgt.ClientKey").alias("DeactivateClientKey"))
 
-    # Compute metric values
+    # Compute operational changes metrics
     new_inserts = int(new_clients_df.count())
     change_inserts = int(changed_clients_df.count())
     change_updates = change_inserts
@@ -190,11 +189,11 @@ try:
     # =========================================================================================
     # THE LIFESAVER SEPARATION CRITICAL STEP: EXPLICIT METADATA CHECKPOINTING
     # =========================================================================================
-    # Unified variable naming across the execution tree to resolve NameErrors permanently
-    deactivate_keys_df = changed_clients_df.select("DeactivateClientKey") \
+    # Explicitly naming the dataframe variable to ensure downstream matches are seamless
+    deactivation_keys_df = changed_clients_df.select("DeactivateClientKey") \
         .unionByName(deleted_clients_df.select("DeactivateClientKey")) \
         .distinct() \
-        .checkpoint()  # <-- Truncates background lazy tree and clears ambiguity bugs
+        .checkpoint()  # <-- Truncates lazy tree log graph lineage memory map cleanly
 
     # =========================================================================================
     # RE-ASSEMBLE THE SNAPSHOT PHASES
@@ -204,15 +203,15 @@ try:
 
     # Filter out active records remaining completely untouched
     current_unchanged_df = active_target_base_df.join(
-        deactivate_keys_df,
-        active_target_base_df["ClientKey"] == deactivate_keys_df["DeactivateClientKey"],
+        deactivation_keys_df,
+        active_target_base_df["ClientKey"] == deactivation_keys_df["DeactivateClientKey"],
         "left_anti"
     ).select(base_target_df.columns)
 
     # Expire changed or deleted records
     expired_mutations_df = active_target_base_df.join(
-        deactivate_keys_df,
-        active_target_base_df["ClientKey"] == deactivate_keys_df["DeactivateClientKey"],
+        deactivation_keys_df,
+        active_target_base_df["ClientKey"] == deactivation_keys_df["DeactivateClientKey"],
         "inner"
     ).withColumn("SCDEndDate", F.current_timestamp()) \
      .withColumn("IsCurrent", F.lit(0)) \
@@ -253,7 +252,7 @@ try:
     log_cols = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE", "RunStatus", "ErrorMessage"]
     spark.createDataFrame(log_row, log_cols).write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
 
-    print("Pipeline executed successfully. Variable name conflict resolved and counts synchronized.")
+    print("Pipeline executed successfully. Variables synchronized and data logs recorded.")
 
 except Exception as e:
     err_msg = traceback.format_exc()

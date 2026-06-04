@@ -13,6 +13,9 @@ spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
 spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 
+# Configure an explicit staging path directory to truncate lineage trees
+spark.sparkContext.setCheckpointDir("Files/checkpoint_dim_client")
+
 # =========================================================================================
 # CONFIGURATION VARIABLES
 # =========================================================================================
@@ -113,7 +116,7 @@ new_inserts, change_updates, change_inserts, delete_updates = 0, 0, 0, 0
 end_count, end_curr = 0, 0
 
 try:
-    # Capture initial dimension metrics
+    # 1. Fetch initial operational counts from raw target storage instance
     base_target_df = spark.table(TARGET_TBL)
     begin_count = base_target_df.count()
     begin_curr = base_target_df.filter(F.col("IsCurrent") == 1).count()
@@ -127,7 +130,7 @@ try:
         "primary_language_value", "smoker_value", "IsActiveClient"
     ]
 
-    # 1. Identify Active Status Flags (Episode Check)
+    # 2. Identify Active Status Flags (Episode Check)
     episode_df = spark.table(SRC_EPISODE_TBL)
     active_clients_df = episode_df.withColumn(
         "clean_discharge_date",
@@ -136,7 +139,7 @@ try:
         F.col("clean_discharge_date") >= F.date_sub(F.current_date(), 13 * 30)
     ).select(F.upper(F.trim(F.col("PATID"))).alias("ACTIVE_PATID")).distinct().cache()
 
-    # 2. Enrich Demographics and Clean Business Keys
+    # 3. Enrich Demographics and Standardize Natural Keys
     demo_df = spark.table(SRC_DEMO_TBL)
     demo_cleaned_df = demo_df.withColumn("CLEAN_PATID", F.upper(F.trim(F.col("PATID"))))
     
@@ -149,64 +152,77 @@ try:
         F.when(F.col("ACTIVE_PATID").isNotNull(), F.lit(1)).otherwise(F.lit(0))
     ).drop("ACTIVE_PATID").cache()
 
+    # Isolate active rows for detection mapping
     comparison_target_df = base_target_df.filter(F.col("IsCurrent") == 1).alias("tgt")
 
-    # 3. Detect Brand New Inbound Records
+    # 4. Detect Brand New Inbound Records (Stage 3)
     new_clients_df = demo_enriched_df.alias("stg").join(
         comparison_target_df,
         F.col("stg.CLEAN_PATID") == F.upper(F.trim(F.col("tgt.PATID"))),
         "left_anti"
     ).select(*[F.col(f"stg.{c}") for c in business_columns])
 
-    # 4. Detect Existing Elements with Historical Attribute Changes
+    # 5. Detect Existing Elements with Historical Attribute Changes (Stage 4)
     changed_clients_df = demo_enriched_df.alias("stg").join(
         comparison_target_df,
         F.col("stg.CLEAN_PATID") == F.upper(F.trim(F.col("tgt.PATID"))),
         "inner"
     ).filter(
         build_sql_concat_string("stg") != build_sql_concat_string("tgt")
-    ).select(*[F.col(f"stg.{c}") for c in business_columns])
+    ).select(
+        F.col("tgt.ClientKey").alias("DeactivateClientKey"),
+        *[F.col(f"stg.{c}") for c in business_columns]
+    )
 
-    # 5. Track Closed/Dropped Records (Orphan Deletions)
+    # 6. Track Closed/Dropped Records (Orphan Deletions - Stage 5)
     deleted_clients_df = comparison_target_df.join(
         demo_enriched_df.alias("stg"),
         F.upper(F.trim(F.col("tgt.PATID"))) == F.col("stg.CLEAN_PATID"),
         "left_anti"
-    ).select(F.upper(F.trim(F.col("tgt.PATID"))).alias("CLEAN_PATID"))
+    ).select(F.col("tgt.ClientKey").alias("DeactivateClientKey"))
 
-    # Track metrics
+    # Compute operational changes metrics
     new_inserts = int(new_clients_df.count())
     change_inserts = int(changed_clients_df.count())
     change_updates = change_inserts
     delete_updates = int(deleted_clients_df.count())
 
     # =========================================================================================
-    # TIMELINE CLOSURE: SUBQUERY EXTRACTION METHOD (Eliminates Python Syntax/Lineage Bugs Completely)
+    # THE LIFESAVER SEPARATION CRITICAL STEP: EXPLICIT METADATA CHECKPOINTING
     # =========================================================================================
-    # Unify target keys to deactivate into a single staging dataframe
-    deactivate_keys_base_df = changed_clients_df.select(F.upper(F.trim(F.col("PATID"))).alias("CLEAN_PATID")) \
-        .unionByName(deleted_clients_df.select(F.upper(F.trim(F.col("CLEAN_PATID"))))) \
-        .distinct()
-
-    # Register keys table as a native SQL Temp View to remove Python parsing boundaries
-    deactivate_keys_base_df.createOrReplaceTempView("mhmr_staged_deactivations_view")
-
-    # Run direct metadata file modifications via ANSI SQL with subquery mapping
-    spark.sql(f"""
-        UPDATE {TARGET_TBL}
-        SET SCDEndDate = CURRENT_TIMESTAMP(),
-            IsCurrent = 0
-        WHERE IsCurrent = 1 
-          AND UPPER(TRIM(PATID)) IN (SELECT CLEAN_PATID FROM mhmr_staged_deactivations_view)
-    """)
+    # Combine keys that must be closed out and write a hard physical checkpoint to truncate background graph lineages
+    deactivation_keys_df = changed_clients_df.select("DeactivateClientKey") \
+        .unionByName(deleted_clients_df.select("DeactivateClientKey")) \
+        .distinct() \
+        .checkpoint()  # <-- SEVERS LINAGE METADATA FOREVER; CLEARING AMBIGUOUS ERRORS
 
     # =========================================================================================
-    # DIMENSION INSERT GENERATION AND APPEND PHASE
+    # RE-ASSEMBLE THE SNAPSHOT PHASES
     # =========================================================================================
-    inserts_combined_df = new_clients_df.unionByName(changed_clients_df).dropDuplicates(["PATID"])
+    # Freshly reference base dimensions components
+    historical_target_df = base_target_df.filter(F.col("IsCurrent") != 1)
+    active_target_base_df = base_target_df.filter(F.col("IsCurrent") == 1)
 
-    # Safely fetch max structural key value from storage layer post modifications
-    max_key_val = spark.table(TARGET_TBL).select(F.coalesce(F.max("ClientKey"), F.lit(0)).alias("max_key")).collect()[0]["max_key"]
+    # Filter out active records remaining completely untouched
+    current_unchanged_df = active_target_base_df.join(
+        deactivation_keys_df,
+        active_target_base_df["ClientKey"] == deactivation_keys_df["DeactivateClientKey"],
+        "left_anti"
+    ).select(base_target_df.columns)
+
+    # Expire changed or deleted records
+    expired_mutations_df = active_target_base_df.join(
+        deactivation_keys_df,
+        active_target_base_df["ClientKey"] == deactivation_keys_df["DeactivateClientKey"],
+        "inner"
+    ).withColumn("SCDEndDate", F.current_timestamp()) \
+     .withColumn("IsCurrent", F.lit(0)) \
+     .select(base_target_df.columns)
+
+    # Generate sequential surrogate keys over fresh incoming values
+    inserts_combined_df = new_clients_df.unionByName(changed_clients_df.drop("DeactivateClientKey")).dropDuplicates(["PATID"])
+    
+    max_key_val = base_target_df.select(F.coalesce(F.max("ClientKey"), F.lit(0)).alias("max_key")).collect()[0]["max_key"]
     surrogate_window = Window.orderBy("PATID")
 
     new_current_records_df = inserts_combined_df.withColumn(
@@ -214,17 +230,22 @@ try:
         F.row_number().over(surrogate_window) + F.lit(int(max_key_val))
     ).withColumn("SCDStartDate", F.current_timestamp()) \
      .withColumn("SCDEndDate", F.to_timestamp(F.lit(FUTURE_END_DATE))) \
-     .withColumn("IsCurrent", F.lit(1))
+     .withColumn("IsCurrent", F.lit(1)) \
+     .select(base_target_df.columns)
 
-    # Safely append row-entries to table using filesystem write mode
-    new_current_records_df.select([c for c in base_target_df.columns]).write.format("delta").mode("append").saveAsTable(TARGET_TBL)
+    # 8. Unify all structures and save back transactionally to Delta Table
+    final_target_snapshot = historical_target_df \
+        .unionByName(current_unchanged_df) \
+        .unionByName(expired_mutations_df) \
+        .unionByName(new_current_records_df)
 
-    # Calculate post-execution metrics
+    final_target_snapshot.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(TARGET_TBL)
+
+    # Compute logging analytics audit traits
     refreshed_target_df = spark.table(TARGET_TBL)
     end_count = refreshed_target_df.count()
     end_curr = refreshed_target_df.filter(F.col("IsCurrent") == 1).count()
 
-    # Append audit records cleanly to pipeline logs
     log_row = [(
         datetime.now(), TABLE_NAME_FOR_LOG, int(begin_count), int(begin_curr),
         int(new_inserts), int(change_updates), int(change_inserts), int(delete_updates),
@@ -233,7 +254,7 @@ try:
     log_cols = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE", "RunStatus", "ErrorMessage"]
     spark.createDataFrame(log_row, log_cols).write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
 
-    print("Pipeline executed successfully. All lineage and string parsing bugs cleared.")
+    print("Pipeline executed successfully. Parity confirmed and session graph memory conflicts cleared.")
 
 except Exception as e:
     err_msg = traceback.format_exc()

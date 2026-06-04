@@ -13,6 +13,9 @@ spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
 spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 
+# Ensure checkpointing directory exists for breaking tough Spark lineages
+spark.sparkContext.setCheckpointDir("Files/checkpoint")
+
 # =========================================================================================
 # CONFIGURATION VARIABLES
 # =========================================================================================
@@ -176,33 +179,30 @@ try:
     delete_updates = int(deleted_clients_df.count())
 
     # 6. Re-assembling Timelines and Closing Expired Records
+    # CRITICAL FIX: Local Checkpoint forces Spark to instantly evaluate these IDs and drop lineage tracking
     deactivation_keys_df = changed_clients_df.select("DeactivateClientKey") \
         .unionByName(deleted_clients_df.select("DeactivateClientKey")) \
-        .distinct()
-
-    # Pull completely fresh instances of the table from storage to clear any lingering context graph reference tags
-    fresh_target_1 = spark.table(TARGET_TBL)
-    fresh_target_2 = spark.table(TARGET_TBL)
-    fresh_target_3 = spark.table(TARGET_TBL)
+        .distinct() \
+        .localCheckpoint()
 
     # Historical items remain unmodified
-    historical_target_df = fresh_target_1.filter(F.col("IsCurrent") != 1)
+    historical_target_df = base_target_df.filter(F.col("IsCurrent") != 1)
 
     # Current items that are remaining active and completely untouched
-    current_unchanged_df = fresh_target_2.filter(F.col("IsCurrent") == 1).alias("c").join(
-        deactivation_keys_df.alias("d"),
-        F.col("c.ClientKey") == F.col("d.DeactivateClientKey"),
+    current_unchanged_df = base_target_df.filter(F.col("IsCurrent") == 1).join(
+        deactivation_keys_df,
+        base_target_df["ClientKey"] == deactivation_keys_df["DeactivateClientKey"],
         "left_anti"
-    ).select("c.*")
+    )
 
-    # Current items that must be expired now (Cleaned up continuation lines)
-    expired_mutations_df = fresh_target_3.filter(F.col("IsCurrent") == 1).alias("c").join(
-        deactivation_keys_df.alias("d"),
-        F.col("c.ClientKey") == F.col("d.DeactivateClientKey"),
+    # Current items that must be expired now
+    expired_mutations_df = base_target_df.filter(F.col("IsCurrent") == 1).join(
+        deactivation_keys_df,
+        base_target_df["ClientKey"] == deactivation_keys_df["DeactivateClientKey"],
         "inner"
     ).withColumn("SCDEndDate", F.current_timestamp()) \
      .withColumn("IsCurrent", F.lit(0)) \
-     .select("c.ClientKey", *[F.col(f"c.{col}") for col in base_target_df.columns if col != "ClientKey"])
+     .select(base_target_df.columns)
 
     # 7. Surrogate Key Generation and Insert Stack assembly
     inserts_to_add_df = new_clients_df.unionByName(changed_clients_df.drop("DeactivateClientKey")).dropDuplicates(["CLEAN_PATID"])
@@ -239,7 +239,7 @@ try:
     log_cols = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE", "RunStatus", "ErrorMessage"]
     spark.createDataFrame(log_row, log_cols).write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
 
-    print("Pipeline executed successfully. Old notebook references cleared and parity confirmed.")
+    print("Pipeline executed successfully. Ambiguous lineage broken and parity confirmed.")
 
 except Exception as e:
     err_msg = traceback.format_exc()

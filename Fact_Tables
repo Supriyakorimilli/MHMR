@@ -1,276 +1,899 @@
-from pyspark.sql import SparkSession, functions as F, Window
-from pyspark.sql.types import (
-    StructType, StructField, IntegerType, LongType, StringType, TimestampType
-)
-import traceback
-from datetime import datetime
+USE [DimensionDW]
+GO
 
-# =========================================================================================
-# SPARK SESSION CONFIGURATION
-# =========================================================================================
-spark = SparkSession.builder.appName("Build.DW.Dim_Client").getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
-spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
-spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+/****** Object:  StoredProcedure [DW].[usp_update_ServiceFact_tables]    Script Date: 6/5/2026 12:36:36 PM ******/
+DROP PROCEDURE [DW].[usp_update_ServiceFact_tables]
+GO
 
-# Configure an explicit staging path directory to truncate lineage trees
-spark.sparkContext.setCheckpointDir("Files/checkpoint_dim_client")
+/****** Object:  StoredProcedure [DW].[usp_update_ServiceFact_tables]    Script Date: 6/5/2026 12:36:36 PM ******/
+SET ANSI_NULLS ON
+GO
 
-# =========================================================================================
-# CONFIGURATION VARIABLES
-# =========================================================================================
-DB = "MHMR_LAKEHOUSE"
+SET QUOTED_IDENTIFIER ON
+GO
 
-SRC_EPISODE_TBL = f"{DB}.RAW.episode_history_RAW"
-SRC_DEMO_TBL    = f"{DB}.RAW.patient_current_demographics_RAW"
 
-TARGET_TBL         = f"{DB}.DW.Dim_Client"
-FINAL_LOG_TBL      = f"{DB}.LOGS.client_final_log"
-TABLE_NAME_FOR_LOG = "Dim_Client"
-ETL_TYPE_FOR_LOG   = "SCD MERGE"
-FUTURE_END_DATE    = "2199-12-31"
+CREATE PROCEDURE [DW].[usp_update_ServiceFact_tables]
+/********************************************************************************************************************************************
+PROCEDURE NAME	: DW.usp_update_ServiceFact_tables
+DESCRIPTION		: Updates the ServiceDeliver, ServiceBilling and ServiceInfo tables in the Dimensional model
+SAMPLE CALL		: EXEC DimensionDW.DW.usp_update_ServiceFact_tables;
+VERSION			: 2.0
+COMMENT			: DATE			USER				COMMENT:
+				  03/08/2024	C. Sherrill			Procedure Creation
+				  03/29/2024	G. Hermanson		Minor formatting completed while researching issue.
+********************************************************************************************************************************************/
 
-# =========================================================================================
-# AUTOMATED TABLE INITIALIZATION
-# =========================================================================================
-def table_exists(table_name: str) -> bool:
-    try:
-        spark.table(table_name)
-        return True
-    except Exception:
-        return False
+AS
 
-if not table_exists(TARGET_TBL):
-    target_schema = StructType([
-        StructField("ClientKey", LongType(), False),
-        StructField("PATID", StringType(), False),
-        StructField("patient_name", StringType(), True),
-        StructField("patient_add_zipcode", StringType(), True),
-        StructField("client_alias", StringType(), True),
-        StructField("employment_status_value", StringType(), True),
-        StructField("education_code", StringType(), True),
-        StructField("marital_status_code", StringType(), True),
-        StructField("facility_chart_number", StringType(), True),
-        StructField("patient_sex_value", StringType(), True),
-        StructField("race_value", StringType(), True),
-        StructField("client_alias_7", StringType(), True),
-        StructField("client_alias_8", StringType(), True),
-        StructField("ethnic_origin_X_NRI_value", StringType(), True),
-        StructField("medicaid_number", StringType(), True),
-        StructField("patient_name_first", StringType(), True),
-        StructField("patient_name_last", StringType(), True),
-        StructField("patient_name_middle", StringType(), True),
-        StructField("patient_name_prefix_code", StringType(), True),
-        StructField("patient_name_prefix_value", StringType(), True),
-        StructField("patient_name_suffix_code", StringType(), True),
-        StructField("patient_name_suffix_value", StringType(), True),
-        StructField("primary_language_value", StringType(), True),
-        StructField("smoker_value", StringType(), True),
-        StructField("IsActiveClient", IntegerType(), True),
-        StructField("SCDStartDate", TimestampType(), True),
-        StructField("SCDEndDate", TimestampType(), True),
-        StructField("IsCurrent", IntegerType(), True)
-    ])
-    spark.createDataFrame([], target_schema).write.format("delta").mode("overwrite").saveAsTable(TARGET_TBL)
+SET NOCOUNT ON;
 
-if not table_exists(FINAL_LOG_TBL):
-    log_schema = StructType([
-        StructField("Logdate", TimestampType(), True),
-        StructField("TableName", StringType(), True),
-        StructField("BeginRecCount", LongType(), True),
-        StructField("BeginCurrCount", LongType(), True),
-        StructField("NewInserts", LongType(), True),
-        StructField("ChangeUpdates", LongType(), True),
-        StructField("ChangeInserts", LongType(), True),
-        StructField("DeleteUpdates", LongType(), True),
-        StructField("EndRecCount", LongType(), True),
-        StructField("EndCurrCount", LongType(), True),
-        StructField("ETL_TYPE", StringType(), True),
-        StructField("RunStatus", StringType(), True),
-        StructField("ErrorMessage", StringType(), True)
-    ])
-    spark.createDataFrame([], log_schema).write.format("delta").mode("overwrite").saveAsTable(FINAL_LOG_TBL)
+-- ##########################################################################################################################
+-- Drop / Truncate Temp Holding Tables if they exist
 
-# =========================================================================================
-# STRATEGIC T-SQL CONCAT MECHANISM REPLICATION
-# =========================================================================================
-def build_sql_concat_string(df_alias):
-    fields = [
-        "patient_name", "patient_add_zipcode", "client_alias", "employment_status_value",
-        "education_code", "marital_status_code", "client_alias_7", "client_alias_8",
-        "medicaid_number", "patient_name_first", "patient_name_last", "patient_name_middle",
-        "patient_name_prefix_code", "patient_name_prefix_value", "patient_name_suffix_code",
-        "patient_name_suffix_value", "primary_language_value", "smoker_value", "IsActiveClient"
-    ]
-    concat_exprs = []
-    for f in fields:
-        col_expr = F.coalesce(F.trim(F.col(f"{df_alias}.{f}").cast("string")), F.lit(""))
-        concat_exprs.append(col_expr)
-    return F.concat(*concat_exprs)
 
-# =========================================================================================
-# CORE EXECUTION PIPELINE
-# =========================================================================================
-begin_count, begin_curr = 0, 0
-new_inserts, change_updates, change_inserts, delete_updates = 0, 0, 0, 0
-end_count, end_curr = 0, 0
+IF OBJECT_ID ('tempdb..#PART1') IS NOT NULL
+BEGIN
+	DROP TABLE #PART1
+END;
 
-try:
-    # 1. Fetch initial operational counts from raw target storage instance
-    base_target_df = spark.table(TARGET_TBL)
-    begin_count = base_target_df.count()
-    begin_curr = base_target_df.filter(F.col("IsCurrent") == 1).count()
+IF OBJECT_ID ('tempdb..#PART2') IS NOT NULL
+BEGIN
+	DROP TABLE #PART2
+END;
 
-    business_columns = [
-        "PATID", "patient_name", "patient_add_zipcode", "client_alias", "employment_status_value",
-        "education_code", "marital_status_code", "facility_chart_number", "patient_sex_value",
-        "race_value", "client_alias_7", "client_alias_8", "ethnic_origin_X_NRI_value", "medicaid_number",
-        "patient_name_first", "patient_name_last", "patient_name_middle", "patient_name_prefix_code",
-        "patient_name_prefix_value", "patient_name_suffix_code", "patient_name_suffix_value",
-        "primary_language_value", "smoker_value", "IsActiveClient"
-    ]
+IF OBJECT_ID ('tempdb..#PART3') IS NOT NULL
+BEGIN
+	DROP TABLE #PART3
+END;
 
-    # 2. Identify Active Status Flags (Episode Check)
-    episode_df = spark.table(SRC_EPISODE_TBL)
-    active_clients_df = episode_df.withColumn(
-        "clean_discharge_date",
-        F.coalesce(F.to_date(F.col("date_of_discharge")), F.to_date(F.lit("2199-12-31")))
-    ).filter(
-        F.col("clean_discharge_date") >= F.date_sub(F.current_date(), 13 * 30)
-    ).select(F.upper(F.trim(F.col("PATID"))).alias("ACTIVE_PATID")).distinct().cache()
+IF OBJECT_ID ('tempdb..#ORPHANS') IS NOT NULL
+BEGIN
+	DROP TABLE #ORPHANS
+END;
 
-    # 3. Enrich Demographics and Standardize Natural Keys
-    demo_df = spark.table(SRC_DEMO_TBL)
-    demo_cleaned_df = demo_df.withColumn("CLEAN_PATID", F.upper(F.trim(F.col("PATID"))))
-    
-    demo_enriched_df = demo_cleaned_df.join(
-        active_clients_df,
-        demo_cleaned_df.CLEAN_PATID == active_clients_df.ACTIVE_PATID,
-        "left"
-    ).withColumn(
-        "IsActiveClient",
-        F.when(F.col("ACTIVE_PATID").isNotNull(), F.lit(1)).otherwise(F.lit(0))
-    ).drop("ACTIVE_PATID").cache()
+--
+-- ##########################################################################################################################
+-- 
+DECLARE  
+	  @TableName_D VARCHAR(40) = 'ServiceDelivery'
+	, @BeginCount_D INT = 0
+	, @BeginCurr_D INT = 0
+	, @NewInserts_D INT = 0
+	, @ChangeUpdates_D INT = 0
+	, @ChangeInserts_D INT = 0
+	, @DeleteUpdates_D INT = 0
+	, @EndCount_D INT = 0
+	, @EndCurr_D INT = 0
+	, @ETLType_D VARCHAR(40) = 'PARTIAL MERGE'
+	, @TableName_B VARCHAR(40) = 'ServiceBilling'
+	, @BeginCount_B INT = 0
+	, @BeginCurr_B INT = 0
+	, @NewInserts_B INT = 0
+	, @ChangeUpdates_B INT = 0
+	, @ChangeInserts_B INT = 0
+	, @DeleteUpdates_B INT = 0
+	, @EndCount_B INT = 0
+	, @EndCurr_B INT = 0
+	, @ETLType_B VARCHAR(40) = 'PARTIAL MERGE'
+	, @TableName_I VARCHAR(40) = 'ServiceInfo'
+	, @BeginCount_I INT = 0
+	, @BeginCurr_I INT = 0
+	, @NewInserts_I INT = 0
+	, @ChangeUpdates_I INT = 0
+	, @ChangeInserts_I INT = 0
+	, @DeleteUpdates_I INT = 0
+	, @EndCount_I INT = 0
+	, @EndCurr_I INT = 0
+	, @ETLType_I VARCHAR(40) = 'PARTIAL MERGE'
 
-    comparison_target_df = base_target_df.filter(F.col("IsCurrent") == 1).alias("tgt")
+--
+-- ##########################################################################################################################
+-- 
 
-    # 4. Detect Brand New Inbound Records (Stage 3)
-    new_clients_df = demo_enriched_df.alias("stg").join(
-        comparison_target_df,
-        F.col("stg.CLEAN_PATID") == F.upper(F.trim(F.col("tgt.PATID"))),
-        "left_anti"
-    ).select(*[F.col(f"stg.{c}") for c in business_columns])
+SELECT @BeginCount_D = COUNT(*) FROM DW.ServiceDelivery;
 
-    # 5. Detect Existing Elements with Historical Attribute Changes (Stage 4)
-    changed_clients_df = demo_enriched_df.alias("stg").join(
-        comparison_target_df,
-        F.col("stg.CLEAN_PATID") == F.upper(F.trim(F.col("tgt.PATID"))),
-        "inner"
-    ).filter(
-        build_sql_concat_string("stg") != build_sql_concat_string("tgt")
-    ).select(
-        F.col("tgt.ClientKey").alias("DeactivateClientKey"),
-        *[F.col(f"stg.{c}") for c in business_columns]
-    )
+SELECT @BeginCount_B = COUNT(*) FROM DW.ServiceBilling;
 
-    # 6. Track Closed/Dropped Records (Orphan Deletions - Stage 5)
-    deleted_clients_df = comparison_target_df.join(
-        demo_enriched_df.alias("stg"),
-        F.upper(F.trim(F.col("tgt.PATID"))) == F.col("stg.CLEAN_PATID"),
-        "left_anti"
-    ).select(F.col("tgt.ClientKey").alias("DeactivateClientKey"))
+SELECT @BeginCount_I = COUNT(*) FROM DW.ServiceInfo;
 
-    # Compute operational changes metrics
-    new_inserts = int(new_clients_df.count())
-    change_inserts = int(changed_clients_df.count())
-    change_updates = change_inserts
-    delete_updates = int(deleted_clients_df.count())
+--
+-- ##########################################################################################################################
+-- 
 
-    # =========================================================================================
-    # THE LIFESAVER SEPARATION CRITICAL STEP: EXPLICIT METADATA CHECKPOINTING
-    # =========================================================================================
-    # Explicitly naming the dataframe variable to ensure downstream matches are seamless
-    deactivation_keys_df = changed_clients_df.select("DeactivateClientKey") \
-        .unionByName(deleted_clients_df.select("DeactivateClientKey")) \
-        .distinct() \
-        .checkpoint()  # <-- Truncates lazy tree log graph lineage memory map cleanly
+CREATE TABLE #PART1
+	(
+	  PART1_ROWID INT NOT NULL IDENTITY(1, 1)
+	, ServiceFactID  VARCHAR(254) NOT NULL
+	, PatientID VARCHAR(20) NOT NULL
+	, DateofService DATE NOT NULL
+	, EPISODE_NUMBER NUMERIC(8,0) NULL
+	, Facility NUMERIC(18, 0) NULL
+	, AdmittedProgram VARCHAR(10) NULL
+	, DataEntrySource VARCHAR(80) NULL
+	, DataEntryDate DATETIME NULL
+	, DataEntryUser VARCHAR(40) NULL
+	, AccountingPeriod DATETIME NULL
+	, CrisisIndicator VARCHAR(50) NULL
+	, COPSD VARCHAR(50) NULL
+	, RecipientCode VARCHAR(50) NULL
+	, EncounterType VARCHAR(50) NULL
+	, PatientAgeonService NUMERIC(38, 2) NULL
+	, ServiceStatusCode VARCHAR(7) NULL
+	, ServiceStatus VARCHAR(10) NULL
+	, ProviderID VARCHAR(15) NULL
+	, CoverageCode VARCHAR(255) NULL
+	, Co_Practitioner_ID VARCHAR(15) NULL
+	, Co_Practitioner2_ID VARCHAR(15) NULL
+	, Tx_Note_UniqueId VARCHAR(40) NULL
+	, ServiceUnits NUMERIC(38, 2) NULL
+	, ServiceCost NUMERIC(38, 2) NULL
+	, BalanceOfFeeOnService NUMERIC(38, 2) NULL
+	, GuarantorID VARCHAR(40) NULL
+	, PrimaryGuarantorLiability NUMERIC(38, 2) NULL
+	, IsBillable CHAR(1) NULL
+	, InsuranceCategoryCode VARCHAR(15) NULL
+	, [Service] VARCHAR(40) NULL
+	, ServiceCode VARCHAR(20) NULL
+	, ServiceLocationCode VARCHAR(15) NULL
+	, ServiceLocation VARCHAR(40) NULL
+	, ServiceDuration NUMERIC(38, 2) NULL
+	, TreatmentSettingCode VARCHAR(15) NULL
+	, TreatmentSetting VARCHAR(40) NULL
+	, ServiceStartTime VARCHAR(10) NULL
+	, ServiceEndTime VARCHAR(10) NULL
+	, AppointmentKey INT NULL
+	, ProgramCode VARCHAR(10) NULL
+	, RANK_NUM INT NULL
+	, CONSTRAINT [PK_PART1_SERVICE_ROWID] PRIMARY KEY CLUSTERED
+		(
+		  PART1_ROWID
+		, ServiceFactID
+		, PatientID
+		, DateofService
+		)
+	);
 
-    # =========================================================================================
-    # RE-ASSEMBLE THE SNAPSHOT PHASES
-    # =========================================================================================
-    historical_target_df = base_target_df.filter(F.col("IsCurrent") != 1)
-    active_target_base_df = base_target_df.filter(F.col("IsCurrent") == 1)
+--
+-- ##########################################################################################################################
+-- 
 
-    # Filter out active records remaining completely untouched
-    current_unchanged_df = active_target_base_df.join(
-        deactivation_keys_df,
-        active_target_base_df["ClientKey"] == deactivation_keys_df["DeactivateClientKey"],
-        "left_anti"
-    ).select(base_target_df.columns)
+CREATE TABLE #PART2
+	(	
+	  PART2_ROWID INT NOT NULL IDENTITY(1, 1)
+	, ServiceFactID VARCHAR(254) NOT NULL
+	, PatientID VARCHAR(20) NOT NULL
+	, DateofService DATE NOT NULL
+	, EPISODE_NUMBER NUMERIC(8,0) NULL
+	, Facility NUMERIC(18, 0) NULL
+	, AdmittedProgram VARCHAR(10) NULL
+	, DataEntrySource VARCHAR(80) NULL
+	, DataEntryDate DATETIME NULL
+	, DataEntryUser VARCHAR(40) NULL
+	, AccountingPeriod DATETIME NULL
+	, CrisisIndicator VARCHAR(50) NULL
+	, COPSD VARCHAR(50) NULL
+	, RecipientCode VARCHAR(50) NULL
+	, EncounterType VARCHAR(50) NULL
+	, PatientAgeonService NUMERIC(38, 2) NULL
+	, ServiceStatusCode VARCHAR(7) NULL
+	, ServiceStatus VARCHAR(10) NULL
+	, ProviderID VARCHAR(15) NULL
+	, CoverageCode VARCHAR(255) NULL
+	, Co_Practitioner_ID VARCHAR(15) NULL
+	, Co_Practitioner2_ID VARCHAR(15) NULL
+	, Tx_Note_UniqueId VARCHAR(40) NULL
+	, ServiceUnits NUMERIC(38, 2) NULL
+	, ServiceCost NUMERIC(38, 2) NULL
+	, BalanceOfFeeOnService NUMERIC(38, 2) NULL
+	, GuarantorKey	INT NULL
+	, PrimaryGuarantorLiability NUMERIC(38, 2) NULL
+	, IsBillable CHAR(1) NULL
+	, InsuranceCategoryCode VARCHAR(15) NULL
+	, [Service] VARCHAR(40) NULL
+	, ServiceCode VARCHAR(20) NULL
+	, ServiceLocationCode VARCHAR(15) NULL
+	, ServiceLocation VARCHAR(40) NULL
+	, ServiceDuration NUMERIC(38, 2) NULL
+	, TreatmentSettingCode VARCHAR(15) NULL
+	, TreatmentSetting VARCHAR(40) NULL
+	, ServiceStartTime VARCHAR(10) NULL
+	, ServiceEndTime VARCHAR(10) NULL
+	, ClientKey INT NULL
+	, StaffKey	INT NULL
+	, ProgramKey INT NULL
+	, AppointmentKey INT NULL
+	, CONSTRAINT [PK_PART2_SERVICE_ROWID] PRIMARY KEY CLUSTERED
+		(
+		  PART2_ROWID
+		, ServiceFactID
+		, PatientID
+		, DateofService
+		)
+	);
 
-    # Expire changed or deleted records
-    expired_mutations_df = active_target_base_df.join(
-        deactivation_keys_df,
-        active_target_base_df["ClientKey"] == deactivation_keys_df["DeactivateClientKey"],
-        "inner"
-    ).withColumn("SCDEndDate", F.current_timestamp()) \
-     .withColumn("IsCurrent", F.lit(0)) \
-     .select(base_target_df.columns)
+--
+-- ##########################################################################################################################
+-- 
 
-    # Generate sequential surrogate keys over fresh incoming values
-    inserts_combined_df = new_clients_df.unionByName(changed_clients_df.drop("DeactivateClientKey")).dropDuplicates(["PATID"])
-    
-    max_key_val = base_target_df.select(F.coalesce(F.max("ClientKey"), F.lit(0)).alias("max_key")).collect()[0]["max_key"]
-    surrogate_window = Window.orderBy("PATID")
+CREATE TABLE #PART3
+	(	
+	  PART3_ROWID INT NOT NULL IDENTITY(1, 1)
+	, ServiceFactID  VARCHAR(254) NOT NULL
+	, PatientID VARCHAR(20) NOT NULL
+	, DateofService	DATE NOT NULL
+	, EPISODE_NUMBER	NUMERIC(8,0) NULL
+	, Facility NUMERIC(18, 0) NULL
+	, AdmittedProgram VARCHAR(10) NULL
+	, DataEntrySource VARCHAR(80) NULL
+	, DataEntryDate DATETIME NULL
+	, DataEntryUser VARCHAR(40) NULL
+	, AccountingPeriod DATETIME NULL
+	, CrisisIndicator VARCHAR(50) NULL
+	, COPSD VARCHAR(50) NULL
+	, RecipientCode VARCHAR(50) NULL
+	, EncounterType VARCHAR(50) NULL
+	, PatientAgeonService NUMERIC(38, 2) NULL
+	, ServiceStatusCode VARCHAR(7) NULL
+	, ServiceStatus VARCHAR(10) NULL
+	, ProviderID VARCHAR(15) NULL
+	, CoverageCode VARCHAR(255) NULL
+	, Co_Practitioner_ID VARCHAR(15) NULL
+	, Co_Practitioner2_ID VARCHAR(15) NULL
+	, Tx_Note_UniqueId VARCHAR(40) NULL
+	, ServiceUnits NUMERIC(38, 2) NULL
+	, ServiceCost NUMERIC(38, 2) NULL
+	, BalanceOfFeeOnService NUMERIC(38, 2) NULL
+	, GuarantorKey	INT NULL
+	, PrimaryGuarantorLiability NUMERIC(38, 2) NULL
+	, IsBillable CHAR(1) NULL
+	, InsuranceCategoryCode VARCHAR(15) NULL
+	, [Service] VARCHAR(40) NULL
+	, ServiceCode VARCHAR(20) NULL
+	, ServiceLocationCode VARCHAR(15) NULL
+	, ServiceLocation VARCHAR(40) NULL
+	, ServiceDuration NUMERIC(38, 2) NULL
+	, TreatmentSettingCode VARCHAR(15) NULL
+	, TreatmentSetting VARCHAR(40) NULL
+	, ServiceStartTime VARCHAR(10) NULL
+	, ServiceEndTime VARCHAR(10) NULL
+	, ClientKey INT NULL
+	, StaffKey INT NULL
+	, ProgramKey INT NULL
+	, AppointmentKey INT NULL
+	, CHANGE_IND VARCHAR(20)
+	, CONSTRAINT [PK_PART3_SERVICE_ROWID] PRIMARY KEY CLUSTERED
+		(
+		  PART3_ROWID
+		, ServiceFactID
+		, PatientID
+		, DateofService
+		)
+	);
 
-    new_current_records_df = inserts_combined_df.withColumn(
-        "ClientKey",
-        F.row_number().over(surrogate_window) + F.lit(int(max_key_val))
-    ).withColumn("SCDStartDate", F.current_timestamp()) \
-     .withColumn("SCDEndDate", F.to_timestamp(F.lit(FUTURE_END_DATE))) \
-     .withColumn("IsCurrent", F.lit(1)) \
-     .select(base_target_df.columns)
+--
+-- ##########################################################################################################################
+-- 
 
-    # 8. Unify all structures and save back transactionally to Delta Table
-    final_target_snapshot = historical_target_df \
-        .unionByName(current_unchanged_df) \
-        .unionByName(expired_mutations_df) \
-        .unionByName(new_current_records_df)
+CREATE TABLE #ORPHANS
+	(	
+	ServiceFactID  VARCHAR(254) NOT NULL
+	)
 
-    final_target_snapshot.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(TARGET_TBL)
 
-    # Compute logging analytics metrics
-    refreshed_target_df = spark.table(TARGET_TBL)
-    end_count = refreshed_target_df.count()
-    end_curr = refreshed_target_df.filter(F.col("IsCurrent") == 1).count()
+--
+-- ##########################################################################################################################
+-- PART 1  SERVICES WITH APPOINTMENT
 
-    log_row = [(
-        datetime.now(), TABLE_NAME_FOR_LOG, int(begin_count), int(begin_curr),
-        int(new_inserts), int(change_updates), int(change_inserts), int(delete_updates),
-        int(end_count), int(end_curr), ETL_TYPE_FOR_LOG, "SUCCESS", ""
-    )]
-    log_cols = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE", "RunStatus", "ErrorMessage"]
-    spark.createDataFrame(log_row, log_cols).write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
+INSERT INTO #PART1
+SELECT 
+	  SDM.ID AS ServiceFactID
+	, SDM.PatientID
+	, SDM.DateofService
+	, CASE 
+		WHEN ISNUMERIC(SUBSTRING(EpisodeNumAndName,1,2)) = 1 
+			THEN LEFT(EpisodeNumAndName,2)
+		ELSE LEFT(EpisodeNumAndName,1) 
+	  END AS EPISODE_NUMBER
+	, SDM.Facility
+	, SDM.AdmittedProgram
+	, SDM.DataEntrySource
+	, SDM.DataEntryDate
+	, SDM.DataEntryUser
+	, SDM.AccountingPeriod
+	, SDM.CrisisIndicator
+	, SDM.COPSD
+	, SDM.RecipientCode
+	, SDM.EncounterType
+	, SDM.PatientAgeonService
+	, SDM.ServiceStatusCode
+	, SDM.ServiceStatus
+	, SDM.ProviderID
+	, SDM.CoverageCode
+	, SDM.Co_Practitioner_ID
+	, SDM.Co_Practitioner2_ID
+	, SDM.Tx_Note_UniqueId
+	, SDM.ServiceUnits
+	, SDM.ServiceCost
+	, SDM.BalanceOfFeeOnService
+	, SDM.PrimaryGuarantorID AS GuarantorID
+	, SDM.PrimaryGuarantorLiability 
+	, SDM.IsBillable 
+	, SDM.InsuranceCategoryCode
+	, SDM.[Service]
+	, SDM.ServiceCode
+	, SDM.ServiceLocationCode
+	, SDM.ServiceLocation 
+	, SDM.ServiceDuration
+	, SDM.TreatmentSettingCode
+	, SDM.TreatmentSetting
+	, SDM.ServiceStartTime 
+	, SDM.ServiceEndTime 
+	, AP.AppointmentKey
+	, SDM.ProgramCode
+	, ROW_NUMBER() OVER (PARTITION BY SDM.PatientID, SUBSTRING(SDM.ID,CHARINDEX('||',SDM.ID,4) + 2,20), AP.NOT_uniqueid 
+		ORDER BY CAST(AP.appointment_date AS DATETIME) + CAST(AP.appointment_start_time AS DATETIME)) AS RANK_NUM
+FROM 
+	MHMRReporting.RPT.ServiceDelivery_Master AS SDM WITH (NOLOCK, NOWAIT)
+	LEFT JOIN DW.Appointments AS AP WITH (NOLOCK, NOWAIT)
+		ON 
+			SDM.PatientID = AP.PATID
+			AND SUBSTRING(SDM.ID,CHARINDEX('||',SDM.ID,4) + 2,20) = AP.JOIN_TO_TX_HISTORY
+			AND SUBSTRING(Tx_Note_UniqueId, CHARINDEX('N',Tx_Note_UniqueId,1),15) = AP.NOT_uniqueid
 
-    print("Pipeline executed successfully. Variables synchronized and data logs recorded.")
+--
+-- ##########################################################################################################################
+-- PART 2 JOIN PART 1 TO CLIENT AND STAFF DIMENSION WHERE RANK_NUM =1
 
-except Exception as e:
-    err_msg = traceback.format_exc()
-    try:
-        log_row = [(
-            datetime.now(), TABLE_NAME_FOR_LOG, int(begin_count), int(begin_curr),
-            int(new_inserts), int(change_updates), int(change_inserts), int(delete_updates),
-            int(end_count), int(end_curr), ETL_TYPE_FOR_LOG, "FAILED", str(e)[:4000]
-        )]
-        log_cols = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE", "RunStatus", "ErrorMessage"]
-        spark.createDataFrame(log_row, log_cols).write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
-    except Exception:
-        pass
-    print(err_msg)
-    raise
 
-finally:
-    try: active_clients_df.unpersist()
-    except Exception: pass
-    try: demo_enriched_df.unpersist()
-    except Exception: pass
+INSERT INTO #PART2
+SELECT 
+	  SDM.ServiceFactID
+	, SDM.PatientID
+	, SDM.DateofService
+	, SDM.EPISODE_NUMBER
+	, SDM.Facility
+	, SDM.AdmittedProgram
+	, SDM.DataEntrySource
+	, SDM.DataEntryDate
+	, SDM.DataEntryUser
+	, SDM.AccountingPeriod
+	, SDM.CrisisIndicator
+	, SDM.COPSD
+	, SDM.RecipientCode
+	, SDM.EncounterType
+	, SDM.PatientAgeonService
+	, SDM.ServiceStatusCode
+	, SDM.ServiceStatus
+	, SDM.ProviderID
+	, SDM.CoverageCode
+	, SDM.Co_Practitioner_ID
+	, SDM.Co_Practitioner2_ID
+	, SDM.Tx_Note_UniqueId
+	, SDM.ServiceUnits
+	, SDM.ServiceCost
+	, SDM.BalanceOfFeeOnService
+	, CG.GuarantorKey
+	, SDM.PrimaryGuarantorLiability 
+	, SDM.IsBillable 
+	, SDM.InsuranceCategoryCode
+	, SDM.[Service]
+	, SDM.ServiceCode
+	, SDM.ServiceLocationCode
+	, SDM.ServiceLocation 
+	, SDM.ServiceDuration
+	, SDM.TreatmentSettingCode
+	, SDM.TreatmentSetting
+	, SDM.ServiceStartTime 
+	, SDM.ServiceEndTime 
+	, DC.ClientKey
+	, DS.StaffKey
+	, DP.ProgramKey
+	, SDM.AppointmentKey
+FROM 
+	#PART1 AS SDM WITH (NOLOCK, NOWAIT)
+	JOIN DW.Dim_Client AS DC WITH (NOLOCK, NOWAIT)
+		ON 
+			SDM.PatientID = DC.PATID
+			AND DC.IsCurrent = 1
+	LEFT JOIN DW.Dim_Staff AS DS WITH (NOLOCK, NOWAIT)
+		ON 
+			SDM.ProviderID = DS.EmployeeID
+			AND DS.IsCurrent = 1
+	LEFT JOIN DW.Dim_Program AS DP WITH (NOLOCK, NOWAIT)
+		ON 
+			SDM.ProgramCode = DP.ProgramCode
+			AND DP.IsCurrent = 1
+	LEFT JOIN DW.Dim_Client_Guarantors AS CG WITH (NOLOCK, NOWAIT)
+		ON 
+			SDM.PatientID = CG.PATID
+			AND SDM.GuarantorID = CG.GuarantorID
+			AND SDM.EPISODE_NUMBER = CG.EPISODE_NUMBER
+			AND CG.IsCurrent = 1
+WHERE 
+	SDM.RANK_NUM = 1
+
+--
+-- ##########################################################################################################################
+-- 
+
+INSERT INTO #PART3
+SELECT 
+	  SDM.ServiceFactID
+	, SDM.PatientID
+	, SDM.DateofService
+	, SDM.EPISODE_NUMBER
+	, SDM.Facility
+	, SDM.AdmittedProgram
+	, SDM.DataEntrySource
+	, SDM.DataEntryDate
+	, SDM.DataEntryUser
+	, SDM.AccountingPeriod
+	, SDM.CrisisIndicator
+	, SDM.COPSD
+	, SDM.RecipientCode
+	, SDM.EncounterType
+	, SDM.PatientAgeonService
+	, SDM.ServiceStatusCode
+	, SDM.ServiceStatus
+	, SDM.ProviderID
+	, SDM.CoverageCode
+	, SDM.Co_Practitioner_ID
+	, SDM.Co_Practitioner2_ID
+	, SDM.Tx_Note_UniqueId
+	, SDM.ServiceUnits
+	, SDM.ServiceCost
+	, SDM.BalanceOfFeeOnService
+	, SDM.GuarantorKey
+	, SDM.PrimaryGuarantorLiability 
+	, SDM.IsBillable 
+	, SDM.InsuranceCategoryCode
+	, SDM.Service
+	, SDM.ServiceCode
+	, SDM.ServiceLocationCode
+	, SDM.ServiceLocation 
+	, SDM.ServiceDuration
+	, SDM.TreatmentSettingCode
+	, SDM.TreatmentSetting
+	, SDM.ServiceStartTime 
+	, SDM.ServiceEndTime 
+	, SDM.ClientKey
+	, SDM.StaffKey
+	, SDM.ProgramKey
+	, SDM.AppointmentKey
+	, CASE 
+		WHEN DW.ServiceFactID IS NULL 
+			THEN 'NEW'
+		WHEN SDM.DataEntryDate > DW.DataEntryDate 
+			THEN 'CHANGE'
+		ELSE NULL 
+	  END AS CHANGE_IND
+FROM 
+	#PART2 AS SDM WITH (NOLOCK, NOWAIT)
+	LEFT JOIN DW.ServiceDelivery AS DW WITH (NOLOCK, NOWAIT)
+		ON 
+			SDM.ServiceFactID = DW.ServiceFactID;
+
+--
+-- ##########################################################################################################################
+-- 
+
+INSERT INTO DW.ServiceDelivery
+SELECT
+	  SDM.ServiceFactID
+	, SDM.PatientID
+	, SDM.DateofService
+	, SDM.EPISODE_NUMBER
+	, SDM.Facility
+	, SDM.AdmittedProgram
+	, SDM.DataEntrySource
+	, SDM.DataEntryDate
+	, SDM.DataEntryUser
+	, SDM.AccountingPeriod
+	, SDM.CrisisIndicator
+	, SDM.COPSD
+	, SDM.RecipientCode
+	, SDM.EncounterType
+	, SDM.PatientAgeonService
+	, SDM.ServiceStatusCode
+	, SDM.ServiceStatus
+	, SDM.ProviderID
+	, SDM.CoverageCode
+	, SDM.Co_Practitioner_ID
+	, SDM.Co_Practitioner2_ID
+	, SDM.Tx_Note_UniqueId
+	, SDM.ClientKey
+	, SDM.StaffKey
+	, SDM.ProgramKey
+	, SDM.AppointmentKey
+FROM
+	#PART3 AS SDM WITH (NOLOCK, NOWAIT)
+WHERE 
+	CHANGE_IND = 'NEW'
+
+SET @NewInserts_D = @@ROWCOUNT;
+
+--
+-- ##########################################################################################################################
+-- 
+
+INSERT INTO DW.ServiceBilling
+SELECT
+	  SDM.ServiceFactID
+	, SDM.ServiceUnits
+	, SDM.ServiceCost
+	, SDM.BalanceOfFeeOnService
+	, SDM.GuarantorKey
+	, SDM.PrimaryGuarantorLiability 
+	, SDM.IsBillable 
+	, SDM.InsuranceCategoryCode
+	, SDM.PatientID
+	, SDM.DateofService
+	, SDM.EPISODE_NUMBER
+	, SDM.ClientKey
+FROM 
+	#PART3 AS SDM WITH (NOLOCK, NOWAIT)
+WHERE 
+	CHANGE_IND = 'NEW'
+
+SET @NewInserts_B = @@ROWCOUNT;
+
+--
+-- ##########################################################################################################################
+-- 
+
+INSERT INTO DW.ServiceInfo
+SELECT
+	  SDM.ServiceFactID
+	, SDM.[Service]
+	, SDM.ServiceCode
+	, SDM.ServiceLocationCode
+	, SDM.ServiceLocation 
+	, SDM.ServiceDuration
+	, SDM.TreatmentSettingCode
+	, SDM.TreatmentSetting
+	, SDM.ServiceStartTime 
+	, SDM.ServiceEndTime 
+	, SDM.PatientID
+	, SDM.DateofService
+	, SDM.ClientKey
+FROM 
+	#PART3 AS SDM WITH (NOLOCK, NOWAIT)
+WHERE 
+	CHANGE_IND = 'NEW'
+
+SET @NewInserts_I = @@ROWCOUNT;
+
+--
+-- ##########################################################################################################################
+-- 
+
+DELETE DW
+FROM 
+	DW.ServiceDelivery AS DW
+	JOIN #PART3 AS SDM WITH (NOLOCK,NOWAIT)
+		ON 
+			DW.ServiceFactID = SDM.ServiceFactID
+			AND SDM.CHANGE_IND = 'CHANGE'
+
+SET @DeleteUpdates_D = @@ROWCOUNT;
+
+--
+-- ##########################################################################################################################
+-- 
+
+DELETE DW
+FROM 
+	DW.ServiceBilling AS DW
+	JOIN #PART3 AS SDM WITH (NOLOCK, NOWAIT)
+		ON 
+			DW.ServiceFactID = SDM.ServiceFactID
+			AND SDM.CHANGE_IND = 'CHANGE'
+
+SET @DeleteUpdates_B = @@ROWCOUNT;
+
+--
+-- ##########################################################################################################################
+-- 
+
+DELETE DW
+FROM 
+	DW.ServiceInfo AS DW
+	JOIN #PART3 AS SDM WITH (NOLOCK, NOWAIT)
+		ON 
+			DW.ServiceFactID = SDM.ServiceFactID
+			AND SDM.CHANGE_IND = 'CHANGE'
+
+SET @DeleteUpdates_I = @@ROWCOUNT;
+
+--
+-- ##########################################################################################################################
+-- 
+
+INSERT INTO DW.ServiceDelivery
+SELECT
+	  SDM.ServiceFactID
+	, SDM.PatientID
+	, SDM.DateofService
+	, SDM.EPISODE_NUMBER
+	, SDM.Facility
+	, SDM.AdmittedProgram
+	, SDM.DataEntrySource
+	, SDM.DataEntryDate
+	, SDM.DataEntryUser
+	, SDM.AccountingPeriod
+	, SDM.CrisisIndicator
+	, SDM.COPSD
+	, SDM.RecipientCode
+	, SDM.EncounterType
+	, SDM.PatientAgeonService
+	, SDM.ServiceStatusCode
+	, SDM.ServiceStatus
+	, SDM.ProviderID
+	, SDM.CoverageCode
+	, SDM.Co_Practitioner_ID
+	, SDM.Co_Practitioner2_ID
+	, SDM.Tx_Note_UniqueId
+	, SDM.ClientKey
+	, SDM.StaffKey
+	, SDM.ProgramKey
+	, SDM.AppointmentKey
+FROM 
+	#PART3 AS SDM WITH (NOLOCK, NOWAIT)
+WHERE 
+	CHANGE_IND = 'CHANGE'
+
+SET @ChangeInserts_D = @@ROWCOUNT;
+
+--
+-- ##########################################################################################################################
+-- 
+
+INSERT INTO DW.ServiceBilling
+SELECT
+	  SDM.ServiceFactID
+	, SDM.ServiceUnits
+	, SDM.ServiceCost
+	, SDM.BalanceOfFeeOnService
+	, SDM.GuarantorKey
+	, SDM.PrimaryGuarantorLiability 
+	, SDM.IsBillable 
+	, SDM.InsuranceCategoryCode
+	, SDM.PatientID
+	, SDM.DateofService
+	, SDM.EPISODE_NUMBER
+	, SDM.ClientKey
+FROM 
+	#PART3 AS SDM WITH (NOLOCK, NOWAIT)
+WHERE 
+	CHANGE_IND = 'CHANGE'
+
+SET @ChangeInserts_B = @@ROWCOUNT;
+
+--
+-- ##########################################################################################################################
+-- 
+
+INSERT INTO DW.ServiceInfo
+SELECT
+	  SDM.ServiceFactID
+	, SDM.[Service]
+	, SDM.ServiceCode
+	, SDM.ServiceLocationCode
+	, SDM.ServiceLocation 
+	, SDM.ServiceDuration
+	, SDM.TreatmentSettingCode
+	, SDM.TreatmentSetting
+	, SDM.ServiceStartTime 
+	, SDM.ServiceEndTime 
+	, SDM.PatientID
+	, SDM.DateofService
+	, SDM.ClientKey
+FROM 
+	#PART3 AS SDM WITH (NOLOCK, NOWAIT)
+WHERE 
+	CHANGE_IND = 'CHANGE'
+
+SET @ChangeInserts_I = @@ROWCOUNT;
+
+--
+-- ##########################################################################################################################
+-- 
+
+INSERT INTO #ORPHANS
+SELECT
+	DW.ServiceFactID
+FROM 
+	DW.ServiceDelivery AS DW WITH (NOLOCK, NOWAIT)
+	LEFT JOIN #PART3 AS P3 WITH (NOLOCK, NOWAIT)
+		ON 
+			DW.ServiceFactID = P3.ServiceFactID
+WHERE 
+	P3.ServiceFactID IS NULL;
+
+--
+-- ##########################################################################################################################
+-- 
+
+DELETE DW
+FROM 
+	DW.ServiceDelivery AS DW WITH (NOLOCK, NOWAIT)
+	JOIN #ORPHANS AS SDM WITH (NOLOCK, NOWAIT)
+		ON 
+			DW.ServiceFactID = SDM.ServiceFactID
+
+SET @DeleteUpdates_D = @@ROWCOUNT;
+
+--
+-- ##########################################################################################################################
+-- 
+
+DELETE DW
+FROM 
+	DW.ServiceBilling AS DW
+	JOIN #ORPHANS AS SDM WITH (NOLOCK, NOWAIT)
+		ON 
+			DW.ServiceFactID = SDM.ServiceFactID
+
+SET @DeleteUpdates_B = @@ROWCOUNT;
+
+
+--
+-- ##########################################################################################################################
+-- 
+
+DELETE DW
+FROM 
+	DW.ServiceInfo AS DW
+	JOIN #ORPHANS AS SDM WITH (NOLOCK, NOWAIT)
+		ON 
+			DW.ServiceFactID = SDM.ServiceFactID
+
+SET @DeleteUpdates_I = @@ROWCOUNT;
+
+--
+-- ##########################################################################################################################
+-- 
+
+SELECT @EndCount_D = COUNT(*) FROM DW.ServiceDelivery;
+
+SELECT @EndCount_B = COUNT(*) FROM DW.ServiceBilling;
+
+SELECT @EndCount_I = COUNT(*) FROM DW.ServiceInfo;
+
+--
+-- ##########################################################################################################################
+-- 
+
+INSERT INTO LOGGING.DW_PROCESS_LOG
+	(
+	  Logdate 
+	, TableName
+	, BeginRecCount
+	, BeginCurrCount
+	, NewInserts
+	, ChangeUpdates
+	, ChangeInserts
+	, DeleteUpdates
+	, EndRecCount
+	, EndCurrCount
+	, ETL_TYPE
+	)
+VALUES
+	(
+	  GETDATE()
+	, @TableName_D
+	, @BeginCount_D
+	, @BeginCurr_D
+	, @NewInserts_D
+	, @ChangeUpdates_D
+	, @ChangeInserts_D
+	, @DeleteUpdates_D
+	, @EndCount_D
+	, @EndCurr_D
+	, @ETLType_D
+	);
+
+--
+-- ##########################################################################################################################
+-- 
+
+
+INSERT INTO LOGGING.DW_PROCESS_LOG
+	(
+	  Logdate 
+	, TableName
+	, BeginRecCount
+	, BeginCurrCount
+	, NewInserts
+	, ChangeUpdates
+	, ChangeInserts
+	, DeleteUpdates
+	, EndRecCount
+	, EndCurrCount
+	, ETL_TYPE
+	)
+VALUES
+	(
+	  GETDATE()
+	, @TableName_B
+	, @BeginCount_B
+	, @BeginCurr_B
+	, @NewInserts_B
+	, @ChangeUpdates_B
+	, @ChangeInserts_B
+	, @DeleteUpdates_B
+	, @EndCount_B
+	, @EndCurr_B
+	, @ETLType_B
+	);
+
+--
+-- ##########################################################################################################################
+-- 
+
+
+INSERT INTO LOGGING.DW_PROCESS_LOG
+	(
+	  Logdate 
+	, TableName
+	, BeginRecCount
+	, BeginCurrCount
+	, NewInserts
+	, ChangeUpdates
+	, ChangeInserts
+	, DeleteUpdates
+	, EndRecCount
+	, EndCurrCount
+	, ETL_TYPE
+	)
+VALUES
+	(
+	  GETDATE()
+	, @TableName_I
+	, @BeginCount_I
+	, @BeginCurr_I
+	, @NewInserts_I
+	, @ChangeUpdates_I
+	, @ChangeInserts_I
+	, @DeleteUpdates_I
+	, @EndCount_I
+	, @EndCurr_I
+	, @ETLType_I
+	);
+
+--
+-- ##########################################################################################################################
+-- 
+
+
+
+IF OBJECT_ID ('tempdb..#PART1') IS NOT NULL
+BEGIN
+	DROP TABLE #PART1
+END;
+
+IF OBJECT_ID ('tempdb..#PART2') IS NOT NULL
+BEGIN
+	DROP TABLE #PART2
+END;
+
+IF OBJECT_ID ('tempdb..#PART3') IS NOT NULL
+BEGIN
+	DROP TABLE #PART3
+END;
+
+IF OBJECT_ID ('tempdb..#ORPHANS') IS NOT NULL
+BEGIN
+	DROP TABLE #ORPHANS
+END;
+
+
+--
+-- ##########################################################################################################################
+-- 
+
+
+GO
+
+

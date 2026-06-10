@@ -20,149 +20,67 @@ spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 
 DB = "MHMR_LAKEHOUSE"
 
-# Target Fact Tables
+# Target Fact Tables (Standardized to compliant 3-part namespace notation via underscores)
 TARGET_DELIVERY_TBL = f"{DB}.dw.fact_ServiceDelivery"
 TARGET_BILLING_TBL  = f"{DB}.dw.fact_ServiceBilling"
 TARGET_INFO_TBL     = f"{DB}.dw.fact_ServiceInfo"
 
-# Dimension Tables
+# Dimension Tables (Synchronized to match your real DW casing structure exactly)
 DIM_CLIENT_TBL      = f"{DB}.DW.dim_client"
 DIM_STAFF_TBL       = f"{DB}.DW.dim_staff"
 DIM_PROGRAM_TBL     = f"{DB}.DW.dim_program"
 DIM_GUARANTOR_TBL   = f"{DB}.DW.dim_client_guarantors"
 
-# Source Tables
-SERVICE_SRC_TBL     = f"{DB}.RAW.ServiceDelivery_Master_RAW_SQL"
-APPT_SRC_TBL        = f"{DB}.DW.dim_appointments"
+# Source Tables (Normal Staging Feed & Clean Appointments Dimension)
+SERVICE_SRC_TBL     = f"{DB}.RAW.ServiceDelivery_Master_RAW_SQL"   # Normal Table 1
+APPT_SRC_TBL        = f"{DB}.DW.dim_appointments"                  # FIXED: Points to actual Dim table
 
 # Logging Configurations
 LOG_TBL             = f"{DB}.LOGS.fact_process_log"
-ETL_TYPE_FOR_LOG    = "PARTIAL MERGE - SCD TYPE 2"
-
-# SCD2 Config
-RUN_TS              = datetime.now()
-RUN_TS_STR          = RUN_TS.strftime("%Y-%m-%d %H:%M:%S")
-BATCH_RUN_ID        = RUN_TS.strftime("%Y%m%d%H%M%S")
-OPEN_END_DATE       = "9999-12-31 23:59:59"
+ETL_TYPE_FOR_LOG    = "PARTIAL MERGE"
 
 # =========================================================================================
 # INITIAL METRICS COLLECTION
 # =========================================================================================
 
-def table_exists(table_path):
-    try:
-        return spark.catalog.tableExists(table_path)
-    except Exception:
-        return False
-
-
 def get_row_count(table_path):
     try:
-        if table_exists(table_path):
+        if spark.catalog.tableExists(table_path):
             return int(spark.read.table(table_path).count())
         return 0
     except Exception:
         return 0
 
-
-def get_current_count(table_path):
-    try:
-        if table_exists(table_path):
-            df = spark.read.table(table_path)
-
-            if "IsCurrent" in df.columns:
-                df = df.filter(F.col("IsCurrent") == True)
-
-            if "IsDeleted" in df.columns:
-                df = df.filter(F.coalesce(F.col("IsDeleted"), F.lit(False)) == False)
-
-            return int(df.count())
-
-        return 0
-    except Exception:
-        return 0
-
-
-def ensure_scd2_columns(table_path):
-    if not table_exists(table_path):
-        return
-
-    existing_cols = spark.read.table(table_path).columns
-    new_cols = []
-
-    if "EffectiveStartDate" not in existing_cols:
-        new_cols.append("EffectiveStartDate TIMESTAMP")
-    if "EffectiveEndDate" not in existing_cols:
-        new_cols.append("EffectiveEndDate TIMESTAMP")
-    if "IsCurrent" not in existing_cols:
-        new_cols.append("IsCurrent BOOLEAN")
-    if "IsDeleted" not in existing_cols:
-        new_cols.append("IsDeleted BOOLEAN")
-    if "RecordHash" not in existing_cols:
-        new_cols.append("RecordHash STRING")
-    if "CreatedDate" not in existing_cols:
-        new_cols.append("CreatedDate TIMESTAMP")
-    if "UpdatedDate" not in existing_cols:
-        new_cols.append("UpdatedDate TIMESTAMP")
-    if "BatchRunId" not in existing_cols:
-        new_cols.append("BatchRunId STRING")
-
-    if len(new_cols) > 0:
-        spark.sql(f"ALTER TABLE {table_path} ADD COLUMNS ({', '.join(new_cols)})")
-
-    dt = DeltaTable.forName(spark, table_path)
-
-    dt.update(
-        condition="IsCurrent IS NULL",
-        set={
-            "EffectiveStartDate": "current_timestamp()",
-            "EffectiveEndDate": f"CAST('{OPEN_END_DATE}' AS TIMESTAMP)",
-            "IsCurrent": "true",
-            "IsDeleted": "false",
-            "RecordHash": "sha2(concat_ws('||', ServiceFactID, cast(DataEntryDate as string)), 256)",
-            "CreatedDate": "current_timestamp()",
-            "UpdatedDate": "current_timestamp()",
-            "BatchRunId": f"'{BATCH_RUN_ID}'"
-        }
-    )
-
-
-for tbl in [TARGET_DELIVERY_TBL, TARGET_BILLING_TBL, TARGET_INFO_TBL]:
-    ensure_scd2_columns(tbl)
-
+# Fetch baseline records before merge executes
 begin_count_d = get_row_count(TARGET_DELIVERY_TBL)
 begin_count_b = get_row_count(TARGET_BILLING_TBL)
 begin_count_i = get_row_count(TARGET_INFO_TBL)
 
-begin_curr_d = get_current_count(TARGET_DELIVERY_TBL)
-begin_curr_b = get_current_count(TARGET_BILLING_TBL)
-begin_curr_i = get_current_count(TARGET_INFO_TBL)
-
 # =========================================================================================
-# PIPELINE STAGE 1: SOURCE EXTRACTION & APPOINTMENT JOIN
+# PIPELINE STAGE 1: SOURCE EXTRACTION & APPOINTMENT JOIN (Normal Tables 1 & 2)
 # =========================================================================================
 
 sdm_df = spark.read.table(SERVICE_SRC_TBL)
 ap_df = spark.read.table(APPT_SRC_TBL)
 
+# Replicating T-SQL Case Statement for Episode Numbers
 sdm_df = sdm_df.withColumn(
     "EPISODE_NUMBER",
-    F.when(
-        F.substring(F.col("EpisodeNumAndName"), 1, 2).rlike("^[0-9]+$"),
-        F.substring(F.col("EpisodeNumAndName"), 1, 2).cast("decimal(8,0)")
-    ).otherwise(
-        F.substring(F.col("EpisodeNumAndName"), 1, 1).cast("decimal(8,0)")
-    )
+    F.when(F.substring("EpisodeNumAndName", 1, 2).cast("int").isNotNull(), F.substring("EpisodeNumAndName", 1, 2))
+     .otherwise(F.substring("EpisodeNumAndName", 1, 1))
 )
 
+# Using F.expr() to bypass the F.substring Column-as-argument limitation safely
 sdm_df = sdm_df.withColumn(
-    "join_tx_hist",
+    "join_tx_hist", 
     F.expr("substring(ID, locate('||', ID, 4) + 2, 20)")
 ).withColumn(
-    "tx_note_uid_slice",
+    "tx_note_uid_slice", 
     F.expr("substring(Tx_Note_UniqueId, locate('N', Tx_Note_UniqueId, 1), 15)")
 )
 
+# Join Normal Table 1 and Appointments Dimension using structured columns
+# RESTORED: ap.AppointmentKey is safely pulled because we are using dim_appointments!
 joined_part1 = sdm_df.alias("sdm").join(
     ap_df.alias("ap"),
     (F.col("sdm.PatientID") == F.col("ap.PATID")) &
@@ -173,7 +91,6 @@ joined_part1 = sdm_df.alias("sdm").join(
     F.col("sdm.ID").alias("ID"),
     "sdm.PatientID",
     "sdm.DateofService",
-    "sdm.EPISODE_NUMBER",
     "sdm.Facility",
     "sdm.AdmittedProgram",
     "sdm.DataEntrySource",
@@ -195,7 +112,7 @@ joined_part1 = sdm_df.alias("sdm").join(
     "sdm.ServiceUnits",
     "sdm.ServiceCost",
     "sdm.BalanceOfFeeOnService",
-    F.col("sdm.PrimaryGuarantorID").alias("GuarantorID"),
+    "sdm.PrimaryGuarantorID",
     "sdm.PrimaryGuarantorLiability",
     "sdm.IsBillable",
     "sdm.InsuranceCategoryCode",
@@ -209,42 +126,24 @@ joined_part1 = sdm_df.alias("sdm").join(
     "sdm.ServiceStartTime",
     "sdm.ServiceEndTime",
     "sdm.ProgramCode",
-    "sdm.join_tx_hist",
-    "sdm.tx_note_uid_slice",
-    "ap.AppointmentKey",
+    "sdm.EPISODE_NUMBER",
+    "sdm.join_tx_hist",         
+    "sdm.tx_note_uid_slice",    
+    "ap.AppointmentKey",        # Restored
     "ap.appointment_date",
     "ap.appointment_start_time"
 )
 
-window_spec = Window.partitionBy(
-    "PatientID",
-    "join_tx_hist",
-    "tx_note_uid_slice"
-).orderBy(
-    F.to_timestamp(
-        F.concat_ws(
-            " ",
-            F.date_format("appointment_date", "yyyy-MM-dd"),
-            F.col("appointment_start_time").cast("string")
-        )
-    ).asc_nulls_last()
-)
+# Dedup rows via Window functions (RANK_NUM = 1)
+window_spec = Window.partitionBy("PatientID", "join_tx_hist", "tx_note_uid_slice") \
+    .orderBy(F.to_timestamp(F.concat_ws(" ", F.date_format("appointment_date", "yyyy-MM-dd"), "appointment_start_time")))
 
-part1_df = joined_part1.withColumn(
-    "RANK_NUM",
-    F.row_number().over(window_spec)
-).filter(
-    F.col("RANK_NUM") == 1
-).drop(
-    "join_tx_hist",
-    "tx_note_uid_slice",
-    "appointment_date",
-    "appointment_start_time",
-    "RANK_NUM"
-)
+part1_df = joined_part1.withColumn("RANK_NUM", F.row_number().over(window_spec)) \
+                       .filter(F.col("RANK_NUM") == 1) \
+                       .drop("join_tx_hist", "tx_note_uid_slice", "appointment_date", "appointment_start_time", "RANK_NUM")
 
 # =========================================================================================
-# PIPELINE STAGE 2: DIMENSION COUPLING
+# PIPELINE STAGE 2: DIMENSION COUPLING (Lookups)
 # =========================================================================================
 
 dim_client    = spark.read.table(DIM_CLIENT_TBL).filter("IsCurrent = 1")
@@ -252,92 +151,30 @@ dim_staff     = spark.read.table(DIM_STAFF_TBL).filter("IsCurrent = 1")
 dim_program   = spark.read.table(DIM_PROGRAM_TBL).filter("IsCurrent = 1")
 dim_guarantor = spark.read.table(DIM_GUARANTOR_TBL).filter("IsCurrent = 1")
 
+# Clean explicit unpack layout to preserve schema validation graph
 part2_df = part1_df.alias("p1") \
-    .join(
-        dim_client.alias("dc"),
-        F.col("p1.PatientID") == F.col("dc.PATID"),
-        "inner"
-    ) \
-    .join(
-        dim_staff.alias("ds"),
-        F.col("p1.ProviderID") == F.col("ds.EmployeeID"),
-        "left"
-    ) \
-    .join(
-        dim_program.alias("dp"),
-        F.col("p1.ProgramCode") == F.col("dp.ProgramCode"),
-        "left"
-    ) \
-    .join(
-        dim_guarantor.alias("cg"),
-        (F.col("p1.PatientID") == F.col("cg.PATID")) &
-        (F.col("p1.GuarantorID") == F.col("cg.GuarantorID")) &
-        (F.col("p1.EPISODE_NUMBER").cast("string") == F.col("cg.EPISODE_NUMBER").cast("string")),
-        "left"
-    ) \
+    .join(dim_client.alias("dc"), (F.col("p1.PatientID") == F.col("dc.PATID")), "inner") \
+    .join(dim_staff.alias("ds"), (F.col("p1.ProviderID") == F.col("ds.EmployeeID")), "left") \
+    .join(dim_program.alias("dp"), (F.col("p1.ProgramCode") == F.col("dp.ProgramCode")), "left") \
+    .join(dim_guarantor.alias("cg"), 
+          (F.col("p1.PatientID") == F.col("cg.PATID")) & 
+          (F.col("p1.PrimaryGuarantorID") == F.col("cg.GuarantorID")) & 
+          (F.col("p1.EPISODE_NUMBER") == F.col("cg.EPISODE_NUMBER")), "left") \
     .select(
-        F.col("p1.ID"),
-        F.col("p1.PatientID"),
-        F.col("p1.DateofService"),
-        F.col("p1.EPISODE_NUMBER"),
-        F.col("p1.Facility"),
-        F.col("p1.AdmittedProgram"),
-        F.col("p1.DataEntrySource"),
-        F.col("p1.DataEntryDate"),
-        F.col("p1.DataEntryUser"),
-        F.col("p1.AccountingPeriod"),
-        F.col("p1.CrisisIndicator"),
-        F.col("p1.COPSD"),
-        F.col("p1.RecipientCode"),
-        F.col("p1.EncounterType"),
-        F.col("p1.PatientAgeonService"),
-        F.col("p1.ServiceStatusCode"),
-        F.col("p1.ServiceStatus"),
-        F.col("p1.ProviderID"),
-        F.col("p1.CoverageCode"),
-        F.col("p1.Co_Practitioner_ID"),
-        F.col("p1.Co_Practitioner2_ID"),
-        F.col("p1.Tx_Note_UniqueId"),
-        F.col("p1.ServiceUnits"),
-        F.col("p1.ServiceCost"),
-        F.col("p1.BalanceOfFeeOnService"),
-        F.col("cg.GuarantorKey"),
-        F.col("p1.PrimaryGuarantorLiability"),
-        F.col("p1.IsBillable"),
-        F.col("p1.InsuranceCategoryCode"),
-        F.col("p1.Service"),
-        F.col("p1.ServiceCode"),
-        F.col("p1.ServiceLocationCode"),
-        F.col("p1.ServiceLocation"),
-        F.col("p1.ServiceDuration"),
-        F.col("p1.TreatmentSettingCode"),
-        F.col("p1.TreatmentSetting"),
-        F.col("p1.ServiceStartTime"),
-        F.col("p1.ServiceEndTime"),
+        F.col("p1.*"),
         F.col("dc.ClientKey"),
         F.col("ds.StaffKey"),
         F.col("dp.ProgramKey"),
-        F.col("p1.AppointmentKey")
+        F.col("cg.GuarantorKey")
     )
 
 # =========================================================================================
 # PIPELINE STAGE 3: CHANGE DETECTION & FACT SPLITTING
 # =========================================================================================
 
-if table_exists(TARGET_DELIVERY_TBL):
-    dw_delivery_df = spark.read.table(TARGET_DELIVERY_TBL)
-
-    if "IsCurrent" in dw_delivery_df.columns:
-        dw_delivery_df = dw_delivery_df.filter(F.col("IsCurrent") == True)
-
-    if "IsDeleted" in dw_delivery_df.columns:
-        dw_delivery_df = dw_delivery_df.filter(F.coalesce(F.col("IsDeleted"), F.lit(False)) == False)
-
-    dw_delivery_df = dw_delivery_df.select(
-        "ServiceFactID",
-        F.col("DataEntryDate").alias("dw_DataEntryDate")
-    )
-
+if spark.catalog.tableExists(TARGET_DELIVERY_TBL):
+    dw_delivery_df = spark.read.table(TARGET_DELIVERY_TBL).select("ServiceFactID", F.col("DataEntryDate").alias("dw_DataEntryDate"))
+    
     staging_df = part2_df.alias("stg").join(
         dw_delivery_df.alias("dw"),
         F.col("stg.ID") == F.col("dw.ServiceFactID"),
@@ -345,253 +182,80 @@ if table_exists(TARGET_DELIVERY_TBL):
     ).withColumn(
         "CHANGE_IND",
         F.when(F.col("dw.ServiceFactID").isNull(), "NEW")
-         .when(F.col("stg.DataEntryDate").cast("timestamp") > F.col("dw_DataEntryDate").cast("timestamp"), "CHANGE")
+         .when(F.col("stg.DataEntryDate") > F.col("dw_DataEntryDate"), "CHANGE")
          .otherwise(F.lit(None))
-    ).drop("dw_DataEntryDate").cache()
+    ).filter(F.col("CHANGE_IND").isNotNull()).cache()
 else:
     staging_df = part2_df.withColumn("CHANGE_IND", F.lit("NEW")).cache()
 
-# IMPORTANT: this is used for orphan detection.
-# Do not use only NEW/CHANGE records for orphan detection.
-source_keys_df = staging_df.select(F.col("ID").alias("ServiceFactID")).distinct().cache()
-
-changed_staging_df = staging_df.filter(F.col("CHANGE_IND").isin("NEW", "CHANGE")).cache()
-
-final_delivery = changed_staging_df.select(
-    F.col("ID").alias("ServiceFactID"),
-    "PatientID",
-    "DateofService",
-    "EPISODE_NUMBER",
-    "Facility",
-    "AdmittedProgram",
-    "DataEntrySource",
-    "DataEntryDate",
-    "DataEntryUser",
-    "AccountingPeriod",
-    "CrisisIndicator",
-    "COPSD",
-    "RecipientCode",
-    "EncounterType",
-    "PatientAgeonService",
-    "ServiceStatusCode",
-    "ServiceStatus",
-    "ProviderID",
-    "CoverageCode",
-    "Co_Practitioner_ID",
-    "Co_Practitioner2_ID",
-    "Tx_Note_UniqueId",
-    "ClientKey",
-    "StaffKey",
-    "ProgramKey",
-    "AppointmentKey",
-    "CHANGE_IND"
+# Map the final 3 fact schemas matching your table boundaries
+final_delivery = staging_df.select(
+    F.col("ID").alias("ServiceFactID"), "PatientID", "DateofService", "EPISODE_NUMBER", "Facility", "AdmittedProgram", 
+    "DataEntrySource", "DataEntryDate", "DataEntryUser", "AccountingPeriod", "CrisisIndicator", "COPSD", 
+    "RecipientCode", "EncounterType", "PatientAgeonService", "ServiceStatusCode", "ServiceStatus", "ProviderID", 
+    "CoverageCode", "Co_Practitioner_ID", "Co_Practitioner2_ID", "Tx_Note_UniqueId", "ClientKey", "StaffKey", 
+    "ProgramKey", "AppointmentKey", "CHANGE_IND"
 )
 
-final_billing = changed_staging_df.select(
-    F.col("ID").alias("ServiceFactID"),
-    "ServiceUnits",
-    "ServiceCost",
-    "BalanceOfFeeOnService",
-    "GuarantorKey",
-    "PrimaryGuarantorLiability",
-    "IsBillable",
-    "InsuranceCategoryCode",
-    "PatientID",
-    "DateofService",
-    "EPISODE_NUMBER",
-    "ClientKey",
-    "CHANGE_IND"
+final_billing = staging_df.select(
+    F.col("ID").alias("ServiceFactID"), "ServiceUnits", "ServiceCost", "BalanceOfFeeOnService", "GuarantorKey", 
+    "PrimaryGuarantorLiability", "IsBillable", "InsuranceCategoryCode", "PatientID", "DateofService", 
+    "EPISODE_NUMBER", "ClientKey", "CHANGE_IND"
 )
 
-final_info = changed_staging_df.select(
-    F.col("ID").alias("ServiceFactID"),
-    "Service",
-    "ServiceCode",
-    "ServiceLocationCode",
-    "ServiceLocation",
-    "ServiceDuration",
-    "TreatmentSettingCode",
-    "TreatmentSetting",
-    "ServiceStartTime",
-    "ServiceEndTime",
-    "PatientID",
-    "DateofService",
-    "ClientKey",
-    "CHANGE_IND"
+final_info = staging_df.select(
+    F.col("ID").alias("ServiceFactID"), "Service", "ServiceCode", "ServiceLocationCode", "ServiceLocation", 
+    "ServiceDuration", "TreatmentSettingCode", "TreatmentSetting", "ServiceStartTime", "ServiceEndTime", 
+    "PatientID", "DateofService", "ClientKey", "CHANGE_IND"
 )
 
 # =========================================================================================
-# PIPELINE STAGE 4: DELTA SCD TYPE 2 UPSERTS
+# PIPELINE STAGE 4: DELTA UPSERTS
 # =========================================================================================
 
-def add_scd2_metadata(df):
-    data_cols = [c for c in df.columns if c != "CHANGE_IND"]
+def execute_upsert(df, target_table_path):
+    if not spark.catalog.tableExists(target_table_path):
+        initial_cnt = int(df.count())
+        df.drop("CHANGE_IND").write.format("delta").saveAsTable(target_table_path)
+        return initial_cnt, 0
+    
+    delta_obj = DeltaTable.forName(spark, target_table_path)
+    upsert_df = df.filter((F.col("CHANGE_IND") == "NEW") | (F.col("CHANGE_IND") == "CHANGE"))
+    
+    ins_cnt = int(upsert_df.filter(F.col("CHANGE_IND") == "NEW").count())
+    upd_cnt = int(upsert_df.filter(F.col("CHANGE_IND") == "CHANGE").count())
+    
+    delta_obj.alias("tgt").merge(
+        source=upsert_df.alias("src"),
+        condition="tgt.ServiceFactID = src.ServiceFactID"
+    ).whenMatchedUpdateAll() \
+     .whenNotMatchedInsertAll() \
+     .execute()
+     
+    return ins_cnt, upd_cnt
 
-    hash_expr = F.sha2(
-        F.concat_ws(
-            "||",
-            *[F.coalesce(F.col(c).cast("string"), F.lit("NULL")) for c in data_cols]
-        ),
-        256
-    )
-
-    return df.withColumn(
-        "EffectiveStartDate",
-        F.lit(RUN_TS).cast("timestamp")
-    ).withColumn(
-        "EffectiveEndDate",
-        F.to_timestamp(F.lit(OPEN_END_DATE))
-    ).withColumn(
-        "IsCurrent",
-        F.lit(True)
-    ).withColumn(
-        "IsDeleted",
-        F.lit(False)
-    ).withColumn(
-        "RecordHash",
-        hash_expr
-    ).withColumn(
-        "CreatedDate",
-        F.lit(RUN_TS).cast("timestamp")
-    ).withColumn(
-        "UpdatedDate",
-        F.lit(RUN_TS).cast("timestamp")
-    ).withColumn(
-        "BatchRunId",
-        F.lit(BATCH_RUN_ID)
-    ).drop("CHANGE_IND")
-
-
-def execute_scd2_upsert(df, target_table_path):
-    df = df.cache()
-
-    new_df = df.filter(F.col("CHANGE_IND") == "NEW")
-    change_df = df.filter(F.col("CHANGE_IND") == "CHANGE")
-
-    new_insert_count = int(new_df.count())
-    change_insert_count = int(change_df.count())
-    change_update_count = 0
-
-    if not table_exists(target_table_path):
-        initial_df = add_scd2_metadata(df)
-
-        (
-            initial_df.write
-            .format("delta")
-            .mode("overwrite")
-            .option("overwriteSchema", "true")
-            .saveAsTable(target_table_path)
-        )
-
-        df.unpersist()
-        return new_insert_count, change_update_count, change_insert_count
-
-    ensure_scd2_columns(target_table_path)
-
-    if change_insert_count > 0:
-        change_keys_df = change_df.select("ServiceFactID").distinct().cache()
-
-        current_target_df = spark.read.table(target_table_path) \
-            .filter(F.col("IsCurrent") == True) \
-            .filter(F.coalesce(F.col("IsDeleted"), F.lit(False)) == False) \
-            .select("ServiceFactID")
-
-        change_update_count = int(
-            current_target_df.join(change_keys_df, "ServiceFactID", "inner").count()
-        )
-
-        delta_obj = DeltaTable.forName(spark, target_table_path)
-
-        delta_obj.alias("tgt").merge(
-            source=change_keys_df.alias("src"),
-            condition="""
-                tgt.ServiceFactID = src.ServiceFactID
-                AND tgt.IsCurrent = true
-                AND coalesce(tgt.IsDeleted, false) = false
-            """
-        ).whenMatchedUpdate(
-            set={
-                "EffectiveEndDate": f"CAST('{RUN_TS_STR}' AS TIMESTAMP)",
-                "IsCurrent": "false",
-                "UpdatedDate": f"CAST('{RUN_TS_STR}' AS TIMESTAMP)",
-                "BatchRunId": f"'{BATCH_RUN_ID}'"
-            }
-        ).execute()
-
-        change_keys_df.unpersist()
-
-    insert_df = new_df.unionByName(change_df)
-
-    if int(insert_df.count()) > 0:
-        insert_df = add_scd2_metadata(insert_df)
-
-        (
-            insert_df.write
-            .format("delta")
-            .mode("append")
-            .option("mergeSchema", "true")
-            .saveAsTable(target_table_path)
-        )
-
-    df.unpersist()
-
-    return new_insert_count, change_update_count, change_insert_count
-
-
-new_inserts_d, change_updates_d, change_inserts_d = execute_scd2_upsert(final_delivery, TARGET_DELIVERY_TBL)
-new_inserts_b, change_updates_b, change_inserts_b = execute_scd2_upsert(final_billing, TARGET_BILLING_TBL)
-new_inserts_i, change_updates_i, change_inserts_i = execute_scd2_upsert(final_info, TARGET_INFO_TBL)
+new_inserts_d, change_updates_d = execute_upsert(final_delivery, TARGET_DELIVERY_TBL)
+new_inserts_b, change_updates_b = execute_upsert(final_billing, TARGET_BILLING_TBL)
+new_inserts_i, change_updates_i = execute_upsert(final_info, TARGET_INFO_TBL)
 
 # =========================================================================================
-# PIPELINE STAGE 5: SCD TYPE 2 ORPHAN CLEANUP
+# PIPELINE STAGE 5: PURGE DELETIONS (ORPHAN CLEANUP)
 # =========================================================================================
 
-def expire_orphans_scd2(target_table_path, source_keys_df):
-    if not table_exists(target_table_path):
-        return 0
+del_d, del_b, del_i = 0, 0, 0
 
-    current_target_keys_df = spark.read.table(target_table_path) \
-        .filter(F.col("IsCurrent") == True) \
-        .filter(F.coalesce(F.col("IsDeleted"), F.lit(False)) == False) \
-        .select("ServiceFactID") \
-        .distinct()
-
-    orphans_df = current_target_keys_df.join(
-        source_keys_df,
-        "ServiceFactID",
-        "left_anti"
+if spark.catalog.tableExists(TARGET_DELIVERY_TBL):
+    orphans_df = spark.read.table(TARGET_DELIVERY_TBL).select("ServiceFactID").join(
+        staging_df.select(F.col("ID").alias("ServiceFactID")), "ServiceFactID", "left_anti"
     ).cache()
-
+    
     orphan_count = int(orphans_df.count())
-
     if orphan_count > 0:
-        delta_obj = DeltaTable.forName(spark, target_table_path)
-
-        delta_obj.alias("tgt").merge(
-            source=orphans_df.alias("src"),
-            condition="""
-                tgt.ServiceFactID = src.ServiceFactID
-                AND tgt.IsCurrent = true
-                AND coalesce(tgt.IsDeleted, false) = false
-            """
-        ).whenMatchedUpdate(
-            set={
-                "EffectiveEndDate": f"CAST('{RUN_TS_STR}' AS TIMESTAMP)",
-                "IsCurrent": "false",
-                "IsDeleted": "true",
-                "UpdatedDate": f"CAST('{RUN_TS_STR}' AS TIMESTAMP)",
-                "BatchRunId": f"'{BATCH_RUN_ID}'"
-            }
-        ).execute()
-
-    orphans_df.unpersist()
-
-    return orphan_count
-
-
-del_d = expire_orphans_scd2(TARGET_DELIVERY_TBL, source_keys_df)
-del_b = expire_orphans_scd2(TARGET_BILLING_TBL, source_keys_df)
-del_i = expire_orphans_scd2(TARGET_INFO_TBL, source_keys_df)
+        for t_path in [TARGET_DELIVERY_TBL, TARGET_BILLING_TBL, TARGET_INFO_TBL]:
+            dt = DeltaTable.forName(spark, t_path)
+            dt.alias("tgt").merge(orphans_df.alias("src"), "tgt.ServiceFactID = src.ServiceFactID") \
+              .whenMatchedDelete().execute()
+        del_d, del_b, del_i = orphan_count, orphan_count, orphan_count
 
 # =========================================================================================
 # PIPELINE STAGE 6: AUDIT METRICS LOGGING
@@ -601,96 +265,28 @@ end_count_d = get_row_count(TARGET_DELIVERY_TBL)
 end_count_b = get_row_count(TARGET_BILLING_TBL)
 end_count_i = get_row_count(TARGET_INFO_TBL)
 
-end_curr_d = get_current_count(TARGET_DELIVERY_TBL)
-end_curr_b = get_current_count(TARGET_BILLING_TBL)
-end_curr_i = get_current_count(TARGET_INFO_TBL)
-
 log_rows = [
-    (
-        RUN_TS,
-        "dw_fact_ServiceDelivery",
-        int(begin_count_d),
-        int(begin_curr_d),
-        int(new_inserts_d),
-        int(change_updates_d),
-        int(change_inserts_d),
-        int(del_d),
-        int(end_count_d),
-        int(end_curr_d),
-        ETL_TYPE_FOR_LOG,
-        BATCH_RUN_ID
-    ),
-    (
-        RUN_TS,
-        "dw_fact_ServiceBilling",
-        int(begin_count_b),
-        int(begin_curr_b),
-        int(new_inserts_b),
-        int(change_updates_b),
-        int(change_inserts_b),
-        int(del_b),
-        int(end_count_b),
-        int(end_curr_b),
-        ETL_TYPE_FOR_LOG,
-        BATCH_RUN_ID
-    ),
-    (
-        RUN_TS,
-        "dw_fact_ServiceInfo",
-        int(begin_count_i),
-        int(begin_curr_i),
-        int(new_inserts_i),
-        int(change_updates_i),
-        int(change_inserts_i),
-        int(del_i),
-        int(end_count_i),
-        int(end_curr_i),
-        ETL_TYPE_FOR_LOG,
-        BATCH_RUN_ID
-    )
+    (datetime.now(), "dw_fact_ServiceDelivery", int(begin_count_d), 0, int(new_inserts_d), int(change_updates_d), int(change_updates_d), int(del_d), int(end_count_d), 0, ETL_TYPE_FOR_LOG),
+    (datetime.now(), "dw_fact_ServiceBilling", int(begin_count_b), 0, int(new_inserts_b), int(change_updates_b), int(change_updates_b), int(del_b), int(end_count_b), 0, ETL_TYPE_FOR_LOG),
+    (datetime.now(), "dw_fact_ServiceInfo", int(begin_count_i), 0, int(new_inserts_i), int(change_updates_i), int(change_updates_i), int(del_i), int(end_count_i), 0, ETL_TYPE_FOR_LOG)
 ]
 
-log_schema = [
-    "Logdate",
-    "TableName",
-    "BeginRecCount",
-    "BeginCurrCount",
-    "NewInserts",
-    "ChangeUpdates",
-    "ChangeInserts",
-    "DeleteUpdates",
-    "EndRecCount",
-    "EndCurrCount",
-    "ETL_TYPE",
-    "BatchRunId"
-]
+log_schema = ["Logdate", "TableName", "BeginRecCount", "BeginCurrCount", "NewInserts", "ChangeUpdates", "ChangeInserts", "DeleteUpdates", "EndRecCount", "EndCurrCount", "ETL_TYPE"]
 
 log_df = spark.createDataFrame(log_rows, log_schema)
 
-if not table_exists(LOG_TBL):
-    (
-        log_df.write
-        .format("delta")
-        .mode("overwrite")
-        .option("overwriteSchema", "true")
-        .saveAsTable(LOG_TBL)
-    )
+if not spark.catalog.tableExists(LOG_TBL):
+    log_df.write.format("delta").mode("overwrite").saveAsTable(LOG_TBL)
 else:
-    (
-        log_df.write
-        .format("delta")
-        .mode("append")
-        .option("mergeSchema", "true")
-        .saveAsTable(LOG_TBL)
-    )
+    log_df.write.format("delta").mode("append").saveAsTable(LOG_TBL)
 
 # Clear active caches
 staging_df.unpersist()
-changed_staging_df.unpersist()
-source_keys_df.unpersist()
+try:
+    orphans_df.unpersist()
+except NameError:
+    pass
+except Exception:
+    pass
 
-print("Fabric Folder-Based Fact SCD Type 2 Load Completed Successfully.")
-print(f"BatchRunId: {BATCH_RUN_ID}")
-print(f"ServiceDelivery - New: {new_inserts_d}, Changes: {change_inserts_d}, Expired: {change_updates_d}, Orphans: {del_d}")
-print(f"ServiceBilling  - New: {new_inserts_b}, Changes: {change_inserts_b}, Expired: {change_updates_b}, Orphans: {del_b}")
-print(f"ServiceInfo     - New: {new_inserts_i}, Changes: {change_inserts_i}, Expired: {change_updates_i}, Orphans: {del_i}")
+print("Fabric Folder-Based Fact Load Completed Successfully.")

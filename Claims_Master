@@ -1,310 +1,475 @@
-# CLAIMS_MASTER_TABLE WITH ROW_HASH AND INSERT_TS - UPDATED JOINS
-
 from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.utils import AnalysisException
-from datetime import datetime
-import pytz
+from pyspark.sql.window import Window
+from delta.tables import DeltaTable
+import traceback
 
-# -----------------------
-# Spark session and configs
-# -----------------------
-spark = SparkSession.builder.appName("Build Service Claims Master").getOrCreate()
+spark = SparkSession.builder.appName("Build DW.DIM_CLIENT (SQL usp_update_Dim_Client match)").getOrCreate()
 spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
-spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
-spark.conf.set("spark.sql.parquet.int96RebaseModeInRead",  "CORRECTED")
-spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
-spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead",  "CORRECTED")
-spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
 spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
-
-# =====================================================================================
-# CONFIG
-# =====================================================================================
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 
 DB = "MHMR_LAKEHOUSE"
 
-SDM_TBL        = f"{DB}.RAW.service_delivery_master_raw"
-PAY_ADJ_TBL    = f"{DB}.RAW.billing_pay_adj_history_RAW"
-GUAR_TBL       = f"{DB}.RAW.billing_guar_table_RAW"
-TX_HIST_TBL    = f"{DB}.RAW.billing_tx_history_RAW"
-GUAR_SUBS_TBL  = f"{DB}.RAW.billing_guar_subs_data_RAW"
-CHARGE_DET_TBL = f"{DB}.RAW.billing_tx_charge_detail_RAW"
-CLAIM_HIST_TBL = f"{DB}.RAW.billing_claim_history_RAW"
-FEE_TBL        = f"{DB}.RAW.REF_PROJECTED_SERVICE_FEES_RAW_SQL"
+DIM_TABLE     = f"{DB}.DW.Dim_Client"
+FINAL_LOG_TBL = f"{DB}.LOGS.client_dim_final_log"
 
-TARGET_TBL     = f"{DB}.RAW.ServiceClaimsMaster_RAW"
+PCD_TBL     = f"{DB}.RAW.patient_current_demographics_raw"
+EPISODE_TBL = f"{DB}.RAW.episode_history_raw"
 
-# =====================================================================================
-# PARAMETERS
-# =====================================================================================
+TABLE_NAME_FOR_LOG = "Dim_Client"
+LOAD_TYPE_FOR_LOG  = "Incremental"
 
-BEG_DATE = F.to_date(F.lit("2018-09-01"))
-END_DATE = F.to_date(F.lit("2199-12-31"))
 
-# =====================================================================================
-# LOAD SOURCE DATAFRAMES
-# =====================================================================================
+spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
 
-sdm  = spark.table(SDM_TBL)
-pay  = spark.table(PAY_ADJ_TBL)
-bgt  = spark.table(GUAR_TBL)
-btx  = spark.table(TX_HIST_TBL)
-subs = spark.table(GUAR_SUBS_TBL)
-bcd  = spark.table(CHARGE_DET_TBL)
-bch  = spark.table(CLAIM_HIST_TBL)
-fee  = spark.table(FEE_TBL)
+LOAD_TYPE = "full"  # you can label it full for first build
 
-# =====================================================================================
-# ADJ CTE TRANSLATION
-# =====================================================================================
+# ---------- Helpers ----------
+def table_exists(table_name: str) -> bool:
+    try:
+        spark.table(table_name)
+        return True
+    except Exception:
+        return False
 
-adj = (
-    pay
-    .where(
-        (F.col("DATE_OF_SERVICE") >= BEG_DATE) &
-        (F.col("DATE_OF_SERVICE") <= END_DATE)
+def now_ts():
+    return spark.sql("SELECT current_timestamp() AS ts").collect()[0]["ts"]
+
+def sql_concat_signature(cols):
+    """
+    SQL CONCAT treats NULL as empty string. We mimic by COALESCE(col, '') for all pieces.
+    The SQL proc compares a concat of many fields including IsActiveClient.
+    """
+    exprs = []
+    for c in cols:
+        if isinstance(c, str):
+            exprs.append(F.coalesce(F.col(c).cast("string"), F.lit("")))
+        else:
+            exprs.append(F.coalesce(c.cast("string"), F.lit("")))
+    return F.concat(*exprs)
+
+def write_final_log(
+    status: str,
+    begin_total: int,
+    begin_curr: int,
+    new_inserts: int,
+    change_updates: int,
+    change_inserts: int,
+    delete_updates: int,
+    end_total: int,
+    end_curr: int,
+    err_msg: str,
+    start_ts,
+    end_ts,
+    metric_count: int
+):
+    log_df = spark.createDataFrame(
+        [(
+            start_ts.date(), # load_date
+            "Dim_Client",                             # table_name
+            status,                                   # status
+            int(metric_count),                        # count (you were printing this)
+            err_msg,                                  # error_message
+            start_ts,                                 # insert_timestamp
+            start_ts,                                 # start_time
+            end_ts,                                   # end_time
+            LOAD_TYPE,                                # load_type
+            start_ts,                                 # Logdate
+            "Dim_Client",                             # TableName
+            int(begin_total),                         # BeginRecCount
+            int(begin_curr),                          # BeginCurrCount
+            int(new_inserts),                         # NewInserts
+            int(change_updates),                      # ChangeUpdates
+            int(change_inserts),                      # ChangeInserts
+            int(delete_updates),                      # DeleteUpdates
+            int(end_total),                           # EndRecCount
+            int(end_curr),                            # EndCurrCount
+            "SCD MERGE"                               # ETL_TYPE
+        )],
+        schema="""
+            load_date date,
+            table_name string,
+            status string,
+            count long,
+            error_message string,
+            insert_timestamp timestamp,
+            start_time timestamp,
+            end_time timestamp,
+            load_type string,
+            Logdate timestamp,
+            TableName string,
+            BeginRecCount long,
+            BeginCurrCount long,
+            NewInserts long,
+            ChangeUpdates long,
+            ChangeInserts long,
+            DeleteUpdates long,
+            EndRecCount long,
+            EndCurrCount long,
+            ETL_TYPE string
+        """
     )
-    .groupBy("PATID", "GUARANTOR_ID", "JOIN_TO_TX_HISTORY", "EPISODE_NUMBER")
-    .agg(
-        F.max(
-            F.when(
-                (F.col("type_of_payment") == "PAYMENT") |
-                ((F.col("payment_type_code") >= "600") & (F.col("payment_type_code") <= "608")),
-                F.col("date_of_payment")
+
+    # Later switch to mode("append") to keep log history.
+    log_df.write.format("delta").mode("append").saveAsTable(FINAL_LOG_TBL)
+
+# ---------- Main ----------
+start_ts = now_ts()
+
+status = "S"
+err_msg = ""
+metric_count = 0
+
+begin_total = 0
+begin_curr = 0
+new_inserts = 0
+change_updates = 0
+change_inserts = 0
+delete_updates = 0
+end_total = 0
+end_curr = 0
+
+try:
+    # Read sources
+    episode_hist = spark.table(EPISODE_TBL)
+    pcd = spark.table(PCD_TBL)
+
+    # Ensure PATID types comparable
+    episode_hist = episode_hist.withColumn("PATID", F.col("PATID").cast("string"))
+    pcd = pcd.withColumn("PATID", F.col("PATID").cast("string"))
+
+    # Active clients list, SQL logic:
+    # where isnull(date_of_discharge,'2199-12-31') >= DATEADD(MONTH,-13,GETDATE())
+    active_clients = (
+        episode_hist
+        .withColumn(
+            "dod",
+            F.coalesce(F.col("date_of_discharge").cast("timestamp"),
+                       F.to_timestamp(F.lit("2199-12-31 00:00:00")))
+        )
+        .where(F.col("dod") >= F.add_months(F.current_timestamp(), -13))
+        .select(F.col("PATID").alias("ACT_PATID"))
+        .distinct()
+    )
+
+    # Load dim if exists, else create empty dim_curr
+    if table_exists(DIM_TABLE):
+        dim_all = spark.table(DIM_TABLE)
+        dim_all = dim_all.withColumn("PATID", F.col("PATID").cast("string"))
+        begin_total = dim_all.count()
+        begin_curr = dim_all.filter(F.col("IsCurrent") == 1).count()
+        dim_curr = dim_all.filter(F.col("IsCurrent") == 1).alias("p2")
+        max_client_key = dim_all.agg(F.max(F.col("ClientKey"))).collect()[0][0] or 0
+    else:
+        # Empty current dim with schema matching what we will write
+        max_client_key = 0
+        begin_total = 0
+        begin_curr = 0
+        dim_curr = None
+
+    # Build PCD with IsActiveClient_new computed once, and referenced without p1. prefix later
+    pcd_enriched = (
+        pcd.alias("p1")
+        .join(active_clients.alias("act"), F.col("p1.PATID") == F.col("act.ACT_PATID"), "left")
+        .withColumn(
+            "IsActiveClient_new",
+            F.when(F.col("act.ACT_PATID").isNotNull(), F.lit(True)).otherwise(F.lit(False))
+        )
+        .select(
+            F.col("p1.PATID").alias("PATID"),
+            F.col("p1.patient_name"),
+            F.col("p1.patient_add_zipcode"),
+            F.col("p1.client_alias"),
+            F.col("p1.employment_status_value"),
+            F.col("p1.education_code"),
+            F.col("p1.marital_status_code"),
+            F.col("p1.facility_chart_number"),
+            F.col("p1.patient_sex_value"),
+            F.col("p1.race_value"),
+            F.col("p1.client_alias_7"),
+            F.col("p1.client_alias_8"),
+            F.col("p1.ethnic_origin_X_NRI_value"),
+            F.col("p1.medicaid_number"),
+            F.col("p1.patient_name_first"),
+            F.col("p1.patient_name_last"),
+            F.col("p1.patient_name_middle"),
+            F.col("p1.patient_name_prefix_code"),
+            F.col("p1.patient_name_prefix_value"),
+            F.col("p1.patient_name_suffix_code"),
+            F.col("p1.patient_name_suffix_value"),
+            F.col("p1.primary_language_value"),
+            F.col("p1.smoker_value"),
+            F.col("IsActiveClient_new")
+        )
+    )
+
+    # If no dim exists yet, first load is simply all PCD as new and no changed/deleted.
+    if dim_curr is None:
+        new_clients = pcd_enriched
+        changed_clients = spark.createDataFrame([], schema="""
+            ClientKey int, PATID string, patient_name string, patient_add_zipcode string, client_alias string,
+            employment_status_value string, education_code string, marital_status_code string, facility_chart_number string,
+            patient_sex_value string, race_value string, client_alias_7 string, client_alias_8 string,
+             smoker_value string, IsActiveClient boolean
+        """)
+        deleted_keys = spark.createDataFrame([], schema="ClientKey int")
+    else:
+        # New clients: PCD left join dim current, where dim missing
+        new_clients = (
+            pcd_enriched.alias("p1x")
+            .join(dim_curr.select(F.col("p2.PATID").alias("DIM_PATID")), F.col("p1x.PATID") == F.col("DIM_PATID"), "left")
+            .where(F.col("DIM_PATID").isNull())
+            .drop("DIM_PATID")
+        )
+
+        # Changed clients: join to current dim and compare SQL concat signatures
+        p2 = dim_curr
+
+        p1x = pcd_enriched.alias("p1x").join(
+            p2.select(F.col("p2.ClientKey"), F.col("p2.PATID").alias("DIM_PATID"),
+                      F.col("p2.patient_name"), F.col("p2.patient_add_zipcode"), F.col("p2.client_alias"),
+                      F.col("p2.employment_status_value"), F.col("p2.education_code"), F.col("p2.marital_status_code"),
+                      F.col("p2.client_alias_7"), F.col("p2.client_alias_8"), F.col("p2.medicaid_number"),
+                      F.col("p2.patient_name_first"), F.col("p2.patient_name_last"), F.col("p2.patient_name_middle"),
+                      F.col("p2.patient_name_prefix_code"), F.col("p2.patient_name_prefix_value"),
+                      F.col("p2.patient_name_suffix_code"), F.col("p2.patient_name_suffix_value"),
+                      F.col("p2.primary_language_value"), F.col("p2.smoker_value"),
+                      F.col("p2.IsActiveClient").alias("DIM_IsActiveClient")
+                     ).alias("p2x"),
+            F.col("p1x.PATID") == F.col("p2x.DIM_PATID"),
+            "inner"
+        )
+
+        # SQL concat lists (note: SQL changed concat does not include facility_chart_number, patient_sex_value, race_value)
+        p1_concat = sql_concat_signature([
+            "p1x.patient_name",
+            "p1x.patient_add_zipcode",
+            "p1x.client_alias",
+            "p1x.employment_status_value",
+            "p1x.education_code",
+            "p1x.marital_status_code",
+            "p1x.client_alias_7",
+            "p1x.client_alias_8",
+            "p1x.medicaid_number",
+            "p1x.patient_name_first",
+            "p1x.patient_name_last",
+            "p1x.patient_name_middle",
+            "p1x.patient_name_prefix_code",
+            "p1x.patient_name_prefix_value",
+            "p1x.patient_name_suffix_code",
+            "p1x.patient_name_suffix_value",
+            "p1x.primary_language_value",
+            "p1x.smoker_value",
+            F.col("p1x.IsActiveClient_new").cast("string")
+        ])
+
+        p2_concat = sql_concat_signature([
+            "p2x.patient_name",
+            "p2x.patient_add_zipcode",
+            "p2x.client_alias",
+            "p2x.employment_status_value",
+            "p2x.education_code",
+            "p2x.marital_status_code",
+            "p2x.client_alias_7",
+            "p2x.client_alias_8",
+            "p2x.medicaid_number",
+            "p2x.patient_name_first",
+            "p2x.patient_name_last",
+            "p2x.patient_name_middle",
+            "p2x.patient_name_prefix_code",
+            "p2x.patient_name_prefix_value",
+            "p2x.patient_name_suffix_code",
+            "p2x.patient_name_suffix_value",
+            "p2x.primary_language_value",
+            "p2x.smoker_value",
+            F.col("p2x.DIM_IsActiveClient").cast("string")
+        ])
+
+        changed_clients = (
+            p1x
+            .withColumn("p1_concat", p1_concat)
+            .withColumn("p2_concat", p2_concat)
+            .where(F.col("p1_concat") != F.col("p2_concat"))
+            .select(
+                F.col("p2x.ClientKey").cast("int").alias("ClientKey"),
+                F.col("p1x.PATID"),
+                F.col("p1x.patient_name"),
+                F.col("p1x.patient_add_zipcode"),
+                F.col("p1x.client_alias"),
+                F.col("p1x.employment_status_value"),
+                F.col("p1x.education_code"),
+                F.col("p1x.marital_status_code"),
+                F.col("p1x.facility_chart_number"),
+                F.col("p1x.patient_sex_value"),
+                F.col("p1x.race_value"),
+                F.col("p1x.client_alias_7"),
+                F.col("p1x.client_alias_8"),
+                F.col("p1x.ethnic_origin_X_NRI_value"),
+                F.col("p1x.medicaid_number"),
+                F.col("p1x.patient_name_first"),
+                F.col("p1x.patient_name_last"),
+                F.col("p1x.patient_name_middle"),
+                F.col("p1x.patient_name_prefix_code"),
+                F.col("p1x.patient_name_prefix_value"),
+                F.col("p1x.patient_name_suffix_code"),
+                F.col("p1x.patient_name_suffix_value"),
+                F.col("p1x.primary_language_value"),
+                F.col("p1x.smoker_value"),
+                F.col("p1x.IsActiveClient_new").alias("IsActiveClient")
             )
-        ).alias("Date_of_payment"),
-        F.sum(
-            F.when(
-                (F.col("type_of_payment") == "PAYMENT") |
-                ((F.col("payment_type_code") >= "600") & (F.col("payment_type_code") <= "608")),
-                F.col("payment_amount")
-            ).otherwise(F.lit(0))
-        ).alias("Total_Payments"),
-        F.sum(
-            F.when(
-                (F.col("payment_type_code") >= "200") & (F.col("payment_type_code") <= "299"),
-                F.col("payment_amount")
-            ).otherwise(F.lit(0))
-        ).alias("Series_200_adj"),
-        F.sum(
-            F.when(
-                (F.col("payment_type_code") >= "300") & (F.col("payment_type_code") <= "399"),
-                F.col("payment_amount")
-            ).otherwise(F.lit(0))
-        ).alias("Series_300_adj"),
-        F.sum(
-            F.when(
-                (F.col("payment_type_code") >= "400") & (F.col("payment_type_code") <= "499"),
-                F.col("payment_amount")
-            ).otherwise(F.lit(0))
-        ).alias("Series_400_adj"),
-        F.sum(
-            F.when(
-                (F.col("payment_type_code") >= "500") & (F.col("payment_type_code") <= "599"),
-                F.col("payment_amount")
-            ).otherwise(F.lit(0))
-        ).alias("Series_500_adj"),
-        F.sum(
-            F.when(
-                (F.col("payment_type_code") >= "600") & (F.col("payment_type_code") <= "699"),
-                F.col("payment_amount")
-            ).otherwise(F.lit(0))
-        ).alias("Series_600_adj"),
-        F.sum(
-            F.when(
-                (F.col("payment_type_code") >= "700") & (F.col("payment_type_code") <= "799"),
-                F.col("payment_amount")
-            ).otherwise(F.lit(0))
-        ).alias("Series_700_adj"),
+        )
+
+        # Deleted clients: current dim left anti join PCD
+        deleted_keys = (
+            dim_curr.select(F.col("p2.ClientKey").cast("int").alias("ClientKey"),
+                            F.col("p2.PATID").alias("DIM_PATID"))
+            .join(pcd.select(F.col("PATID").cast("string").alias("SRC_PATID")),
+                  F.col("DIM_PATID") == F.col("SRC_PATID"),
+                  "left")
+            .where(F.col("SRC_PATID").isNull())
+            .select("ClientKey")
+        )
+
+    # Expire changed + deleted in the dim table (if it exists)
+    if table_exists(DIM_TABLE):
+        dim_delta = DeltaTable.forName(spark, DIM_TABLE)
+
+        changed_keys_df = changed_clients.select(F.col("ClientKey").cast("int").alias("ClientKey")).distinct()
+        deleted_keys_df = deleted_keys.select(F.col("ClientKey").cast("int").alias("ClientKey")).distinct()
+
+        # Expire changed
+        if changed_keys_df.count() > 0:
+            dim_delta.alias("t").merge(
+                changed_keys_df.alias("s"),
+                "t.ClientKey = s.ClientKey AND t.IsCurrent = 1"
+            ).whenMatchedUpdate(set={
+                "SCDEndDate": "current_timestamp()",
+                "IsCurrent": "0"
+            }).execute()
+            change_updates = changed_keys_df.count()
+
+        # Expire deleted
+        if deleted_keys_df.count() > 0:
+            dim_delta.alias("t").merge(
+                deleted_keys_df.alias("s"),
+                "t.ClientKey = s.ClientKey AND t.IsCurrent = 1"
+            ).whenMatchedUpdate(set={
+                "SCDEndDate": "current_timestamp()",
+                "IsCurrent": "0"
+            }).execute()
+            delete_updates = deleted_keys_df.count()
+
+    # Build insert rows for new + changed, assign new ClientKey values
+    to_insert = (
+        new_clients
+        .select(
+            "PATID","patient_name","patient_add_zipcode","client_alias","employment_status_value","education_code",
+            "marital_status_code","facility_chart_number","patient_sex_value","race_value","client_alias_7","client_alias_8",
+            "ethnic_origin_X_NRI_value","medicaid_number","patient_name_first","patient_name_last","patient_name_middle",
+            "patient_name_prefix_code","patient_name_prefix_value","patient_name_suffix_code","patient_name_suffix_value",
+            "primary_language_value","smoker_value",
+            F.col("IsActiveClient_new").alias("IsActiveClient")
+        )
+        .withColumn("ins_type", F.lit("NEW"))
+        .unionByName(
+            changed_clients
+            .select(
+                "PATID","patient_name","patient_add_zipcode","client_alias","employment_status_value","education_code",
+                "marital_status_code","facility_chart_number","patient_sex_value","race_value","client_alias_7","client_alias_8",
+                "ethnic_origin_X_NRI_value","medicaid_number","patient_name_first","patient_name_last","patient_name_middle",
+                "patient_name_prefix_code","patient_name_prefix_value","patient_name_suffix_code","patient_name_suffix_value",
+                "primary_language_value","smoker_value","IsActiveClient"
+                )
+            .withColumn("ins_type", F.lit("CHG"))
+        )
     )
+
+    # counts like SQL
+    new_inserts = new_clients.count()
+    change_inserts = changed_clients.count()
+
+    if to_insert.count() > 0:
+        w = Window.orderBy(F.col("PATID").asc())
+
+        insert_rows = (
+            to_insert
+            .withColumn("_rn", F.row_number().over(w))
+            .withColumn("ClientKey", (F.lit(int(max_client_key)) + F.col("_rn")).cast("int"))
+            .drop("_rn", "ins_type")
+            .withColumn("SCDStartDate", F.current_timestamp())
+            .withColumn("SCDEndDate", F.to_timestamp(F.lit("2199-12-31 00:00:00")))
+            .withColumn("IsCurrent", F.lit(1))
+            .select(
+                "ClientKey","PATID","patient_name","patient_add_zipcode","client_alias","employment_status_value","education_code",
+                "marital_status_code","facility_chart_number","patient_sex_value","race_value","client_alias_7","client_alias_8",
+                "ethnic_origin_X_NRI_value","medicaid_number","patient_name_first","patient_name_last","patient_name_middle",
+                "patient_name_prefix_code","patient_name_prefix_value","patient_name_suffix_code","patient_name_suffix_value",
+                "primary_language_value","smoker_value","IsActiveClient","SCDStartDate","SCDEndDate","IsCurrent"
+            )
+        )
+    else:
+        insert_rows = None
+
+    # Final write
+    # For first ever run, overwrite is fine.
+    # If the dim already exists and you want to keep history across runs, do NOT overwrite; use append.
+    if not table_exists(DIM_TABLE):
+        if insert_rows is not None:
+            insert_rows.write.format("delta").mode("append").saveAsTable(DIM_TABLE)
+        else:
+            # create empty table with expected schema if needed
+            spark.createDataFrame([], schema="""
+                ClientKey int, PATID string, patient_name string, patient_add_zipcode string, client_alias string,
+                employment_status_value string, education_code string, marital_status_code string, facility_chart_number string,
+                patient_sex_value string, race_value string, client_alias_7 string, client_alias_8 string,
+                ethnic_origin_X_NRI_value string, medicaid_number string, patient_name_first string, patient_name_last string,
+                patient_name_middle string, patient_name_prefix_code string, patient_name_prefix_value string,
+                patient_name_suffix_code string, patient_name_suffix_value string, primary_language_value string,
+                smoker_value string, IsActiveClient boolean, SCDStartDate timestamp, SCDEndDate timestamp, IsCurrent int
+            """).write.format("delta").mode("overwrite").saveAsTable(DIM_TABLE)
+    else:
+        # We already expired rows in-place via merge, now append new versions
+        if insert_rows is not None:
+            # Keep overwrite while you are testing if you want, but it will destroy history.
+            # Recommended: append
+            insert_rows.write.format("delta").mode("append").saveAsTable(DIM_TABLE)
+
+    # End counts
+    dim_final = spark.table(DIM_TABLE)
+    end_total = dim_final.count()
+    end_curr = dim_final.filter(F.col("IsCurrent") == 1).count()
+
+    # metric_count you were printing; keep it as current rows
+    metric_count = end_curr
+
+except Exception:
+    status = "E"
+    err_msg = traceback.format_exc()
+    metric_count = 0
+
+end_ts = now_ts()
+
+# Write final log and raise if error (matches your pattern)
+write_final_log(
+    status=status,
+    begin_total=begin_total,
+    begin_curr=begin_curr,
+    new_inserts=new_inserts,
+    change_updates=change_updates,
+    change_inserts=change_inserts,
+    delete_updates=delete_updates,
+    end_total=end_total,
+    end_curr=end_curr,
+    err_msg=err_msg,
+    start_ts=start_ts,
+    end_ts=end_ts,
+    metric_count=metric_count
 )
 
-# =====================================================================================
-# BUILD MAIN DATAFRAME
-# =====================================================================================
+if status == "E":
+    raise Exception(err_msg)
 
-df = (
-    # Use SDM as the driving table and avoid dropping rows
-    sdm.alias("SDM")
-
-    # Was inner before, which could drop SDM rows that have no guarantor row
-    .join(
-        bgt.alias("BGT"),
-        F.col("SDM.PrimaryGuarantorID") == F.col("BGT.GUARANTOR_ID"),
-        "left"
-    )
-
-    # Was inner before, which could drop SDM rows that have no tx history row
-    .join(
-        btx.alias("BTX"),
-        F.col("BTX.ID") == F.col("SDM.ID"),
-        "left"
-    )
-
-    .join(
-        subs.alias("SUB"),
-        (F.col("SDM.PatientID") == F.col("SUB.PATID")) &
-        (F.col("SDM.PrimaryGuarantorID") == F.col("SUB.GUARANTOR_ID")) &
-        (F.col("BTX.EPISODE_NUMBER") == F.col("SUB.EPISODE_NUMBER")),
-        "left"
-    )
-    .join(
-        adj.alias("ADJ"),
-        (F.col("BTX.PATID") == F.col("ADJ.PATID")) &
-        (F.col("BTX.JOIN_TO_TX_HISTORY") == F.col("ADJ.JOIN_TO_TX_HISTORY")) &
-        (F.col("BTX.EPISODE_NUMBER") == F.col("ADJ.EPISODE_NUMBER")) &
-        (F.col("BTX.primary_guarantor") == F.col("ADJ.GUARANTOR_ID")),
-        "left"
-    )
-    .join(
-        bcd.alias("BCD"),
-        (F.col("BTX.PATID") == F.col("BCD.PATID")) &
-        (F.col("BTX.JOIN_TO_TX_HISTORY") == F.col("BCD.JOIN_TO_TX_HISTORY")) &
-        (F.col("BTX.EPISODE_NUMBER") == F.col("BCD.EPISODE_NUMBER")) &
-        (F.col("BTX.primary_guarantor") == F.col("BCD.GUARANTOR_ID")),
-        "left"
-    )
-    .join(
-        bch.alias("BCH"),
-        (F.col("BCD.PATID") == F.col("BCH.PATID")) &
-        (F.col("BCD.EPISODE_NUMBER") == F.col("BCH.EPISODE_NUMBER")) &
-        (F.col("BCD.CLAIM_NUMBER") == F.col("BCH.CLAIM_NUMBER")) &
-        (F.col("BCD.GUARANTOR_ID") == F.col("BCH.GUARANTOR_ID")),
-        "left"
-    )
-    .join(
-        fee.alias("FEE"),
-        (F.col("SDM.ServiceCode") == F.col("FEE.SERVICE_CODE")) &
-        (F.col("SDM.RRGCode") == F.col("FEE.DIVISION")) &
-        (F.col("SDM.PatientAgeonService") >= F.col("FEE.MIN_AGE")) &
-        (F.col("SDM.PatientAgeonService") <= F.col("FEE.MAX_AGE")) &
-        (F.col("BGT.financial_class_code") == F.col("FEE.FINANCIAL_CLASS")) &
-        (F.coalesce(F.col("SDM.ServiceDuration"), F.lit(0)) >= F.col("FEE.MIN_DURATION")) &
-        (F.coalesce(F.col("SDM.ServiceDuration"), F.lit(0)) <= F.col("FEE.MAX_DURATION")),
-        "left"
-    )
-)
-
-# =====================================================================================
-# SELECT LIST
-# =====================================================================================
-
-claims_no_hash = df.select(
-    F.col("SDM.Service_Delivery_Master_ID").alias("ServiceDelivery_MasterID"),
-    F.col("SDM.FACILITY").alias("FACILITY"),
-    F.col("SDM.PatientID").alias("PatientID"),
-    F.col("SDM.programcode").alias("Program_Code"),
-    F.col("SDM.ServiceCode").alias("Service_Code"),
-    F.col("SDM.PrimaryGuarantorID").alias("Primary_Guarantor"),
-    F.col("SDM.DateofService").alias("Date_Of_Service"),
-    F.col("SDM.ServiceCost").alias("Cost_Of_Service"),
-
-    F.when(
-        F.col("FEE.FEE_AMOUNT").isNotNull() & (F.col("FEE.FEE_RULE") == "EVENT"),
-        F.col("FEE.FEE_AMOUNT")
-    ).when(
-        F.col("FEE.FEE_AMOUNT").isNotNull() & (F.col("FEE.FEE_RULE") == "UNIT"),
-        F.col("FEE.FEE_AMOUNT") * F.col("SDM.ServiceUnits")
-    ).when(
-        F.col("FEE.FEE_AMOUNT").isNull(),
-        F.col("SDM.ServiceCost")
-    ).otherwise(F.lit(None)).alias("Projected_Payment"),
-
-    F.when(F.col("FEE.REF_ProjectedServiceFeeID").isNotNull(), F.lit("Fee Rule"))
-     .otherwise(F.lit("Default")).alias("Fee_Type"),
-
-    F.col("ADJ.Total_Payments").alias("Total_Payments"),
-    F.col("ADJ.Series_200_adj").alias("Reversal_Adjustment"),
-    F.col("ADJ.Series_300_adj").alias("Writeoff_Adjustment"),
-    F.col("ADJ.Series_400_adj").alias("Contractural_Adjustment"),
-    F.col("ADJ.Series_500_adj").alias("Charge_Reversal"),
-    F.col("ADJ.Series_600_adj").alias("Refunds"),
-    F.col("ADJ.Series_700_adj").alias("Transfers"),
-
-    F.col("BCD.guarantor_liability").alias("Guarantor_Liability"),
-    F.col("BCD.guarantor_total_payments").alias("Guarantor_Total_Payments"),
-    F.col("BCD.remaining_balance").alias("Remaining_Balance"),
-    F.col("BCD.v_claim_date").alias("Claim_date"),
-    F.col("ADJ.Date_of_payment").alias("Payment_date"),
-
-    F.col("BGT.financial_class_value").alias("Financial_Class_Value"),
-    F.col("BGT.guarantor_name").alias("Guarantor_name"),
-
-    F.when(F.col("FEE.IsBillable") == "N", "N")
-     .when(F.col("FEE.Appt_Required") == "N", "Y")
-     .when(
-         (F.col("FEE.Appt_Required") == "Y") &
-         (~F.col("SDM.AppointmentType").isin("1", "2", "C", "U")),
-         "N"
-     )
-     .when(F.col("SDM.ServiceCode").isin("DELETE", "153NB", "T2024", "556NB", "554NB", "2900"), "N")
-     .when(F.col("SDM.ServiceCost") == F.lit("0.00"), "N")
-     .when(
-         (F.length(F.col("SDM.ServiceCode")) == 3) &
-         (F.col("SDM.ServiceCode") >= "100") &
-         (F.col("SDM.ServiceCode") <= "650") &
-         (~F.col("SDM.ServiceCode").isin("172", "184", "205", "206", "207", "208", "443", "444")),
-         "N"
-     )
-     .otherwise("Y").alias("IsBillable"),
-
-    F.col("BCD.CLAIM_NUMBER").alias("Claim_Number"),
-    F.col("BCH.option_desc").alias("Claim_option_desc"),
-
-    F.when(
-        F.col("BGT.financial_class_code").isin("13", "17", "20", "3"),
-        F.col("SUB.subs_policy")
-    ).otherwise(F.lit(None)).alias("Medicade_Number"),
-
-    F.when(
-        F.col("BGT.financial_class_code").isin("14", "7", "8"),
-        F.col("SUB.subs_policy")
-    ).otherwise(F.lit(None)).alias("Medicare_Number"),
-
-    F.col("BTX.JOIN_TO_TX_HISTORY").alias("JOIN_TO_TX_HISTORY"),
-    F.col("BCD.ID").alias("Charge_detail_ID")
-)
-
-# =====================================================================================
-# ADD SCMID HASH FIRST, THEN INSERT_TS LAST
-# =====================================================================================
-
-hash_expr = F.sha2(
-    F.concat_ws(
-        "||",
-        *[F.coalesce(F.col(c).cast("string"), F.lit("")) for c in claims_no_hash.columns]
-    ),
-    256
-)
-
-claims_with_hash = (
-    claims_no_hash
-    .withColumn("SCMID", hash_expr)
-    .select(["SCMID"] + claims_no_hash.columns)
-)
-
-claims_with_hash = claims_with_hash.withColumn("insert_ts", F.current_date())
-
-# =====================================================================================
-# APPLY WHERE FILTERS
-# =====================================================================================
-
-result_filtered = (
-    claims_with_hash
-    .where(
-        (F.col("Date_Of_Service") >= BEG_DATE) &
-        (F.col("Date_Of_Service") <= END_DATE)
-    )
-    .where(~F.col("PatientID").isin("77777777", "88888888", "99999999"))
-    .orderBy("Date_Of_Service", "PatientID", "JOIN_TO_TX_HISTORY")
-)
-
-# =====================================================================================
-# WRITE TO TARGET
-# =====================================================================================
-
-result_filtered.write \
-    .format("delta") \
-    .mode("overwrite") \
-    .option("overwriteSchema", "true") \
-    .saveAsTable(TARGET_TBL)
+print(f"Dim_Client completed. status={status}, current_count={metric_count}, total_count={end_total}")
+   

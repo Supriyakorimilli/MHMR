@@ -1,12 +1,12 @@
 from __future__ import annotations
 from datetime import datetime
-from typing import List, Dict
+from typing import List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import traceback
 import pytz
 
-from pyspark.sql import SparkSession, functions as F, types as T
+from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.dataframe import DataFrame
 from pyspark.sql.utils import AnalysisException
 
@@ -31,9 +31,15 @@ tz = pytz.timezone("America/Chicago")
 
 CATALOG = "MHMR_LAKEHOUSE"
 
+# RAW tables physically have _RAW suffix
 SOURCE_SCHEMA = f"{CATALOG}.RAW"
-STAGING_SCHEMA = "staging"
+
+# Staging output should be STAGING.stg_<TABLE_NAME>
+STAGING_SCHEMA = "STAGING"
+
+# Previous snapshot output
 PREV_SCHEMA = "prevs"
+
 LOG_SCHEMA = "LOGS"
 
 TABLES_LISTS = [
@@ -62,14 +68,51 @@ def _ts() -> str:
 
 
 def src_tbl(table: str) -> str:
-    return f"{SOURCE_SCHEMA}.{table}"
+    """
+    TABLE_NAME in list is base name.
+    RAW physical table has _RAW suffix.
+
+    Example:
+    table = billing_guar_table
+    source = MHMR_LAKEHOUSE.RAW.billing_guar_table_RAW
+    """
+    table = table.strip()
+
+    if table.upper().endswith("_RAW"):
+        return f"{SOURCE_SCHEMA}.{table}"
+
+    return f"{SOURCE_SCHEMA}.{table}_RAW"
 
 
 def stg_tbl(table: str) -> str:
+    """
+    Staging table should not have _RAW.
+
+    Example:
+    table = billing_guar_table
+    staging = STAGING.stg_billing_guar_table
+    """
+    table = table.strip()
+
+    if table.upper().endswith("_RAW"):
+        table = table[:-4]
+
     return f"{STAGING_SCHEMA}.stg_{table}"
 
 
 def prev_tbl(table: str) -> str:
+    """
+    Previous table should not have _RAW.
+
+    Example:
+    table = billing_guar_table
+    previous = prevs.prev_billing_guar_table
+    """
+    table = table.strip()
+
+    if table.upper().endswith("_RAW"):
+        table = table[:-4]
+
     return f"{PREV_SCHEMA}.prev_{table}"
 
 
@@ -95,9 +138,16 @@ def read_all_table_lists() -> DataFrame:
             df = (
                 spark.read.table(list_table)
                 .select("TABLE_NAME", "KEY_COLUMN")
+                .where(F.col("TABLE_NAME").isNotNull())
+                .where(F.col("KEY_COLUMN").isNotNull())
             )
 
-            tables_df = df if tables_df is None else tables_df.unionByName(df, allowMissingColumns=True)
+            tables_df = df if tables_df is None else tables_df.unionByName(
+                df,
+                allowMissingColumns=True
+            )
+
+            print(f"[{_ts()}] Added table list: {list_table}")
 
         except AnalysisException:
             print(f"[{_ts()}] WARNING: Table list not found, skipping: {list_table}")
@@ -112,12 +162,15 @@ def read_all_table_lists() -> DataFrame:
 
     tables_df = tables_df.dropDuplicates(["TABLE_NAME"])
 
+    print(f"[{_ts()}] Combined all table lists")
+    print(f"[{_ts()}] Total unique tables to process: {tables_df.count()}")
+
     return tables_df
 
 
 def normalize_columns(df: DataFrame) -> DataFrame:
     """
-    Keeps column names as-is, but removes duplicate columns if any.
+    Keeps first occurrence of duplicate columns case-insensitively.
     """
     seen = set()
     final_cols = []
@@ -142,8 +195,7 @@ def add_missing_columns(df: DataFrame, target_cols: List[str]) -> DataFrame:
 
 def align_dataframes_for_union(dfs: List[DataFrame]) -> List[DataFrame]:
     """
-    Makes all dataframes have same columns before union.
-    This avoids unionByName column mismatch issues.
+    Makes deletes, updates, inserts have same columns before union.
     """
     all_cols = []
 
@@ -156,7 +208,11 @@ def align_dataframes_for_union(dfs: List[DataFrame]) -> List[DataFrame]:
 
 
 def get_hash_columns(df: DataFrame, key_cols: List[str]) -> List[str]:
-    exclude_cols = set([c.lower() for c in key_cols] + ["status", "insert_timestamp", "insert_ts"])
+    exclude_cols = set(
+        [c.lower() for c in key_cols]
+        + ["status", "insert_timestamp", "insert_ts"]
+    )
+
     return [c for c in df.columns if c.lower() not in exclude_cols]
 
 
@@ -180,7 +236,6 @@ def add_hash(df: DataFrame, key_cols: List[str]) -> DataFrame:
         )
     )
 
-
 # ==============================================================
 # Change Detection Logic
 # ==============================================================
@@ -190,9 +245,6 @@ def build_changes(current_df: DataFrame, previous_df: DataFrame, key_cols: List[
     I = records in current but not in previous
     U = records in current and previous but non-key values changed
     D = records in previous but not in current
-
-    Main fix added:
-    unionByName(..., allowMissingColumns=True)
     """
 
     current_df = normalize_columns(current_df)
@@ -214,14 +266,15 @@ def build_changes(current_df: DataFrame, previous_df: DataFrame, key_cols: List[
         .withColumn("insert_timestamp", F.current_timestamp())
     )
 
-    # Updates: current exists, previous exists, row hash changed
+    # Updates: current exists, previous exists, hash changed
     joined_updates = (
         current_h.join(previous_h, on=join_cond, how="inner")
         .where(F.col("c._row_hash") != F.col("p._row_hash"))
     )
 
     updates = (
-        joined_updates.select(*[F.col(f"c.{c}").alias(c) for c in current_df.columns])
+        joined_updates
+        .select(*[F.col(f"c.{c}").alias(c) for c in current_df.columns])
         .withColumn("STATUS", F.lit("U"))
         .withColumn("insert_timestamp", F.current_timestamp())
     )
@@ -235,7 +288,7 @@ def build_changes(current_df: DataFrame, previous_df: DataFrame, key_cols: List[
         .withColumn("insert_timestamp", F.current_timestamp())
     )
 
-    # Important fix for schema mismatch
+    # Fix for schema mismatch between D/U/I
     aligned_dfs = align_dataframes_for_union([deletes, updates, inserts])
 
     deletes_aligned = aligned_dfs[0]
@@ -250,31 +303,36 @@ def build_changes(current_df: DataFrame, previous_df: DataFrame, key_cols: List[
 
     return changes_df
 
-
 # ==============================================================
 # Process One Table
 # ==============================================================
 
 def process_table(table_name: str, key_cols: List[str]) -> None:
+    table_name = table_name.strip()
+
+    print(f"[{_ts()}] ==================================================")
     print(f"[{_ts()}] Will process {table_name} - not processed yet today.")
 
     source_table = src_tbl(table_name)
     staging_table = stg_tbl(table_name)
     previous_table = prev_tbl(table_name)
 
-    print(f"[{_ts()}] Source:  {source_table}")
-    print(f"[{_ts()}] Staging: {staging_table}")
-    print(f"[{_ts()}] Previous:{previous_table}")
+    print(f"[{_ts()}] Source:   {source_table}")
+    print(f"[{_ts()}] Staging:  {staging_table}")
+    print(f"[{_ts()}] Previous: {previous_table}")
+    print(f"[{_ts()}] Keys:     {key_cols}")
 
     if not table_exists(source_table):
         raise Exception(f"Source table not found: {source_table}")
 
+    print(f"[{_ts()}] Reading RAW started for {table_name}")
     current_df = spark.read.table(source_table)
+    print(f"[{_ts()}] Reading RAW completed for {table_name}")
 
     if current_df.rdd.isEmpty():
         print(f"[{_ts()}] Source has zero rows: {source_table}")
 
-    # If previous does not exist, create empty previous table using current schema
+    # Create previous table if not present
     if not table_exists(previous_table):
         print(f"[{_ts()}] Previous table not found. Creating empty previous table: {previous_table}")
 
@@ -287,25 +345,32 @@ def process_table(table_name: str, key_cols: List[str]) -> None:
             .saveAsTable(previous_table)
         )
 
-    previous_df = spark.read.table(previous_table)
+        print(f"[{_ts()}] Empty previous table created: {previous_table}")
 
-    # Validate keys
+    print(f"[{_ts()}] Reading PREV started for {table_name}")
+    previous_df = spark.read.table(previous_table)
+    print(f"[{_ts()}] Reading PREV completed for {table_name}")
+
+    # Validate keys in RAW
     for k in key_cols:
         if k not in current_df.columns:
             raise Exception(f"Key column '{k}' not found in source table: {source_table}")
 
+    # Add missing keys to previous if needed
     for k in key_cols:
         if k not in previous_df.columns:
             previous_df = previous_df.withColumn(k, F.lit(None))
 
-    # Build changes
+    print(f"[{_ts()}] Building changes started for {table_name}")
     changes_df = build_changes(current_df, previous_df, key_cols)
+    print(f"[{_ts()}] Building changes completed for {table_name}")
 
+    print(f"[{_ts()}] Counting changes started for {table_name}")
     changes_count = changes_df.count()
-
     print(f"[{_ts()}] Changes found for {table_name}: {changes_count}")
 
-    # Write staging table
+    print(f"[{_ts()}] Writing to staging started: {staging_table}")
+
     (
         changes_df.write
         .mode("overwrite")
@@ -313,9 +378,10 @@ def process_table(table_name: str, key_cols: List[str]) -> None:
         .saveAsTable(staging_table)
     )
 
-    print(f"[{_ts()}] Staging written: {staging_table}")
+    print(f"[{_ts()}] Writing to staging completed: {staging_table}")
 
-    # Update previous snapshot with current data
+    print(f"[{_ts()}] Updating previous snapshot started: {previous_table}")
+
     (
         current_df.write
         .mode("overwrite")
@@ -326,7 +392,6 @@ def process_table(table_name: str, key_cols: List[str]) -> None:
     print(f"[{_ts()}] Previous snapshot updated: {previous_table}")
 
     print(f"[{_ts()}] Completed table: {table_name}")
-
 
 # ==============================================================
 # Retry Wrapper
@@ -344,6 +409,7 @@ def process_table_with_retry(table_name: str, key_cols: List[str]) -> None:
             attempts += 1
 
             msg = f"{type(e).__name__}: {str(e)}"
+
             print(f"[{_ts()}] ERROR processing {table_name}: {msg}")
             traceback.print_exc()
 
@@ -353,7 +419,6 @@ def process_table_with_retry(table_name: str, key_cols: List[str]) -> None:
 
             print(f"[{_ts()}] RETRY in {SLEEP_BETWEEN_RETRIES}s for {table_name}")
             time.sleep(SLEEP_BETWEEN_RETRIES)
-
 
 # ==============================================================
 # Main Orchestration
@@ -368,7 +433,9 @@ def process_all_tables() -> None:
 
     tables_df = read_all_table_lists()
 
+    print(f"[{_ts()}] Collecting table rows started")
     all_rows = [r.asDict() for r in tables_df.collect()]
+    print(f"[{_ts()}] Collecting table rows completed")
 
     print(f"[{_ts()}] Total tables to process: {len(all_rows)}")
 
@@ -377,6 +444,7 @@ def process_all_tables() -> None:
 
         for r in all_rows:
             table_name = r["TABLE_NAME"]
+
             key_cols = [
                 c.strip()
                 for c in r["KEY_COLUMN"].split(",")
@@ -395,7 +463,6 @@ def process_all_tables() -> None:
             f.result()
 
     print(f"[{_ts()}] ========= Staging and previous loads complete =========")
-
 
 # ==============================================================
 # Entry Point

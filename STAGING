@@ -6,7 +6,7 @@ import time
 import traceback
 import pytz
 
-from pyspark.sql import SparkSession, functions as F
+from pyspark.sql import SparkSession, functions as F, types as T
 from pyspark.sql.dataframe import DataFrame
 from pyspark.sql.utils import AnalysisException
 
@@ -58,6 +58,24 @@ TABLES_LISTS = [
 MAX_WORKERS = 4
 MAX_RETRIES = 2
 SLEEP_BETWEEN_RETRIES = 5
+
+# ==============================================================
+# STAGING LOG SCHEMA
+# ==============================================================
+
+staging_log_schema = T.StructType([
+    T.StructField("load_date", T.DateType()),
+    T.StructField("table_name", T.StringType()),
+    T.StructField("status", T.StringType()),          # I / U / D / FAILED
+    T.StructField("count", T.LongType()),
+    T.StructField("error_message", T.StringType()),
+    T.StructField("insert_timestamp", T.TimestampType()),
+    T.StructField("start_time", T.TimestampType()),
+    T.StructField("end_time", T.TimestampType()),
+    T.StructField("load_type", T.StringType()),       # staging
+])
+
+STAGING_LOG_ROWS = []
 
 # ==============================================================
 # Helper Functions
@@ -126,6 +144,125 @@ def table_exists(table_fqn: str) -> bool:
         return True
     except Exception:
         return False
+
+
+# ==============================================================
+# STAGING LOG FUNCTIONS
+# ==============================================================
+
+def ensure_staging_log_tables_exist() -> None:
+    print(f"[{_ts()}] Ensuring staging log tables exist ...")
+
+    _ensure_schema(LOG_SCHEMA)
+
+    for log_table in [
+        f"{LOG_SCHEMA}.staging_daily_log",
+        f"{LOG_SCHEMA}.staging_final_log"
+    ]:
+        try:
+            spark.read.table(log_table).limit(1).count()
+        except Exception:
+            (
+                spark.createDataFrame([], staging_log_schema)
+                .write
+                .mode("overwrite")
+                .saveAsTable(log_table)
+            )
+
+            print(f"[{_ts()}] Created log table: {log_table}")
+
+
+def reset_staging_daily_log() -> None:
+    ensure_staging_log_tables_exist()
+
+    print(f"[{_ts()}] Truncating {LOG_SCHEMA}.staging_daily_log ...")
+
+    spark.sql(f"TRUNCATE TABLE {LOG_SCHEMA}.staging_daily_log")
+
+
+def add_staging_log_row(
+    table_name: str,
+    status: str,
+    cnt: int,
+    start_time_py: datetime,
+    end_time_py: datetime,
+    error_message: str | None = None
+) -> None:
+    STAGING_LOG_ROWS.append({
+        "load_date": datetime.now(tz).date(),
+        "table_name": table_name,
+        "status": status,
+        "count": int(cnt or 0),
+        "error_message": error_message,
+        "insert_timestamp": datetime.now(tz),
+        "start_time": start_time_py,
+        "end_time": end_time_py,
+        "load_type": "staging"
+    })
+
+
+def write_staging_daily_logs() -> None:
+    if not STAGING_LOG_ROWS:
+        print(f"[{_ts()}] No staging log rows to write.")
+        return
+
+    print(f"[{_ts()}] Writing staging daily logs: {len(STAGING_LOG_ROWS)} rows")
+
+    log_df = spark.createDataFrame(STAGING_LOG_ROWS, schema=staging_log_schema)
+
+    (
+        log_df.write
+        .mode("append")
+        .saveAsTable(f"{LOG_SCHEMA}.staging_daily_log")
+    )
+
+    print(f"[{_ts()}] Staging daily logs written.")
+
+
+def consolidate_staging_logs_to_final() -> None:
+    print(f"[{_ts()}] Consolidating staging daily logs -> staging final logs ...")
+
+    daily_tbl = f"{LOG_SCHEMA}.staging_daily_log"
+    final_tbl = f"{LOG_SCHEMA}.staging_final_log"
+
+    try:
+        daily = spark.read.table(daily_tbl)
+    except Exception:
+        print(f"[{_ts()}] No staging daily log found.")
+        return
+
+    if daily.rdd.isEmpty():
+        print(f"[{_ts()}] Staging daily log is empty.")
+        return
+
+    try:
+        final_ = spark.read.table(final_tbl)
+    except Exception:
+        final_ = spark.createDataFrame([], staging_log_schema)
+
+    keys = ["load_date", "table_name", "status"]
+
+    existing_keys = final_.select(*keys).distinct()
+
+    new_only = (
+        daily.alias("d")
+        .join(existing_keys.alias("f"), on=keys, how="left_anti")
+        .select("d.*")
+    )
+
+    print(f"[{_ts()}] FINAL before: {final_.count()} rows | DAILY new: {new_only.count()} rows")
+
+    final_updated = final_.unionByName(new_only)
+
+    final_updated.write.mode("overwrite").saveAsTable(final_tbl)
+
+    final_count = spark.read.table(final_tbl).count()
+
+    print(f"[{_ts()}] FINAL after: {final_count} rows")
+
+    spark.sql(f"TRUNCATE TABLE {daily_tbl}")
+
+    print(f"[{_ts()}] Staging log consolidation complete.")
 
 
 def read_all_table_lists() -> DataFrame:
@@ -308,6 +445,8 @@ def build_changes(current_df: DataFrame, previous_df: DataFrame, key_cols: List[
 # ==============================================================
 
 def process_table(table_name: str, key_cols: List[str]) -> None:
+    start_time_py = datetime.now(tz)
+
     table_name = table_name.strip()
 
     print(f"[{_ts()}] ==================================================")
@@ -365,9 +504,28 @@ def process_table(table_name: str, key_cols: List[str]) -> None:
     changes_df = build_changes(current_df, previous_df, key_cols)
     print(f"[{_ts()}] Building changes completed for {table_name}")
 
-    print(f"[{_ts()}] Counting changes started for {table_name}")
-    changes_count = changes_df.count()
+    print(f"[{_ts()}] Counting changes by STATUS started for {table_name}")
+
+    status_counts_rows = (
+        changes_df
+        .groupBy("STATUS")
+        .agg(F.count("*").alias("cnt"))
+        .collect()
+    )
+
+    status_counts = {
+        r["STATUS"]: int(r["cnt"])
+        for r in status_counts_rows
+    }
+
+    i_count = int(status_counts.get("I", 0))
+    u_count = int(status_counts.get("U", 0))
+    d_count = int(status_counts.get("D", 0))
+
+    changes_count = i_count + u_count + d_count
+
     print(f"[{_ts()}] Changes found for {table_name}: {changes_count}")
+    print(f"[{_ts()}] I={i_count}, U={u_count}, D={d_count}")
 
     print(f"[{_ts()}] Writing to staging started: {staging_table}")
 
@@ -391,6 +549,12 @@ def process_table(table_name: str, key_cols: List[str]) -> None:
 
     print(f"[{_ts()}] Previous snapshot updated: {previous_table}")
 
+    end_time_py = datetime.now(tz)
+
+    add_staging_log_row(table_name, "I", i_count, start_time_py, end_time_py, None)
+    add_staging_log_row(table_name, "U", u_count, start_time_py, end_time_py, None)
+    add_staging_log_row(table_name, "D", d_count, start_time_py, end_time_py, None)
+
     print(f"[{_ts()}] Completed table: {table_name}")
 
 # ==============================================================
@@ -399,6 +563,7 @@ def process_table(table_name: str, key_cols: List[str]) -> None:
 
 def process_table_with_retry(table_name: str, key_cols: List[str]) -> None:
     attempts = 0
+    start_time_py = datetime.now(tz)
 
     while True:
         try:
@@ -414,6 +579,17 @@ def process_table_with_retry(table_name: str, key_cols: List[str]) -> None:
             traceback.print_exc()
 
             if attempts > MAX_RETRIES:
+                end_time_py = datetime.now(tz)
+
+                add_staging_log_row(
+                    table_name,
+                    "FAILED",
+                    0,
+                    start_time_py,
+                    end_time_py,
+                    msg
+                )
+
                 print(f"[{_ts()}] FINAL FAILURE for {table_name} after {attempts} attempts")
                 return
 
@@ -430,6 +606,9 @@ def process_all_tables() -> None:
     _ensure_schema(STAGING_SCHEMA)
     _ensure_schema(PREV_SCHEMA)
     _ensure_schema(LOG_SCHEMA)
+
+    ensure_staging_log_tables_exist()
+    reset_staging_daily_log()
 
     tables_df = read_all_table_lists()
 
@@ -453,6 +632,18 @@ def process_all_tables() -> None:
 
             if not key_cols:
                 print(f"[{_ts()}] Skipping {table_name}: KEY_COLUMN is empty")
+
+                now_time = datetime.now(tz)
+
+                add_staging_log_row(
+                    table_name,
+                    "FAILED",
+                    0,
+                    now_time,
+                    now_time,
+                    "KEY_COLUMN is empty"
+                )
+
                 continue
 
             futures.append(
@@ -461,6 +652,9 @@ def process_all_tables() -> None:
 
         for f in as_completed(futures):
             f.result()
+
+    write_staging_daily_logs()
+    consolidate_staging_logs_to_final()
 
     print(f"[{_ts()}] ========= Staging and previous loads complete =========")
 

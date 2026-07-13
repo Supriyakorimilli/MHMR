@@ -36,7 +36,21 @@ LOCAL_TZ_NAME = "America/Chicago"
 CATALOG = "MHMR_LAKEHOUSE"
 SNAPSHOT_SCHEMA = f"{CATALOG}.SNAPSHOT"
 STAGING_SCHEMA = "staging"
-TABLES_LIST = "TABLES_LIST"  # columns: TABLE_NAME, KEY_COLUMN (comma-separated keys)
+
+
+TABLES_LISTS = [
+    "TABLES_LIST_1",
+    "TABLES_LIST_2",
+    "TABLES_LIST_3",
+    "TABLES_LIST_4",
+    "TABLES_LIST_5",
+    "TABLES_LIST_6",
+    "TABLES_LIST_7",
+    "TABLES_LIST_8",
+    "TABLES_LIST_9",
+    "TABLES_LIST_10"
+]
+
 
 # If staging timestamps are UTC and must be localized to CST/CDT when landing in snapshot, set True.
 STAGING_TIMESTAMPS_ARE_UTC = True
@@ -358,15 +372,27 @@ def _apply_with_retry_for_date(table_name: str, key_cols: List[str], d: date) ->
                 return
             print(f"[{_ts()}] RETRY in {SLEEP_BETWEEN_RETRIES}s for {table_name} {d}")
             time.sleep(SLEEP_BETWEEN_RETRIES)
-
 def process_all_snapshot() -> None:
     print(f"[{_ts()}] ========= Start snapshot apply (global dates; CST/CDT) =========")
     ensure_snapshot_log_tables_exist()
     _ensure_log_columns_are_timestamps()
     reset_daily_log()  # safe to truncate after ensuring TIMESTAMP types
 
-    tables_df = spark.read.table(TABLES_LIST).select("TABLE_NAME", "KEY_COLUMN")
+    tables_df = None
+
+    for tables_list in TABLES_LISTS:
+        current_df = spark.read.table(tables_list).select(
+            "TABLE_NAME",
+            "KEY_COLUMN"
+        )
+
+        if tables_df is None:
+            tables_df = current_df
+        else:
+            tables_df = tables_df.unionByName(current_df)
+
     all_rows = [r.asDict() for r in tables_df.collect()]
+
     print(f"[{_ts()}] Tables to scan: {len(all_rows)}")
 
     global_dates = union_staging_dates_across_tables(all_rows)
@@ -374,12 +400,19 @@ def process_all_snapshot() -> None:
 
     plan = {}
     total_pending = 0
+
     for r in all_rows:
         table = r["TABLE_NAME"]
         key_cols = [c.strip() for c in r["KEY_COLUMN"].split(",") if c.strip()]
         pend = dates_to_process_for_table(table, global_dates)
-        plan[table] = {"keys": key_cols, "pending": pend}
+
+        plan[table] = {
+            "keys": key_cols,
+            "pending": pend
+        }
+
         total_pending += len(pend)
+
         if pend:
             print(f"[{_ts()}] PLAN {table}: {', '.join(map(str, pend))}")
         else:
@@ -393,20 +426,31 @@ def process_all_snapshot() -> None:
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = []
+
         for table, info in plan.items():
             dates = info["pending"]
+
             if not dates:
                 continue
+
             def work(table=table, key_cols=info["keys"], dates=dates):
                 print(f"[{_ts()}] >>> Processing {table}: {', '.join(map(str, dates))}")
+
                 for d in dates:
-                    _apply_with_retry_for_date(table, key_cols, d)
+                    _apply_with_retry_for_date(
+                        table,
+                        key_cols,
+                        d
+                    )
+
             futures.append(ex.submit(work))
+
         for f in as_completed(futures):
             f.result()
 
     consolidate_snapshot_logs_to_final()
     print(f"[{_ts()}] ========= All snapshot processing complete =========")
+
 
 # Entry point
 process_all_snapshot()

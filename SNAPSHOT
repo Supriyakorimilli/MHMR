@@ -1,8 +1,9 @@
 # SNAPSHOT — CST/CDT; global-date planning; real runtime timestamps (hh:mm:ss) in logs.
 # Success path writes snapshot first, then logs D/I/U (counts can be 0).
 # Failure writes a single 'E' row.
-# This version guarantees start_time, end_time, insert_timestamp are
-# TIMESTAMPs in America/Chicago.
+# This version keeps insert_timestamp, start_time, end_time in America/Chicago
+# and adds insert_timestamp_utc, start_time_utc, and end_time_utc
+# in GMT/UTC for snapshot logs only.
 
 #------------------------------------------UPDATED FINAL----------------------------------------------------#
 
@@ -184,6 +185,29 @@ def _lit_ts(dt_py: datetime):
     )
 
 
+def _lit_utc_ts(dt_py: datetime):
+    utc_str = (
+        dt_py
+        .astimezone(pytz.UTC)
+        .strftime("%Y-%m-%d %H:%M:%S")
+    )
+
+    return F.to_timestamp(
+        F.lit(utc_str)
+    )
+
+
+def _to_utc_from_cst_timestamp(ts_col):
+    """
+    Convert an America/Chicago timestamp expression to UTC/GMT.
+    Spark automatically handles CST versus CDT for the timestamp date.
+    """
+    return F.to_utc_timestamp(
+        ts_col,
+        LOCAL_TZ_NAME
+    )
+
+
 def _align_to_snapshot_schema(
     source_df: DataFrame,
     snapshot_df: DataFrame,
@@ -279,6 +303,20 @@ snap_log_schema = T.StructType([
         "end_time",
         T.TimestampType()
     ),
+
+    # Additional UTC/GMT columns
+    T.StructField(
+        "insert_timestamp_utc",
+        T.TimestampType()
+    ),
+    T.StructField(
+        "start_time_utc",
+        T.TimestampType()
+    ),
+    T.StructField(
+        "end_time_utc",
+        T.TimestampType()
+    ),
     T.StructField(
         "load_type",
         T.StringType()
@@ -342,11 +380,22 @@ def _ensure_log_columns_are_timestamps():
         "LOGS.snapshot_final_log"
     ]
 
-    timestamp_columns = [
+    existing_timestamp_columns = [
         "insert_timestamp",
         "start_time",
         "end_time"
     ]
+
+    utc_timestamp_columns = [
+        "insert_timestamp_utc",
+        "start_time_utc",
+        "end_time_utc"
+    ]
+
+    all_timestamp_columns = (
+        existing_timestamp_columns
+        + utc_timestamp_columns
+    )
 
     for tbl in log_tables:
         df = spark.read.table(tbl)
@@ -356,9 +405,44 @@ def _ensure_log_columns_are_timestamps():
             for field in df.schema.fields
         }
 
+        # Existing log tables may not yet have the UTC/GMT columns.
+        # Add only the missing columns and preserve all existing data.
+        missing_utc_columns = [
+            c
+            for c in utc_timestamp_columns
+            if c not in fields
+        ]
+
+        if missing_utc_columns:
+            utc_columns_sql = ", ".join(
+                f"{c} TIMESTAMP"
+                for c in missing_utc_columns
+            )
+
+            print(
+                f"[{_ts()}] Adding UTC/GMT columns "
+                f"to {tbl}: {missing_utc_columns}"
+            )
+
+            spark.sql(
+                f"""
+                ALTER TABLE {tbl}
+                ADD COLUMNS (
+                    {utc_columns_sql}
+                )
+                """
+            )
+
+            df = spark.read.table(tbl)
+
+            fields = {
+                field.name.lower(): field.dataType.simpleString()
+                for field in df.schema.fields
+            }
+
         missing = [
             c
-            for c in timestamp_columns
+            for c in all_timestamp_columns
             if c not in fields
         ]
 
@@ -367,37 +451,19 @@ def _ensure_log_columns_are_timestamps():
                 f"{tbl} missing required columns: {missing}"
             )
 
-        needs_alter = any(
-            fields[c] != "timestamp"
-            for c in timestamp_columns
-        )
+        for c in all_timestamp_columns:
+            if fields[c] != "timestamp":
+                print(
+                    f"[{_ts()}] Altering {tbl}.{c} "
+                    f"to TIMESTAMP for time precision."
+                )
 
-        if needs_alter:
-            print(
-                f"[{_ts()}] Altering {tbl} columns "
-                f"to TIMESTAMP for time precision."
-            )
-
-            spark.sql(
-                f"""
-                ALTER TABLE {tbl}
-                ALTER COLUMN insert_timestamp TYPE TIMESTAMP
-                """
-            )
-
-            spark.sql(
-                f"""
-                ALTER TABLE {tbl}
-                ALTER COLUMN start_time TYPE TIMESTAMP
-                """
-            )
-
-            spark.sql(
-                f"""
-                ALTER TABLE {tbl}
-                ALTER COLUMN end_time TYPE TIMESTAMP
-                """
-            )
+                spark.sql(
+                    f"""
+                    ALTER TABLE {tbl}
+                    ALTER COLUMN {c} TYPE TIMESTAMP
+                    """
+                )
 
 
 def reset_daily_log() -> None:
@@ -425,6 +491,8 @@ def append_snapshot_daily_log(
     now_py = datetime.now(tz)
 
     insert_ts = _lit_ts(now_py)
+    insert_ts_utc = _lit_utc_ts(now_py)
+
     start_ts = _lit_ts(
         start_time_py or now_py
     )
@@ -453,6 +521,7 @@ def append_snapshot_daily_log(
             .cast("string")
             .alias("error_message"),
 
+            # Existing CST/CDT values
             insert_ts.alias(
                 "insert_timestamp"
             ),
@@ -465,6 +534,19 @@ def append_snapshot_daily_log(
                 "end_time"
             ),
 
+            # Additional UTC/GMT equivalents
+            insert_ts_utc.alias(
+                "insert_timestamp_utc"
+            ),
+
+            start_ts_utc.alias(
+                "start_time_utc"
+            ),
+
+            end_ts_utc.alias(
+                "end_time_utc"
+            ),
+
             F.lit("incremental")
             .alias("load_type")
         )
@@ -473,7 +555,7 @@ def append_snapshot_daily_log(
     print(
         f"[{_ts()}] LOG += {table_name} {load_date} "
         f"status={status} count={cnt} "
-        f"(start/end/insert have real CST/CDT times)"
+        f"(insert/start/end=CST/CDT, UTC equivalents also written)"
     )
 
     (
@@ -1137,7 +1219,7 @@ def _apply_with_retry_for_date(
 def process_all_snapshot() -> None:
     print(
         f"[{_ts()}] ========= Start snapshot apply "
-        f"(global dates; CST/CDT) ========="
+        f"(global dates; CST/CDT + UTC log columns) ========="
     )
 
     ensure_snapshot_log_tables_exist()
@@ -1283,5 +1365,3 @@ def process_all_snapshot() -> None:
 
 process_all_snapshot()
 #final
-
-

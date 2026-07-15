@@ -1,6 +1,8 @@
 # HISTORY — CST/CDT; global-date logging (I/U/D=0 for tables with no rows that day)
 # Success => 3 daily/final log rows (I/U/D). Failure => 1 row (table_name='Fail', status='').
-# insert_timestamp in logs = load_date 00:00:00 (CST/CDT). First-seen consolidation.
+# Existing log timestamps remain CST/CDT.
+# Additional UTC/GMT columns are added for insert_timestamp, start_time, and end_time.
+# First-seen consolidation.
 
 
 #------------------------------------------UPDATED FINAL----------------------------------------------------#
@@ -139,17 +141,92 @@ hist_log_schema = T.StructType([
     T.StructField("status", T.StringType()),      # 'I','U','D' (success) or '' (failure row)
     T.StructField("count", T.LongType()),
     T.StructField("error_message", T.StringType()),
-    T.StructField("insert_timestamp", T.TimestampType()),  # = load_date 00:00:00 CST/CDT (Change to GMT)
-    T.StructField("start_time", T.TimestampType()),        # runtime
-    T.StructField("end_time", T.TimestampType()),          # runtime
+    # Existing CST/CDT log columns — retained exactly as before
+    T.StructField("insert_timestamp", T.TimestampType()),  # load_date 00:00:00 CST/CDT
+    T.StructField("start_time", T.TimestampType()),        # runtime CST/CDT
+    T.StructField("end_time", T.TimestampType()),          # runtime CST/CDT
+
+    # Additional UTC/GMT log columns
+    T.StructField("insert_timestamp_utc", T.TimestampType()),
+    T.StructField("start_time_utc", T.TimestampType()),
+    T.StructField("end_time_utc", T.TimestampType()),
+
     T.StructField("load_type", T.StringType()),            # "history"
 ])
+
+def _ensure_history_log_utc_columns(table_fqn: str) -> None:
+    """
+    Safely add the three UTC/GMT columns to an existing history log table.
+
+    Existing CST/CDT columns and existing rows remain unchanged.
+    Older rows are backfilled only where the UTC columns are NULL.
+    """
+    existing_cols = {c.lower() for c in spark.read.table(table_fqn).columns}
+
+    utc_columns = {
+        "insert_timestamp_utc": "TIMESTAMP",
+        "start_time_utc": "TIMESTAMP",
+        "end_time_utc": "TIMESTAMP",
+    }
+
+    missing_defs = [
+        f"{col_name} {data_type}"
+        for col_name, data_type in utc_columns.items()
+        if col_name.lower() not in existing_cols
+    ]
+
+    if missing_defs:
+        print(
+            f"[{_ts()}] Adding UTC/GMT columns to {table_fqn}: "
+            f"{', '.join(col.split()[0] for col in missing_defs)}"
+        )
+        spark.sql(
+            f"ALTER TABLE {table_fqn} "
+            f"ADD COLUMNS ({', '.join(missing_defs)})"
+        )
+
+    # Backfill existing rows without changing the original CST/CDT columns.
+    spark.sql(
+        f"""
+        UPDATE {table_fqn}
+        SET
+            insert_timestamp_utc = CASE
+                WHEN insert_timestamp_utc IS NULL
+                 AND insert_timestamp IS NOT NULL
+                THEN to_utc_timestamp(insert_timestamp, 'America/Chicago')
+                ELSE insert_timestamp_utc
+            END,
+
+            start_time_utc = CASE
+                WHEN start_time_utc IS NULL
+                 AND start_time IS NOT NULL
+                THEN to_utc_timestamp(start_time, 'America/Chicago')
+                ELSE start_time_utc
+            END,
+
+            end_time_utc = CASE
+                WHEN end_time_utc IS NULL
+                 AND end_time IS NOT NULL
+                THEN to_utc_timestamp(end_time, 'America/Chicago')
+                ELSE end_time_utc
+            END
+        WHERE
+            (insert_timestamp_utc IS NULL AND insert_timestamp IS NOT NULL)
+            OR (start_time_utc IS NULL AND start_time IS NOT NULL)
+            OR (end_time_utc IS NULL AND end_time IS NOT NULL)
+        """
+    )
+
 
 def ensure_history_log_tables_exist() -> None:
     print(f"[{_ts()}] Ensuring history log tables exist ...")
     _ensure_schema("LOGS")
+
     _ensure_table("LOGS.history_daily_log", hist_log_schema)
     _ensure_table("LOGS.history_final_log", hist_log_schema)
+
+    _ensure_history_log_utc_columns("LOGS.history_daily_log")
+    _ensure_history_log_utc_columns("LOGS.history_final_log")
 
 def reset_history_daily_log() -> None:
     ensure_history_log_tables_exist()
@@ -157,8 +234,18 @@ def reset_history_daily_log() -> None:
     spark.sql("TRUNCATE TABLE LOGS.history_daily_log")
 
 def _insert_ts_from_load_date(load_date: date):
-    """insert_timestamp = midnight of load_date (CST/CDT)."""
+    """insert_timestamp = midnight of load_date in CST/CDT."""
     return F.to_timestamp(F.lit(str(load_date)))  # session TZ => America/Chicago
+
+
+def _to_utc_from_cst_timestamp(timestamp_col):
+    """
+    Convert a CST/CDT wall-clock timestamp to its UTC/GMT equivalent.
+
+    This does not change the original CST/CDT column.
+    America/Chicago automatically handles CST versus CDT.
+    """
+    return F.to_utc_timestamp(timestamp_col, "America/Chicago")
 
 def append_history_daily_log(table_name: str, load_date: date, status: str,
                              cnt: int, start_time_py: datetime | None = None,
@@ -166,15 +253,24 @@ def append_history_daily_log(table_name: str, load_date: date, status: str,
     insert_ts = _insert_ts_from_load_date(load_date)
     start_ts = F.lit(start_time_py).cast("timestamp") if start_time_py else F.current_timestamp()
     end_ts   = F.current_timestamp()
+
     row_df = (spark.range(1).select(
         F.lit(load_date).cast("date").alias("load_date"),
         F.lit(table_name).alias("table_name"),
         F.lit(status).alias("status"),
         F.lit(int(cnt or 0)).cast("long").alias("count"),
         F.lit(error_message).cast("string").alias("error_message"),
+
+        # Existing CST/CDT values
         insert_ts.alias("insert_timestamp"),
         start_ts.alias("start_time"),
         end_ts.alias("end_time"),
+
+        # Additional UTC/GMT equivalents
+        _to_utc_from_cst_timestamp(insert_ts).alias("insert_timestamp_utc"),
+        _to_utc_from_cst_timestamp(start_ts).alias("start_time_utc"),
+        _to_utc_from_cst_timestamp(end_ts).alias("end_time_utc"),
+
         F.lit("history").alias("load_type"),
     ))
     print(f"[{_ts()}] LOGS.history_daily_log += table={table_name}, date={load_date}, status='{status}', count={cnt}")
@@ -187,15 +283,24 @@ def append_history_failure_log(load_date: date,
     insert_ts = _insert_ts_from_load_date(load_date)
     start_ts = F.lit(start_time_py).cast("timestamp") if start_time_py else F.current_timestamp()
     end_ts   = F.current_timestamp()
+
     row_df = (spark.range(1).select(
         F.lit(load_date).cast("date").alias("load_date"),
-        F.lit("Fail").alias("table_name"),          # failure 
+        F.lit("Fail").alias("table_name"),          # failure
         F.lit("").alias("status"),                  # empty
         F.lit(0).cast("long").alias("count"),
         F.lit(error_message).cast("string").alias("error_message"),
+
+        # Existing CST/CDT values
         insert_ts.alias("insert_timestamp"),
         start_ts.alias("start_time"),
         end_ts.alias("end_time"),
+
+        # Additional UTC/GMT equivalents
+        _to_utc_from_cst_timestamp(insert_ts).alias("insert_timestamp_utc"),
+        _to_utc_from_cst_timestamp(start_ts).alias("start_time_utc"),
+        _to_utc_from_cst_timestamp(end_ts).alias("end_time_utc"),
+
         F.lit("history").alias("load_type"),
     ))
     print(f"[{_ts()}] LOGS.history_daily_log += table=Fail, date={load_date}, status='', count=0")
@@ -229,7 +334,7 @@ def consolidate_history_logs_to_final(dedupe: bool = True) -> None:
 
     print(f"[{_ts()}] FINAL before: {final_.count()} rows | DAILY new: {new_only.count()} rows")
 
-    final_updated = final_.unionByName(new_only)
+    final_updated = final_.unionByName(new_only, allowMissingColumns=True)
     final_updated.write.mode("overwrite").saveAsTable("LOGS.history_final_log")
 
     final_count = spark.read.table("LOGS.history_final_log").count()
@@ -614,4 +719,3 @@ def process_all_history() -> None:
 
 # Entry point — this line must have no spaces before it
 process_all_history()            
-

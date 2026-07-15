@@ -118,7 +118,7 @@ def _add_flag_column(df: DataFrame, flag_value: str, target_cols: List[str]) -> 
     return work.select(*target_cols)
 
 # ------------------------
-# Ensure schema/table helpers
+# Ensure schema
 # ------------------------
 def _ensure_schema(schema_name: str) -> None:
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
@@ -139,7 +139,7 @@ hist_log_schema = T.StructType([
     T.StructField("status", T.StringType()),      # 'I','U','D' (success) or '' (failure row)
     T.StructField("count", T.LongType()),
     T.StructField("error_message", T.StringType()),
-    T.StructField("insert_timestamp", T.TimestampType()),  # = load_date 00:00:00 CST/CDT
+    T.StructField("insert_timestamp", T.TimestampType()),  # = load_date 00:00:00 CST/CDT (Change to GMT)
     T.StructField("start_time", T.TimestampType()),        # runtime
     T.StructField("end_time", T.TimestampType()),          # runtime
     T.StructField("load_type", T.StringType()),            # "history"
@@ -189,7 +189,7 @@ def append_history_failure_log(load_date: date,
     end_ts   = F.current_timestamp()
     row_df = (spark.range(1).select(
         F.lit(load_date).cast("date").alias("load_date"),
-        F.lit("Fail").alias("table_name"),          # failure marker
+        F.lit("Fail").alias("table_name"),          # failure 
         F.lit("").alias("status"),                  # empty
         F.lit(0).cast("long").alias("count"),
         F.lit(error_message).cast("string").alias("error_message"),
@@ -221,7 +221,7 @@ def consolidate_history_logs_to_final(dedupe: bool = True) -> None:
 
     keys = ["load_date", "table_name", "status"]
 
-    # Keep only new keys not already in FINAL (first-seen wins)
+    # Keep only new keys not already in FINAL
     existing_keys = final_.select(*keys).distinct()
     new_only = (daily.alias("d")
                     .join(existing_keys.alias("f"), on=keys, how="left_anti")
@@ -406,7 +406,7 @@ def apply_history_for_table_and_date(table_name: str, key_cols: List[str], d: da
 
         print(f"[{_ts()}] Partitioned: I={i_src.count()} | U={u_src.count()} | D={d_src.count()}")
 
-        # Prepare outputs (do NOT write yet)
+        # Prepare outputs 
         # D: inactivate matching actives
         d_inact_out = None
         d_count_inactivated = 0

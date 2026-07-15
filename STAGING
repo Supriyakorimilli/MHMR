@@ -2,9 +2,11 @@
 # STAGING LOADS — RAW vs PREV_RAW Change Detection
 # + Staging Daily/Final Logs
 # + PREV_RAW_SNAPSHOT Backup Before PREV_RAW Overwrite
+# + Existing Log Timestamps in CST/CDT
+# + Additional Log Timestamps in UTC/GMT
 # ==============================================================
 
-#------------------------------------------UPDATED FINAL----------------------------------------------------#
+# -------------------------------- UPDATED FINAL -------------------------------- #
 
 from pyspark.sql import SparkSession, functions as F, types as T
 from pyspark.sql.utils import AnalysisException
@@ -16,12 +18,19 @@ import traceback
 import threading
 import re
 
+
 # ==============================================================
 # INIT SPARK
 # ==============================================================
 
-spark = SparkSession.builder.appName("STAGING_AND_PREV_RAW_LOADS_WITH_LOGS_AND_SNAPSHOT").getOrCreate()
+spark = (
+    SparkSession.builder
+    .appName("STAGING_AND_PREV_RAW_LOADS_WITH_LOGS_AND_SNAPSHOT")
+    .getOrCreate()
+)
 
+# Keep the Spark session timezone in America/Chicago.
+# Existing processing and log timestamp columns continue using CST/CDT.
 spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
 spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
@@ -30,7 +39,13 @@ spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
 spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED")
 spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
 
+
+# CST/CDT timezone
 tz = pytz.timezone("America/Chicago")
+
+# UTC/GMT timezone
+utc_tz = pytz.UTC
+
 
 # ==============================================================
 # CONFIG
@@ -42,8 +57,8 @@ SOURCE_SCHEMA   = f"{CATALOG}.RAW"
 PREV_SCHEMA     = f"{CATALOG}.PREV_RAW"
 SNAPSHOT_SCHEMA = f"{CATALOG}.PREV_RAW_SNAPSHOT"
 
-STAGING_SCHEMA  = "STAGING"
-LOG_SCHEMA      = "LOGS"
+STAGING_SCHEMA = "STAGING"
+LOG_SCHEMA     = "LOGS"
 
 STAGING_DAILY_LOG_TBL = f"{LOG_SCHEMA}.staging_daily_log"
 STAGING_FINAL_LOG_TBL = f"{LOG_SCHEMA}.staging_final_log"
@@ -51,10 +66,11 @@ STAGING_FINAL_LOG_TBL = f"{LOG_SCHEMA}.staging_final_log"
 MAX_WORKERS = 8
 MAX_RETRIES = 2
 
+# Existing snapshot run ID remains based on CST/CDT
 RUN_ID = datetime.now(tz).strftime("%Y%m%d%H%M%S")
 
-TABLES_LISTS = [
 
+TABLES_LISTS = [
     "TABLES_LIST",
     "TABLES_LIST_1",
     "TABLES_LIST_2",
@@ -69,6 +85,7 @@ TABLES_LISTS = [
     "TABLES_LIST_MSO",
 ]
 
+
 # ==============================================================
 # LOG SCHEMA
 # ==============================================================
@@ -79,14 +96,24 @@ staging_log_schema = T.StructType([
     T.StructField("status", T.StringType(), True),
     T.StructField("count", T.LongType(), True),
     T.StructField("error_message", T.StringType(), True),
+
+    # Existing CST/CDT log columns
     T.StructField("insert_timestamp", T.TimestampType(), True),
     T.StructField("start_time", T.TimestampType(), True),
     T.StructField("end_time", T.TimestampType(), True),
+
+    # New UTC/GMT log columns
+    T.StructField("insert_timestamp_utc", T.TimestampType(), True),
+    T.StructField("start_time_utc", T.TimestampType(), True),
+    T.StructField("end_time_utc", T.TimestampType(), True),
+
     T.StructField("load_type", T.StringType(), True)
 ])
 
+
 STAGING_LOG_ROWS = []
 LOG_LOCK = threading.Lock()
+
 
 # ==============================================================
 # TABLE NAME HELPERS
@@ -94,34 +121,43 @@ LOG_LOCK = threading.Lock()
 
 def clean_table_name(table: str) -> str:
     table = str(table).strip()
+
     if table.upper().endswith("_RAW"):
         table = table[:-4]
+
     return table
 
 
 def src_tbl(table: str) -> str:
     table = str(table).strip()
+
     if table.upper().endswith("_RAW"):
         return f"{SOURCE_SCHEMA}.{table}"
+
     return f"{SOURCE_SCHEMA}.{table}_RAW"
 
 
 def stg_tbl(table: str) -> str:
     table = clean_table_name(table)
+
     return f"{STAGING_SCHEMA}.stg_{table}"
 
 
 def prev_tbl(table: str) -> str:
     table = str(table).strip()
+
     if table.upper().endswith("_RAW"):
         return f"{PREV_SCHEMA}.{table}"
+
     return f"{PREV_SCHEMA}.{table}_RAW"
 
 
 def snapshot_tbl(table: str) -> str:
     table = str(table).strip()
+
     if table.upper().endswith("_RAW"):
         return f"{SNAPSHOT_SCHEMA}.{table}"
+
     return f"{SNAPSHOT_SCHEMA}.{table}_RAW"
 
 
@@ -132,10 +168,12 @@ def snapshot_tbl(table: str) -> str:
 def table_exists(table_name: str) -> bool:
     try:
         return spark.catalog.tableExists(table_name)
+
     except Exception:
         try:
             spark.table(table_name).limit(1).count()
             return True
+
         except Exception:
             return False
 
@@ -155,6 +193,7 @@ def normalize_columns(df):
         if new_c in seen:
             seen[new_c] += 1
             new_c = f"{new_c}_{seen[new_c]}"
+
         else:
             seen[new_c] = 0
 
@@ -177,28 +216,51 @@ def parse_key_cols(key_column):
         return []
 
     key_column = key_column.replace("|", ",")
-    return [k.strip() for k in key_column.split(",") if k.strip()]
+
+    return [
+        k.strip()
+        for k in key_column.split(",")
+        if k.strip()
+    ]
 
 
 def resolve_key_columns(df, key_cols):
-    col_map = {c.lower(): c for c in df.columns}
+    col_map = {
+        c.lower(): c
+        for c in df.columns
+    }
+
     resolved = []
 
     for k in key_cols:
         if k.lower() not in col_map:
-            raise Exception(f"Key column missing in RAW table: {k}")
+            raise Exception(
+                f"Key column missing in RAW table: {k}"
+            )
+
         resolved.append(col_map[k.lower()])
 
     return resolved
 
 
 def add_missing_columns(df, required_cols, reference_df):
-    existing_lower = {c.lower(): c for c in df.columns}
+    existing_lower = {
+        c.lower(): c
+        for c in df.columns
+    }
 
     for c in required_cols:
         if c.lower() not in existing_lower:
-            ref_type = reference_df.schema[c].dataType if c in reference_df.columns else T.StringType()
-            df = df.withColumn(c, F.lit(None).cast(ref_type))
+            ref_type = (
+                reference_df.schema[c].dataType
+                if c in reference_df.columns
+                else T.StringType()
+            )
+
+            df = df.withColumn(
+                c,
+                F.lit(None).cast(ref_type)
+            )
 
     return df
 
@@ -218,7 +280,11 @@ def align_dataframes_for_union(dfs):
     for df in dfs:
         for c in all_cols:
             if c not in df.columns:
-                df = df.withColumn(c, F.lit(None).cast(col_types[c]))
+                df = df.withColumn(
+                    c,
+                    F.lit(None).cast(col_types[c])
+                )
+
         df = df.select(all_cols)
         aligned.append(df)
 
@@ -226,17 +292,32 @@ def align_dataframes_for_union(dfs):
 
 
 def get_hash_columns(df, key_cols):
-    exclude_cols = set([k.lower() for k in key_cols])
-    exclude_cols.update(["status", "insert_timestamp", "_row_hash"])
+    exclude_cols = {
+        k.lower()
+        for k in key_cols
+    }
 
-    return [c for c in df.columns if c.lower() not in exclude_cols]
+    exclude_cols.update([
+        "status",
+        "insert_timestamp",
+        "_row_hash"
+    ])
+
+    return [
+        c
+        for c in df.columns
+        if c.lower() not in exclude_cols
+    ]
 
 
 def add_hash(df, key_cols):
     hash_cols = get_hash_columns(df, key_cols)
 
     if len(hash_cols) == 0:
-        return df.withColumn("_row_hash", F.lit(""))
+        return df.withColumn(
+            "_row_hash",
+            F.lit("")
+        )
 
     return df.withColumn(
         "_row_hash",
@@ -244,7 +325,10 @@ def add_hash(df, key_cols):
             F.concat_ws(
                 "||",
                 *[
-                    F.coalesce(F.col(c).cast("string"), F.lit(""))
+                    F.coalesce(
+                        F.col(c).cast("string"),
+                        F.lit("")
+                    )
                     for c in hash_cols
                 ]
             ),
@@ -257,19 +341,110 @@ def add_hash(df, key_cols):
 # LOG HELPERS
 # ==============================================================
 
+def add_missing_utc_log_columns(table_name):
+    """
+    Adds the three new UTC columns to an existing log table.
+
+    This is required only when the log table was created using
+    the older schema that contained only CST/CDT timestamp columns.
+    """
+
+    if not table_exists(table_name):
+        return
+
+    existing_columns = {
+        c.lower()
+        for c in spark.table(table_name).columns
+    }
+
+    columns_to_add = []
+
+    if "insert_timestamp_utc" not in existing_columns:
+        columns_to_add.append(
+            "insert_timestamp_utc TIMESTAMP"
+        )
+
+    if "start_time_utc" not in existing_columns:
+        columns_to_add.append(
+            "start_time_utc TIMESTAMP"
+        )
+
+    if "end_time_utc" not in existing_columns:
+        columns_to_add.append(
+            "end_time_utc TIMESTAMP"
+        )
+
+    if columns_to_add:
+        columns_sql = ",\n".join(columns_to_add)
+
+        spark.sql(
+            f"""
+            ALTER TABLE {table_name}
+            ADD COLUMNS (
+                {columns_sql}
+            )
+            """
+        )
+
+        print(
+            f"Added UTC log columns to: {table_name}"
+        )
+
+
 def ensure_staging_log_tables_exist():
-    empty_log_df = spark.createDataFrame([], staging_log_schema)
+    empty_log_df = spark.createDataFrame(
+        [],
+        staging_log_schema
+    )
 
+    # Daily log table
     if not table_exists(STAGING_DAILY_LOG_TBL):
-        empty_log_df.write.mode("overwrite").saveAsTable(STAGING_DAILY_LOG_TBL)
+        (
+            empty_log_df.write
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .saveAsTable(STAGING_DAILY_LOG_TBL)
+        )
 
+    else:
+        add_missing_utc_log_columns(
+            STAGING_DAILY_LOG_TBL
+        )
+
+    # Final log table
     if not table_exists(STAGING_FINAL_LOG_TBL):
-        empty_log_df.write.mode("overwrite").saveAsTable(STAGING_FINAL_LOG_TBL)
+        (
+            empty_log_df.write
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .saveAsTable(STAGING_FINAL_LOG_TBL)
+        )
+
+    else:
+        add_missing_utc_log_columns(
+            STAGING_FINAL_LOG_TBL
+        )
 
 
 def reset_staging_daily_log():
-    empty_log_df = spark.createDataFrame([], staging_log_schema)
-    empty_log_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(STAGING_DAILY_LOG_TBL)
+    """
+    Clears only the daily log table.
+
+    The table is recreated using the complete schema containing
+    both the existing CST/CDT columns and the new UTC columns.
+    """
+
+    empty_log_df = spark.createDataFrame(
+        [],
+        staging_log_schema
+    )
+
+    (
+        empty_log_df.write
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(STAGING_DAILY_LOG_TBL)
+    )
 
 
 def add_staging_log_row(
@@ -280,15 +455,76 @@ def add_staging_log_row(
     end_time,
     error_message=None
 ):
+    """
+    Existing timestamp columns:
+        insert_timestamp
+        start_time
+        end_time
+
+    remain in America/Chicago CST/CDT.
+
+    Additional timestamp columns:
+        insert_timestamp_utc
+        start_time_utc
+        end_time_utc
+
+    contain the corresponding UTC/GMT values.
+    """
+
+    # Current insertion time in CST/CDT
+    insert_time_cst = datetime.now(tz)
+
+    # Ensure start and end times are timezone-aware Chicago values
+    if start_time.tzinfo is None:
+        start_time_cst = tz.localize(start_time)
+    else:
+        start_time_cst = start_time.astimezone(tz)
+
+    if end_time.tzinfo is None:
+        end_time_cst = tz.localize(end_time)
+    else:
+        end_time_cst = end_time.astimezone(tz)
+
+    # Convert the same timestamps into UTC
+    insert_time_utc = insert_time_cst.astimezone(utc_tz)
+    start_time_utc = start_time_cst.astimezone(utc_tz)
+    end_time_utc = end_time_cst.astimezone(utc_tz)
+
     row = {
-        "load_date": start_time.date(),
+        # Business/load date remains based on CST/CDT
+        "load_date": start_time_cst.date(),
+
         "table_name": str(table_name),
         "status": str(status),
-        "count": int(count_value) if count_value is not None else 0,
+        "count": (
+            int(count_value)
+            if count_value is not None
+            else 0
+        ),
         "error_message": error_message,
-        "insert_timestamp": datetime.now(tz).replace(tzinfo=None),
-        "start_time": start_time.replace(tzinfo=None),
-        "end_time": end_time.replace(tzinfo=None),
+
+        # Existing CST/CDT values
+        "insert_timestamp": insert_time_cst.replace(
+            tzinfo=None
+        ),
+        "start_time": start_time_cst.replace(
+            tzinfo=None
+        ),
+        "end_time": end_time_cst.replace(
+            tzinfo=None
+        ),
+
+        # New UTC/GMT values
+        "insert_timestamp_utc": insert_time_utc.replace(
+            tzinfo=None
+        ),
+        "start_time_utc": start_time_utc.replace(
+            tzinfo=None
+        ),
+        "end_time_utc": end_time_utc.replace(
+            tzinfo=None
+        ),
+
         "load_type": "staging"
     }
 
@@ -300,15 +536,31 @@ def write_staging_daily_logs():
     if len(STAGING_LOG_ROWS) == 0:
         return
 
-    log_df = spark.createDataFrame(STAGING_LOG_ROWS, staging_log_schema)
-    log_df.write.mode("append").saveAsTable(STAGING_DAILY_LOG_TBL)
+    log_df = spark.createDataFrame(
+        STAGING_LOG_ROWS,
+        staging_log_schema
+    )
+
+    (
+        log_df.write
+        .mode("append")
+        .option("mergeSchema", "true")
+        .saveAsTable(STAGING_DAILY_LOG_TBL)
+    )
 
 
 def consolidate_staging_logs_to_final():
-    daily_df = spark.table(STAGING_DAILY_LOG_TBL)
+    daily_df = spark.table(
+        STAGING_DAILY_LOG_TBL
+    )
 
     if daily_df.count() > 0:
-        daily_df.write.mode("append").saveAsTable(STAGING_FINAL_LOG_TBL)
+        (
+            daily_df.write
+            .mode("append")
+            .option("mergeSchema", "true")
+            .saveAsTable(STAGING_FINAL_LOG_TBL)
+        )
 
     reset_staging_daily_log()
 
@@ -322,9 +574,18 @@ def write_prev_raw_snapshot(table_name, previous_df):
 
     snapshot_df = (
         previous_df
-        .withColumn("__snapshot_run_id", F.lit(RUN_ID))
-        .withColumn("__snapshot_date", F.current_date())
-        .withColumn("__snapshot_timestamp", F.current_timestamp())
+        .withColumn(
+            "__snapshot_run_id",
+            F.lit(RUN_ID)
+        )
+        .withColumn(
+            "__snapshot_date",
+            F.current_date()
+        )
+        .withColumn(
+            "__snapshot_timestamp",
+            F.current_timestamp()
+        )
     )
 
     (
@@ -343,15 +604,36 @@ def build_changes(current_df, previous_df, key_cols):
     current_df = normalize_columns(current_df)
     previous_df = normalize_columns(previous_df)
 
-    key_cols = resolve_key_columns(current_df, key_cols)
+    key_cols = resolve_key_columns(
+        current_df,
+        key_cols
+    )
 
-    previous_df = add_missing_columns(previous_df, current_df.columns, current_df)
-    current_df = add_missing_columns(current_df, previous_df.columns, previous_df)
+    previous_df = add_missing_columns(
+        previous_df,
+        current_df.columns,
+        current_df
+    )
 
-    current_df = current_df.select(previous_df.columns)
+    current_df = add_missing_columns(
+        current_df,
+        previous_df.columns,
+        previous_df
+    )
 
-    current_hash = add_hash(current_df, key_cols).alias("c")
-    previous_hash = add_hash(previous_df, key_cols).alias("p")
+    current_df = current_df.select(
+        previous_df.columns
+    )
+
+    current_hash = add_hash(
+        current_df,
+        key_cols
+    ).alias("c")
+
+    previous_hash = add_hash(
+        previous_df,
+        key_cols
+    ).alias("p")
 
     join_cond = [
         F.col(f"c.`{k}`") == F.col(f"p.`{k}`")
@@ -360,39 +642,83 @@ def build_changes(current_df, previous_df, key_cols):
 
     inserts_df = (
         current_hash
-        .join(previous_hash, join_cond, "left_anti")
+        .join(
+            previous_hash,
+            join_cond,
+            "left_anti"
+        )
         .drop("_row_hash")
-        .withColumn("STATUS", F.lit("I"))
-        .withColumn("insert_timestamp", F.current_timestamp())
+        .withColumn(
+            "STATUS",
+            F.lit("I")
+        )
+        .withColumn(
+            "insert_timestamp",
+            F.current_timestamp()
+        )
     )
 
     deletes_df = (
         previous_hash
-        .join(current_hash, join_cond, "left_anti")
+        .join(
+            current_hash,
+            join_cond,
+            "left_anti"
+        )
         .drop("_row_hash")
-        .withColumn("STATUS", F.lit("D"))
-        .withColumn("insert_timestamp", F.current_timestamp())
+        .withColumn(
+            "STATUS",
+            F.lit("D")
+        )
+        .withColumn(
+            "insert_timestamp",
+            F.current_timestamp()
+        )
     )
 
     updates_df = (
         current_hash
-        .join(previous_hash, join_cond, "inner")
-        .where(F.col("c._row_hash") != F.col("p._row_hash"))
-        .select([F.col(f"c.`{c}`").alias(c) for c in current_df.columns])
-        .withColumn("STATUS", F.lit("U"))
-        .withColumn("insert_timestamp", F.current_timestamp())
+        .join(
+            previous_hash,
+            join_cond,
+            "inner"
+        )
+        .where(
+            F.col("c._row_hash") !=
+            F.col("p._row_hash")
+        )
+        .select([
+            F.col(f"c.`{c}`").alias(c)
+            for c in current_df.columns
+        ])
+        .withColumn(
+            "STATUS",
+            F.lit("U")
+        )
+        .withColumn(
+            "insert_timestamp",
+            F.current_timestamp()
+        )
     )
 
-    inserts_df, updates_df, deletes_df = align_dataframes_for_union([
-        inserts_df,
-        updates_df,
-        deletes_df
-    ])
+    inserts_df, updates_df, deletes_df = (
+        align_dataframes_for_union([
+            inserts_df,
+            updates_df,
+            deletes_df
+        ])
+    )
 
     changes_df = (
         inserts_df
-        .unionByName(updates_df, allowMissingColumns=True)
-        .unionByName(deletes_df, allowMissingColumns=True)
+        .unionByName(
+            updates_df,
+            allowMissingColumns=True
+        )
+        .unionByName(
+            deletes_df,
+            allowMissingColumns=True
+        )
     )
 
     return changes_df
@@ -403,6 +729,7 @@ def build_changes(current_df, previous_df, key_cols):
 # ==============================================================
 
 def process_table(table_name, key_column):
+    # Existing processing start time remains CST/CDT
     start_time = datetime.now(tz)
 
     source_table = src_tbl(table_name)
@@ -413,6 +740,7 @@ def process_table(table_name, key_column):
 
     if len(key_cols) == 0:
         end_time = datetime.now(tz)
+
         add_staging_log_row(
             table_name=clean_table_name(table_name),
             status="FAILED",
@@ -421,29 +749,46 @@ def process_table(table_name, key_column):
             end_time=end_time,
             error_message="KEY_COLUMN is empty"
         )
-        raise Exception(f"KEY_COLUMN is empty for {table_name}")
 
-    print(f"\n============================================================")
+        raise Exception(
+            f"KEY_COLUMN is empty for {table_name}"
+        )
+
+    print(
+        "\n============================================================"
+    )
     print(f"Processing table: {table_name}")
     print(f"Source   : {source_table}")
     print(f"Previous : {previous_table}")
     print(f"Staging  : {staging_table}")
     print(f"Keys     : {key_cols}")
-    print(f"============================================================")
+    print(
+        "============================================================"
+    )
 
     if not table_exists(source_table):
         end_time = datetime.now(tz)
+
         add_staging_log_row(
             table_name=clean_table_name(table_name),
             status="FAILED",
             count_value=0,
             start_time=start_time,
             end_time=end_time,
-            error_message=f"Source table does not exist: {source_table}"
+            error_message=(
+                f"Source table does not exist: "
+                f"{source_table}"
+            )
         )
-        raise Exception(f"Source table does not exist: {source_table}")
 
-    current_df = normalize_columns(spark.table(source_table))
+        raise Exception(
+            f"Source table does not exist: "
+            f"{source_table}"
+        )
+
+    current_df = normalize_columns(
+        spark.table(source_table)
+    )
 
     if not table_exists(previous_table):
         (
@@ -454,14 +799,22 @@ def process_table(table_name, key_column):
             .saveAsTable(previous_table)
         )
 
-    previous_df = normalize_columns(spark.table(previous_table))
+    previous_df = normalize_columns(
+        spark.table(previous_table)
+    )
 
-    changes_df = build_changes(current_df, previous_df, key_cols).cache()
+    changes_df = build_changes(
+        current_df,
+        previous_df,
+        key_cols
+    ).cache()
 
     status_counts_rows = (
         changes_df
         .groupBy("STATUS")
-        .agg(F.count("*").alias("cnt"))
+        .agg(
+            F.count("*").alias("cnt")
+        )
         .collect()
     )
 
@@ -474,7 +827,11 @@ def process_table(table_name, key_column):
     update_count = status_counts.get("U", 0)
     delete_count = status_counts.get("D", 0)
 
-    total_change_count = insert_count + update_count + delete_count
+    total_change_count = (
+        insert_count +
+        update_count +
+        delete_count
+    )
 
     print(f"Insert count : {insert_count}")
     print(f"Update count : {update_count}")
@@ -489,7 +846,10 @@ def process_table(table_name, key_column):
     )
 
     # Snapshot old PREV_RAW before overwriting it
-    write_prev_raw_snapshot(table_name, previous_df)
+    write_prev_raw_snapshot(
+        table_name,
+        previous_df
+    )
 
     # Update PREV_RAW with current RAW after staging is created
     (
@@ -501,11 +861,35 @@ def process_table(table_name, key_column):
 
     changes_df.unpersist()
 
+    # Existing processing end time remains CST/CDT
     end_time = datetime.now(tz)
 
-    add_staging_log_row(clean_table_name(table_name), "I", insert_count, start_time, end_time, None)
-    add_staging_log_row(clean_table_name(table_name), "U", update_count, start_time, end_time, None)
-    add_staging_log_row(clean_table_name(table_name), "D", delete_count, start_time, end_time, None)
+    add_staging_log_row(
+        clean_table_name(table_name),
+        "I",
+        insert_count,
+        start_time,
+        end_time,
+        None
+    )
+
+    add_staging_log_row(
+        clean_table_name(table_name),
+        "U",
+        update_count,
+        start_time,
+        end_time,
+        None
+    )
+
+    add_staging_log_row(
+        clean_table_name(table_name),
+        "D",
+        delete_count,
+        start_time,
+        end_time,
+        None
+    )
 
     return {
         "table_name": clean_table_name(table_name),
@@ -524,20 +908,32 @@ def process_table(table_name, key_column):
 def process_table_with_retry(table_name, key_column):
     last_error = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1
+    ):
         try:
-            return process_table(table_name, key_column)
+            return process_table(
+                table_name,
+                key_column
+            )
 
         except Exception as e:
             last_error = str(e)
-            print(f"Attempt {attempt} failed for {table_name}: {last_error}")
+
+            print(
+                f"Attempt {attempt} failed for "
+                f"{table_name}: {last_error}"
+            )
 
             if attempt == MAX_RETRIES:
                 start_time = datetime.now(tz)
                 end_time = datetime.now(tz)
 
                 add_staging_log_row(
-                    table_name=clean_table_name(table_name),
+                    table_name=clean_table_name(
+                        table_name
+                    ),
                     status="FAILED",
                     count_value=0,
                     start_time=start_time,
@@ -546,7 +942,9 @@ def process_table_with_retry(table_name, key_column):
                 )
 
                 return {
-                    "table_name": clean_table_name(table_name),
+                    "table_name": clean_table_name(
+                        table_name
+                    ),
                     "insert_count": 0,
                     "update_count": 0,
                     "delete_count": 0,
@@ -562,9 +960,14 @@ def process_table_with_retry(table_name, key_column):
 
 def read_table_list_table(table_list_name):
     try:
-        return spark.table(table_list_name)
+        return spark.table(
+            table_list_name
+        )
+
     except Exception:
-        return spark.table(f"{CATALOG}.{table_list_name}")
+        return spark.table(
+            f"{CATALOG}.{table_list_name}"
+        )
 
 
 def read_all_table_lists():
@@ -574,14 +977,28 @@ def read_all_table_lists():
         df = (
             read_table_list_table(tbl)
             .select(
-                F.col("TABLE_NAME").cast("string").alias("TABLE_NAME"),
-                F.col("KEY_COLUMN").cast("string").alias("KEY_COLUMN")
+                F.col("TABLE_NAME")
+                .cast("string")
+                .alias("TABLE_NAME"),
+
+                F.col("KEY_COLUMN")
+                .cast("string")
+                .alias("KEY_COLUMN")
             )
-            .where(F.col("TABLE_NAME").isNotNull())
+            .where(
+                F.col("TABLE_NAME").isNotNull()
+            )
         )
+
         dfs.append(df)
 
-    final_df = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), dfs)
+    final_df = reduce(
+        lambda a, b: a.unionByName(
+            b,
+            allowMissingColumns=True
+        ),
+        dfs
+    )
 
     final_df = (
         final_df
@@ -605,21 +1022,35 @@ def process_all_tables():
     ensure_staging_log_tables_exist()
     reset_staging_daily_log()
 
+    # Clear any rows left in Python memory if the notebook cell
+    # is rerun in the same Spark session.
+    with LOG_LOCK:
+        STAGING_LOG_ROWS.clear()
+
     table_list_df = read_all_table_lists()
 
+    # Collect only the table-name and key metadata.
+    # RAW tables are not loaded here.
     table_rows = table_list_df.collect()
 
-    print(f"Total tables to process: {len(table_rows)}")
+    print(
+        f"Total tables to process: "
+        f"{len(table_rows)}"
+    )
 
     results = []
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
+
         future_map = {
             executor.submit(
                 process_table_with_retry,
                 row["TABLE_NAME"],
                 row["KEY_COLUMN"]
             ): row["TABLE_NAME"]
+
             for row in table_rows
         }
 
@@ -640,10 +1071,16 @@ def process_all_tables():
 
             except Exception as e:
                 error_msg = traceback.format_exc()
-                print(f"Unexpected failure for {table_name}: {error_msg}")
+
+                print(
+                    f"Unexpected failure for "
+                    f"{table_name}: {error_msg}"
+                )
 
                 results.append({
-                    "table_name": clean_table_name(table_name),
+                    "table_name": clean_table_name(
+                        table_name
+                    ),
                     "insert_count": 0,
                     "update_count": 0,
                     "delete_count": 0,
@@ -657,18 +1094,36 @@ def process_all_tables():
 
     result_df = spark.createDataFrame(results)
 
-    print("\n================ FINAL SUMMARY ================")
-    result_df.groupBy("status").count().show(truncate=False)
+    print(
+        "\n================ FINAL SUMMARY ================"
+    )
 
-    print("\n================ CHANGE COUNTS ================")
-    result_df.select(
-        "table_name",
-        "status",
-        "insert_count",
-        "update_count",
-        "delete_count",
-        "total_change_count"
-    ).orderBy("table_name").show(1000, truncate=False)
+    result_df.groupBy(
+        "status"
+    ).count().show(
+        truncate=False
+    )
+
+    print(
+        "\n================ CHANGE COUNTS ================"
+    )
+
+    (
+        result_df
+        .select(
+            "table_name",
+            "status",
+            "insert_count",
+            "update_count",
+            "delete_count",
+            "total_change_count"
+        )
+        .orderBy("table_name")
+        .show(
+            1000,
+            truncate=False
+        )
+    )
 
     return result_df
 

@@ -4,6 +4,8 @@
 # + PREV_RAW_SNAPSHOT Backup Before PREV_RAW Overwrite
 # ==============================================================
 
+#------------------------------------------UPDATED FINAL----------------------------------------------------#
+
 from pyspark.sql import SparkSession, functions as F, types as T
 from pyspark.sql.utils import AnalysisException
 from functools import reduce
@@ -52,6 +54,8 @@ MAX_RETRIES = 2
 RUN_ID = datetime.now(tz).strftime("%Y%m%d%H%M%S")
 
 TABLES_LISTS = [
+
+    "TABLES_LIST",
     "TABLES_LIST_1",
     "TABLES_LIST_2",
     "TABLES_LIST_3",
@@ -61,7 +65,8 @@ TABLES_LISTS = [
     "TABLES_LIST_7",
     "TABLES_LIST_8",
     "TABLES_LIST_9",
-    "TABLES_LIST_10"
+    "TABLES_LIST_10",
+    "TABLES_LIST_MSO",
 ]
 
 # ==============================================================

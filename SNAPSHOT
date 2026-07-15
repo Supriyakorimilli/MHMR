@@ -4,6 +4,8 @@
 # This version guarantees start_time, end_time, insert_timestamp are
 # TIMESTAMPs in America/Chicago.
 
+#------------------------------------------UPDATED FINAL----------------------------------------------------#
+
 from __future__ import annotations
 
 from datetime import datetime, date
@@ -55,8 +57,11 @@ SNAPSHOT_SCHEMA = f"{CATALOG}.SNAPSHOT"
 STAGING_SCHEMA = "staging"
 
 TABLES_LISTS = [
+
+    "TABLES_LIST",
     "TABLES_LIST_1",
     "TABLES_LIST_2",
+    "TABLES_LIST_2(i)",
     "TABLES_LIST_3",
     "TABLES_LIST_4",
     "TABLES_LIST_5",
@@ -64,7 +69,8 @@ TABLES_LISTS = [
     "TABLES_LIST_7",
     "TABLES_LIST_8",
     "TABLES_LIST_9",
-    "TABLES_LIST_10"
+    "TABLES_LIST_10",
+    "TABLES_LIST_MSO",
 ]
 
 # Set True when staging timestamps are UTC and need to be converted

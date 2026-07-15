@@ -2,6 +2,8 @@
 # Success => 3 daily/final log rows (I/U/D). Failure => 1 row (table_name='Fail', status='').
 # insert_timestamp in logs = load_date 00:00:00 (CST/CDT). First-seen consolidation.
 
+
+#------------------------------------------UPDATED FINAL----------------------------------------------------#
 from __future__ import annotations
 from datetime import datetime, date
 from typing import List, Dict
@@ -36,7 +38,25 @@ tz = pytz.timezone("America/Chicago")
 CATALOG = "MHMR_LAKEHOUSE"
 HISTORY_SCHEMA = f"{CATALOG}.HISTORY"
 STAGING_SCHEMA = "staging"
-TABLES_LIST = "TABLES_LIST"  # cols: TABLE_NAME, KEY_COLUMN (comma-separated keys)
+
+
+
+TABLES_LISTS = [
+
+    "TABLES_LIST",
+    "TABLES_LIST_1",
+    "TABLES_LIST_2",
+    "TABLES_LIST_2(i)",
+    "TABLES_LIST_3",
+    "TABLES_LIST_4",
+    "TABLES_LIST_5",
+    "TABLES_LIST_6",
+    "TABLES_LIST_7",
+    "TABLES_LIST_8",
+    "TABLES_LIST_9",
+    "TABLES_LIST_10",
+    "TABLES_LIST_MSO",
+]
 
 # Set True if staging insert_ts/insert_timestamp is UTC; False if already CST/CDT.
 STAGING_TIMESTAMPS_ARE_UTC = True
@@ -237,28 +257,53 @@ def processed_success_dates_history(table_name: str) -> DataFrame:
 # ------------------------
 # Global date helpers
 # ------------------------
-def union_staging_dates_across_tables(tables: List[Dict[str, str]]) -> List[date]:
-    """
-    Return sorted unique CST business dates present in ANY staging table.
-    If none exist, return [today] so we still log I/U/D=0 per table.
-    """
-    all_dates_df = None
+def union_staging_dates_across_tables(
+    tables: List[Dict[str, str]]
+) -> List[date]:
+
+    all_dates = set()
+
     for r in tables:
         table = r["TABLE_NAME"]
+        staging_table = stg_tbl(table)
+
         try:
-            stg = spark.read.table(stg_tbl(table))
+            stg = spark.read.table(staging_table)
+
+            ts_col = _resolve_insert_ts_col(stg)
+
+            table_dates = (
+                stg.select(
+                    _to_cst_date_from_ts(ts_col).alias("load_date")
+                )
+                .where(F.col("load_date").isNotNull())
+                .distinct()
+                .collect()
+            )
+
+            for row in table_dates:
+                all_dates.add(row["load_date"])
+
         except AnalysisException:
             continue
-        ts_col = _resolve_insert_ts_col(stg)
-        ddf = stg.select(_to_cst_date_from_ts(ts_col).alias("load_date")).distinct()
-        all_dates_df = ddf if all_dates_df is None else all_dates_df.unionByName(ddf)
 
-    if all_dates_df is None or all_dates_df.rdd.isEmpty():
+        except Exception as e:
+            print(
+                f"[{_ts()}] WARNING: unable to scan dates for "
+                f"{staging_table}: {type(e).__name__}: {str(e)}"
+            )
+
+    if not all_dates:
         today = datetime.now(tz).date()
-        print(f"[{_ts()}] No dates found in any staging table; defaulting to today={today}")
+
+        print(
+            f"[{_ts()}] No dates found in any staging table; "
+            f"defaulting to today={today}"
+        )
+
         return [today]
 
-    return [r["load_date"] for r in all_dates_df.select("load_date").distinct().orderBy("load_date").collect()]
+    return sorted(all_dates)
 
 def dates_to_process_for_table(table_name: str, candidate_dates: List[date]) -> List[date]:
     """
@@ -432,58 +477,141 @@ def _apply_history_with_retry_for_date(table_name: str, key_cols: List[str], d: 
 
 def process_all_history() -> None:
     print(f"[{_ts()}] ========= Starting history apply (backfill-aware; global dates) =========")
+
     ensure_history_log_tables_exist()
     reset_history_daily_log()
 
-    tables_df = spark.read.table(TABLES_LIST).select("TABLE_NAME", "KEY_COLUMN")
+    # Combine TABLES_LIST_1 through TABLES_LIST_10
+    tables_df = None
+
+    for tbl_list in TABLES_LISTS:
+        print(f"[{_ts()}] Reading table list: {tbl_list}")
+
+        df = (
+            spark.read.table(tbl_list)
+            .select(
+                F.col("TABLE_NAME").cast("string").alias("TABLE_NAME"),
+                F.col("KEY_COLUMN").cast("string").alias("KEY_COLUMN")
+            )
+            .where(
+                F.col("TABLE_NAME").isNotNull()
+                & F.col("KEY_COLUMN").isNotNull()
+            )
+        )
+
+        if tables_df is None:
+            tables_df = df
+        else:
+            tables_df = tables_df.unionByName(df)
+
+    if tables_df is None:
+        raise ValueError("No table-list data was loaded.")
+
+    tables_df = tables_df.dropDuplicates(["TABLE_NAME"])
+
     all_rows = [r.asDict() for r in tables_df.collect()]
+
     print(f"[{_ts()}] Tables to scan for history: {len(all_rows)}")
 
-    # Build the global run date set (union across all staging tables)
+    # Build global dates
     global_dates = union_staging_dates_across_tables(all_rows)
-    print(f"[{_ts()}] Global candidate dates: {', '.join(map(str, global_dates))}")
+
+    print(
+        f"[{_ts()}] Global candidate dates: "
+        f"{', '.join(map(str, global_dates))}"
+    )
 
     plan = {}
     total_pending = 0
 
-    # For each table, process dates not yet successful in FINAL (from global set)
+    # Build processing plan
     for r in all_rows:
         table = r["TABLE_NAME"]
-        key_cols = [c.strip() for c in r["KEY_COLUMN"].split(",") if c.strip()]
+
+        key_cols = [
+            c.strip()
+            for c in r["KEY_COLUMN"].split(",")
+            if c.strip()
+        ]
+
         print(f"[{_ts()}] -------- Planning table: {table} --------")
+
         pend = dates_to_process_for_table(table, global_dates)
-        plan[table] = {"keys": key_cols, "pending": pend}
+
+        plan[table] = {
+            "keys": key_cols,
+            "pending": pend
+        }
+
         total_pending += len(pend)
+
         if pend:
-            print(f"[{_ts()}] PLAN {table}: pending dates -> {', '.join(map(str, pend))}")
+            print(
+                f"[{_ts()}] PLAN {table}: pending dates -> "
+                f"{', '.join(map(str, pend))}"
+            )
         else:
-            print(f"[{_ts()}] PLAN {table}: no pending dates (already successful in FINAL for global set).")
+            print(
+                f"[{_ts()}] PLAN {table}: no pending dates "
+                f"(already successful in FINAL for global set)."
+            )
 
     if total_pending == 0:
-        print(f"[{_ts()}] Nothing pending across all tables. Consolidating logs and exiting.")
+        print(
+            f"[{_ts()}] Nothing pending across all tables. "
+            f"Consolidating logs and exiting."
+        )
+
         consolidate_history_logs_to_final(dedupe=True)
-        print(f"[{_ts()}] ========= All history processing complete (no work) =========")
+
+        print(
+            f"[{_ts()}] ========= "
+            f"All history processing complete (no work) ========="
+        )
+
         return
 
-    # Parallelize across tables; per-table, process dates serially
+    # Parallelize across tables
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = []
+
         for table, info in plan.items():
             dates = info["pending"]
+
             if not dates:
                 print(f"[{_ts()}] SKIP: {table} has no pending dates.")
                 continue
-            def work(table=table, key_cols=info["keys"], dates=dates):
-                print(f"[{_ts()}] >>> Processing table {table}: {', '.join(map(str, dates))}")
+
+            def work(
+                table=table,
+                key_cols=info["keys"],
+                dates=dates
+            ):
+                print(
+                    f"[{_ts()}] >>> Processing table {table}: "
+                    f"{', '.join(map(str, dates))}"
+                )
+
                 for d in dates:
-                    _apply_history_with_retry_for_date(table, key_cols, d)
+                    _apply_history_with_retry_for_date(
+                        table,
+                        key_cols,
+                        d
+                    )
+
             futures.append(ex.submit(work))
+
         for f in as_completed(futures):
             f.result()
 
     consolidate_history_logs_to_final(dedupe=True)
-    print(f"[{_ts()}] ========= All history processing complete =========")
 
-# Entry point
-process_all_history()
+    print(
+        f"[{_ts()}] ========= "
+        f"All history processing complete ========="
+    )
+
+
+# Entry point — this line must have no spaces before it
+process_all_history()            
 

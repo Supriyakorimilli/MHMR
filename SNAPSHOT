@@ -62,7 +62,6 @@ TABLES_LISTS = [
     "TABLES_LIST",
     "TABLES_LIST_1",
     "TABLES_LIST_2",
-    "TABLES_LIST_2(i)",
     "TABLES_LIST_3",
     "TABLES_LIST_4",
     "TABLES_LIST_5",

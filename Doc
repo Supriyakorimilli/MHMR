@@ -1,35 +1,56 @@
-1. Project Overview
-1.1 Introduction
+1.4 Scope
 
-The MHMR Data Processing Framework is an enterprise-scale data engineering solution developed on Microsoft Fabric Lakehouse using PySpark. The framework is designed to process daily data from source systems, identify data changes, maintain complete historical records, create current-state snapshots, and generate operational audit logs for monitoring and recovery.
+The framework includes the following major components:
 
-The solution processes data through multiple layers including Raw, Previous Raw, Staging, History, and Snapshot. It supports incremental data loading, historical tracking using Slowly Changing Dimension (SCD Type 2), current-state reporting using snapshot tables, automated auditing, retry mechanisms, and parallel execution for improved performance.
+Raw Data Processing
+Previous Raw Data Management
+Staging Layer
+History Layer
+Snapshot Layer
+Daily Logging Framework
+Final Logging Framework
+Retry Mechanism
+Parallel Processing Framework
+Audit Framework
+Backfill Processing
+Timezone Management
+Error Handling
+Performance Optimization
 
-The framework is metadata-driven, enabling a single implementation to process more than 500 source tables while minimizing manual development effort.
+1.5 Technology Stack
+Component	Technology
+Platform	Microsoft Fabric
+Storage	Lakehouse
+Language	PySpark
+Processing Engine	Apache Spark
+Catalog	MHMR_LAKEHOUSE
+Data Format	Delta Tables
+Programming Language	Python
+Parallel Processing	ThreadPoolExecutor
+Logging	Custom Audit Tables
+Versioning	SCD Type 2
+Snapshot	CDC-Based Snapshot Framework
 
-1.2 Purpose
 
-The primary purpose of this project is to provide a scalable and reliable data processing framework that:
-
-Processes daily incremental data from source systems.
-Detects Inserts, Updates, and Deletes efficiently.
-Preserves historical data for auditing and reporting.
-Maintains the latest snapshot of every business record.
-Supports automated backfill processing for missed execution dates.
-Provides complete operational logging and auditing.
-Improves execution performance through parallel processing.
-Enables easy recovery from failures using retry mechanisms and detailed logs.
-
-1.3 Project Objectives
-
-The objectives of the MHMR Data Processing Framework are:
-
-Build a scalable ETL framework capable of processing hundreds of tables.
-Minimize execution time through parallel processing.
-Detect data changes using row-level comparisons.
-Preserve historical versions of data using SCD Type 2.
-Maintain accurate daily snapshot tables.
-Support incremental and backfill processing.
-Ensure complete operational visibility through audit logs.
-Reduce manual intervention during failures.
-Improve data quality and consistency across the Lakehouse.
+1.6 High-Level Workflow
+Source System
+      │
+      ▼
+RAW Layer
+      │
+      ▼
+Previous RAW Comparison
+      │
+      ▼
+Staging Layer
+      │
+ ┌────┴────┐
+ ▼         ▼
+History   Snapshot
+(SCD2)    (Current State)
+      │
+      ▼
+Daily & Final Logs
+      │
+      ▼
+Business Reporting

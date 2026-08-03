@@ -1,56 +1,34 @@
-1.4 Scope
+1.7 Key Features
 
-The framework includes the following major components:
+The MHMR Data Processing Framework includes the following capabilities:
 
-Raw Data Processing
-Previous Raw Data Management
-Staging Layer
-History Layer
-Snapshot Layer
-Daily Logging Framework
-Final Logging Framework
-Retry Mechanism
-Parallel Processing Framework
-Audit Framework
-Backfill Processing
-Timezone Management
-Error Handling
+Incremental Data Processing
+Row-Level Change Detection
+Historical Data Maintenance
+Snapshot Generation
+Automated Retry Logic
+Parallel Table Processing
+Metadata-Driven Execution
+Dynamic Table Handling
+Detailed Audit Logging
+Daily and Final Execution Logs
+Backfill Support
+Error Recovery
+Atomic Snapshot Replacement
+Timezone Support (CST/CDT and UTC)
 Performance Optimization
+Failure Isolation
+1.8 Benefits
 
-1.5 Technology Stack
-Component	Technology
-Platform	Microsoft Fabric
-Storage	Lakehouse
-Language	PySpark
-Processing Engine	Apache Spark
-Catalog	MHMR_LAKEHOUSE
-Data Format	Delta Tables
-Programming Language	Python
-Parallel Processing	ThreadPoolExecutor
-Logging	Custom Audit Tables
-Versioning	SCD Type 2
-Snapshot	CDC-Based Snapshot Framework
+The implemented solution provides several operational and business benefits:
 
-
-1.6 High-Level Workflow
-Source System
-      │
-      ▼
-RAW Layer
-      │
-      ▼
-Previous RAW Comparison
-      │
-      ▼
-Staging Layer
-      │
- ┌────┴────┐
- ▼         ▼
-History   Snapshot
-(SCD2)    (Current State)
-      │
-      ▼
-Daily & Final Logs
-      │
-      ▼
-Business Reporting
+Reduces execution time by processing tables in parallel.
+Eliminates full-table reloads through incremental processing.
+Maintains complete historical records for compliance and analysis.
+Provides accurate point-in-time snapshots for reporting.
+Simplifies failure recovery using automated retry logic.
+Enables monitoring through detailed execution logs.
+Supports scalable processing for hundreds of tables.
+Improves data consistency across downstream systems.
+Reduces manual operational effort.
+Provides a reusable framework that can be extended to additional source systems.

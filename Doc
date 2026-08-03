@@ -1,0 +1,35 @@
+1. Project Overview
+1.1 Introduction
+
+The MHMR Data Processing Framework is an enterprise-scale data engineering solution developed on Microsoft Fabric Lakehouse using PySpark. The framework is designed to process daily data from source systems, identify data changes, maintain complete historical records, create current-state snapshots, and generate operational audit logs for monitoring and recovery.
+
+The solution processes data through multiple layers including Raw, Previous Raw, Staging, History, and Snapshot. It supports incremental data loading, historical tracking using Slowly Changing Dimension (SCD Type 2), current-state reporting using snapshot tables, automated auditing, retry mechanisms, and parallel execution for improved performance.
+
+The framework is metadata-driven, enabling a single implementation to process more than 500 source tables while minimizing manual development effort.
+
+1.2 Purpose
+
+The primary purpose of this project is to provide a scalable and reliable data processing framework that:
+
+Processes daily incremental data from source systems.
+Detects Inserts, Updates, and Deletes efficiently.
+Preserves historical data for auditing and reporting.
+Maintains the latest snapshot of every business record.
+Supports automated backfill processing for missed execution dates.
+Provides complete operational logging and auditing.
+Improves execution performance through parallel processing.
+Enables easy recovery from failures using retry mechanisms and detailed logs.
+
+1.3 Project Objectives
+
+The objectives of the MHMR Data Processing Framework are:
+
+Build a scalable ETL framework capable of processing hundreds of tables.
+Minimize execution time through parallel processing.
+Detect data changes using row-level comparisons.
+Preserve historical versions of data using SCD Type 2.
+Maintain accurate daily snapshot tables.
+Support incremental and backfill processing.
+Ensure complete operational visibility through audit logs.
+Reduce manual intervention during failures.
+Improve data quality and consistency across the Lakehouse.

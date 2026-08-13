@@ -116,15 +116,24 @@ LOG_SCHEMA = "LOGS"
 
 
 # ==============================================================
+# TEST SUFFIX
+#
+# Using TEST tables so normal staging/PREV_RAW are not modified.
+# ==============================================================
+
+TEST_SUFFIX = "_rowhash_test"
+
+
+# ==============================================================
 # SAME EXISTING LOG TABLES
 # ==============================================================
 
 STAGING_DAILY_LOG_TBL = (
-    f"{LOG_SCHEMA}.staging_daily_log"
+    f"{LOG_SCHEMA}.staging_daily_log_rowhash_test"
 )
 
 STAGING_FINAL_LOG_TBL = (
-    f"{LOG_SCHEMA}.staging_final_log"
+    f"{LOG_SCHEMA}.staging_final_log_rowhash_test"
 )
 
 
@@ -153,26 +162,9 @@ RUN_ID = datetime.now(
 # ONLY CHANGE THESE TWO VALUES
 # ==============================================================
 
-TEST_TABLE = "YOUR_TABLE_NAME"
+TEST_TABLE = "admission_data"
 
-TEST_KEY_COLUMN = "YOUR_KEY_COLUMN"
-
-
-# ==============================================================
-# EXAMPLES
-# ==============================================================
-#
-# TEST_TABLE = "CLIENT"
-# TEST_KEY_COLUMN = "CLIENT_ID"
-#
-#
-# Composite key:
-#
-# TEST_TABLE = "CLIENT_PROGRAM"
-# TEST_KEY_COLUMN = "CLIENT_ID,PROGRAM_ID"
-#
-# ==============================================================
-
+TEST_KEY_COLUMN = "blank_row_id"
 
 # ==============================================================
 # LOG SCHEMA

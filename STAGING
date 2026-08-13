@@ -1,19 +1,32 @@
 # ==============================================================
 # SINGLE TABLE STAGING TEST
-# RAW vs PREV_RAW USING LAST_MODIFIED TIMESTAMP
+# RAW vs LM_TEST PREV_RAW USING LAST_MODIFIED TIMESTAMP
 #
-# NO ROW HASH
-# NO THREADPOOL
+# IMPORTANT:
+#   NORMAL PREV_RAW IS NOT READ
+#   NORMAL PREV_RAW IS NOT USED
+#   NORMAL PREV_RAW IS NOT MODIFIED
+#
+# FIRST RUN:
+#   If _LM_TEST PREV_RAW does not exist:
+#       Create EMPTY _LM_TEST PREV_RAW
+#       Therefore all current RAW rows become INSERTS
+#
+# NEXT RUN:
+#   Compare current RAW against previous _LM_TEST PREV_RAW
 #
 # INSERT:
-#   Key exists in CURRENT RAW but not PREV_RAW
+#   Key exists in CURRENT RAW but not LM_TEST PREV_RAW
 #
 # UPDATE:
 #   Key exists in both
 #   AND CURRENT.LAST_MODIFIED > PREVIOUS.LAST_MODIFIED
 #
 # DELETE:
-#   Key exists in PREV_RAW but not CURRENT RAW
+#   Key exists in LM_TEST PREV_RAW but not CURRENT RAW
+#
+# NO ROW HASH
+# NO THREADPOOL
 #
 # Includes:
 #   - Single table only
@@ -24,8 +37,9 @@
 #   - Final logs
 #   - CST/CDT timestamps
 #   - UTC/GMT timestamps
-#   - PREV_RAW backup snapshot
-#   - Separate test tables
+#   - LM_TEST PREV_RAW
+#   - LM_TEST PREV_RAW snapshot
+#   - Separate LM_TEST staging
 # ==============================================================
 
 
@@ -50,7 +64,6 @@ spark = (
     .appName("SINGLE_TABLE_LAST_MODIFIED_STAGING_TEST")
     .getOrCreate()
 )
-
 
 spark.conf.set(
     "spark.sql.session.timeZone",
@@ -100,7 +113,7 @@ UTC_TZ = pytz.UTC
 
 
 # ==============================================================
-# CHANGE ONLY THESE 3 VALUES
+# TABLE CONFIGURATION
 # ==============================================================
 
 TEST_TABLE = "admission_data"
@@ -109,15 +122,20 @@ KEY_COLUMN = "blank_row_id"
 
 LAST_MODIFIED_COLUMN = "UTCTimestamp"
 
+
 # ==============================================================
 # CONFIGURATION
 # ==============================================================
 
 CATALOG = "MHMR_LAKEHOUSE"
 
-SOURCE_SCHEMA = f"{CATALOG}.RAW"
+SOURCE_SCHEMA = (
+    f"{CATALOG}.RAW"
+)
 
-PREV_SCHEMA = f"{CATALOG}.PREV_RAW"
+PREV_SCHEMA = (
+    f"{CATALOG}.PREV_RAW"
+)
 
 SNAPSHOT_SCHEMA = (
     f"{CATALOG}.PREV_RAW_SNAPSHOT"
@@ -129,16 +147,14 @@ LOG_SCHEMA = "LOGS"
 
 
 # ==============================================================
-# TEST SUFFIX
-#
-# Using TEST tables so normal staging/PREV_RAW are not modified.
+# LM TEST SUFFIX
 # ==============================================================
 
 TEST_SUFFIX = "_LM_TEST"
 
 
 # ==============================================================
-# TEST LOG TABLES
+# SEPARATE LM TEST LOG TABLES
 # ==============================================================
 
 DAILY_LOG_TABLE = (
@@ -165,10 +181,13 @@ SLEEP_BETWEEN_RETRIES = 5
 # RUN ID
 # ==============================================================
 
-RUN_ID = datetime.now(
-    CST_TZ
-).strftime(
-    "%Y%m%d%H%M%S"
+RUN_ID = (
+    datetime.now(
+        CST_TZ
+    )
+    .strftime(
+        "%Y%m%d%H%M%S"
+    )
 )
 
 
@@ -227,7 +246,7 @@ log_schema = T.StructType([
         True
     ),
 
-    # UTC
+    # UTC/GMT
     T.StructField(
         "insert_timestamp_utc",
         T.TimestampType(),
@@ -296,7 +315,7 @@ def raw_object_name(table_name):
 
 
 # ==============================================================
-# TABLE NAME HELPERS
+# SOURCE RAW TABLE
 # ==============================================================
 
 def source_table_name(table_name):
@@ -307,15 +326,12 @@ def source_table_name(table_name):
     )
 
 
-def production_prev_table_name(
-    table_name
-):
-
-    return (
-        f"{PREV_SCHEMA}."
-        f"{raw_object_name(table_name)}"
-    )
-
+# ==============================================================
+# LM TEST PREV_RAW
+#
+# NOTE:
+# NO NORMAL PREV_RAW FUNCTION IS USED.
+# ==============================================================
 
 def test_prev_table_name(
     table_name
@@ -327,6 +343,10 @@ def test_prev_table_name(
         f"{TEST_SUFFIX}"
     )
 
+
+# ==============================================================
+# LM TEST STAGING TABLE
+# ==============================================================
 
 def test_staging_table_name(
     table_name
@@ -342,6 +362,10 @@ def test_staging_table_name(
         f"{TEST_SUFFIX}"
     )
 
+
+# ==============================================================
+# LM TEST PREV_RAW SNAPSHOT
+# ==============================================================
 
 def test_snapshot_table_name(
     table_name
@@ -372,7 +396,9 @@ def table_exists(table_name):
 
             spark.table(
                 table_name
-            ).limit(1).count()
+            ).limit(
+                1
+            ).count()
 
             return True
 
@@ -416,13 +442,12 @@ def normalize_column_name(
 
 
 # ==============================================================
-# NORMALIZE ALL DATAFRAME COLUMNS
+# NORMALIZE ALL COLUMNS
 # ==============================================================
 
 def normalize_columns(df):
 
     new_columns = []
-
     seen = {}
 
     for old_column in df.columns:
@@ -504,11 +529,12 @@ def parse_key_columns(
         for key in key_column.split(",")
 
         if key.strip()
+
     ]
 
 
 # ==============================================================
-# RESOLVE COLUMN CASE-INSENSITIVELY
+# RESOLVE COLUMN CASE INSENSITIVE
 # ==============================================================
 
 def resolve_column(
@@ -525,9 +551,11 @@ def resolve_column(
 
     column_map = {
 
-        column.lower(): column
+        column.lower():
+            column
 
-        for column in df.columns
+        for column
+        in df.columns
 
     }
 
@@ -559,16 +587,20 @@ def validate_keys(
 ):
 
     # ----------------------------------------------------------
-    # Check NULL keys
+    # NULL KEY VALIDATION
     # ----------------------------------------------------------
 
     null_condition = None
 
+
     for key in key_columns:
 
         condition = (
-            F.col(key).isNull()
+            F.col(
+                key
+            ).isNull()
         )
+
 
         if null_condition is None:
 
@@ -585,32 +617,41 @@ def validate_keys(
     if (
         df.where(
             null_condition
-        ).limit(1).count()
+        )
+        .limit(1)
+        .count()
         > 0
     ):
 
         raise Exception(
-            f"{dataframe_name} contains NULL "
-            f"values in key columns: "
+            f"{dataframe_name} contains "
+            f"NULL values in key columns: "
             f"{key_columns}"
         )
 
 
     # ----------------------------------------------------------
-    # Check duplicate keys
+    # DUPLICATE KEY VALIDATION
     # ----------------------------------------------------------
 
     duplicate_exists = (
 
         df
+
         .groupBy(
             *key_columns
         )
+
         .count()
+
         .where(
-            F.col("count") > 1
+            F.col(
+                "count"
+            ) > 1
         )
+
         .limit(1)
+
         .count()
 
     )
@@ -639,13 +680,16 @@ def ensure_log_tables():
     )
 
 
+    # Daily Log
     if not table_exists(
         DAILY_LOG_TABLE
     ):
 
         (
             empty_log_df.write
-            .mode("overwrite")
+            .mode(
+                "overwrite"
+            )
             .option(
                 "overwriteSchema",
                 "true"
@@ -656,13 +700,16 @@ def ensure_log_tables():
         )
 
 
+    # Final Log
     if not table_exists(
         FINAL_LOG_TABLE
     ):
 
         (
             empty_log_df.write
-            .mode("overwrite")
+            .mode(
+                "overwrite"
+            )
             .option(
                 "overwriteSchema",
                 "true"
@@ -689,7 +736,9 @@ def reset_daily_log():
 
     (
         empty_log_df.write
-        .mode("overwrite")
+        .mode(
+            "overwrite"
+        )
         .option(
             "overwriteSchema",
             "true"
@@ -756,22 +805,21 @@ def add_log_row(
 
 
     insert_time_utc = (
-        insert_time_cst
-        .astimezone(
+        insert_time_cst.astimezone(
             UTC_TZ
         )
     )
+
 
     start_time_utc = (
-        start_time_cst
-        .astimezone(
+        start_time_cst.astimezone(
             UTC_TZ
         )
     )
 
+
     end_time_utc = (
-        end_time_cst
-        .astimezone(
+        end_time_cst.astimezone(
             UTC_TZ
         )
     )
@@ -788,7 +836,9 @@ def add_log_row(
             ),
 
         "status":
-            str(status),
+            str(
+                status
+            ),
 
         "count":
             int(
@@ -799,6 +849,7 @@ def add_log_row(
 
         "error_message":
             error_message,
+
 
         # CST/CDT
         "insert_timestamp":
@@ -816,7 +867,8 @@ def add_log_row(
                 tzinfo=None
             ),
 
-        # UTC
+
+        # UTC/GMT
         "insert_timestamp_utc":
             insert_time_utc.replace(
                 tzinfo=None
@@ -831,6 +883,7 @@ def add_log_row(
             end_time_utc.replace(
                 tzinfo=None
             ),
+
 
         "load_type":
             "LAST_MODIFIED_TEST"
@@ -848,20 +901,26 @@ def add_log_row(
 
 def write_daily_logs():
 
-    if len(LOG_ROWS) == 0:
+    if len(
+        LOG_ROWS
+    ) == 0:
 
         return
 
 
-    log_df = spark.createDataFrame(
-        LOG_ROWS,
-        log_schema
+    log_df = (
+        spark.createDataFrame(
+            LOG_ROWS,
+            log_schema
+        )
     )
 
 
     (
         log_df.write
-        .mode("append")
+        .mode(
+            "append"
+        )
         .option(
             "mergeSchema",
             "true"
@@ -873,23 +932,30 @@ def write_daily_logs():
 
 
 # ==============================================================
-# MOVE DAILY LOG -> FINAL LOG
+# DAILY LOG -> FINAL LOG
 # ==============================================================
 
 def consolidate_logs():
 
-    daily_df = spark.table(
-        DAILY_LOG_TABLE
+    daily_df = (
+        spark.table(
+            DAILY_LOG_TABLE
+        )
     )
 
 
-    if daily_df.limit(
-        1
-    ).count() > 0:
+    if (
+        daily_df
+        .limit(1)
+        .count()
+        > 0
+    ):
 
         (
             daily_df.write
-            .mode("append")
+            .mode(
+                "append"
+            )
             .option(
                 "mergeSchema",
                 "true"
@@ -904,7 +970,21 @@ def consolidate_logs():
 
 
 # ==============================================================
-# INITIALIZE TEST PREV_RAW
+# INITIALIZE LM TEST PREV_RAW
+#
+# IMPORTANT CHANGE:
+#
+# 1. Check ONLY LM_TEST PREV_RAW.
+#
+# 2. If LM_TEST PREV_RAW exists:
+#       use it.
+#
+# 3. If LM_TEST PREV_RAW does NOT exist:
+#       create EMPTY table using RAW schema.
+#
+# 4. DO NOT CHECK NORMAL PREV_RAW.
+# 5. DO NOT COPY NORMAL PREV_RAW.
+#
 # ==============================================================
 
 def initialize_test_prev(
@@ -920,15 +1000,10 @@ def initialize_test_prev(
     )
 
 
-    production_prev = (
-        production_prev_table_name(
-            table_name
-        )
-    )
-
-
     # ----------------------------------------------------------
-    # Already exists from previous test run
+    # LM_TEST PREV_RAW EXISTS
+    #
+    # Use previous LM test state.
     # ----------------------------------------------------------
 
     if table_exists(
@@ -936,96 +1011,73 @@ def initialize_test_prev(
     ):
 
         print(
-            f"Using existing TEST PREV_RAW:"
+            "\nLM TEST PREV_RAW already exists."
         )
 
         print(
-            test_prev
+            f"Using: {test_prev}"
         )
 
         return
 
 
     # ----------------------------------------------------------
-    # Copy production PREV_RAW as baseline
-    # ----------------------------------------------------------
-
-    if table_exists(
-        production_prev
-    ):
-
-        print(
-            "\nInitializing TEST PREV_RAW "
-            "from existing PREV_RAW..."
-        )
-
-        print(
-            f"Baseline: {production_prev}"
-        )
-
-
-        previous_df = normalize_columns(
-            spark.table(
-                production_prev
-            )
-        )
-
-
-        (
-            previous_df.write
-            .mode("overwrite")
-            .option(
-                "overwriteSchema",
-                "true"
-            )
-            .saveAsTable(
-                test_prev
-            )
-        )
-
-
-        print(
-            f"Created: {test_prev}"
-        )
-
-
-    # ----------------------------------------------------------
-    # No PREV_RAW exists
+    # LM_TEST PREV_RAW DOES NOT EXIST
     #
-    # Create empty table with current RAW schema.
-    # First run = all inserts.
+    # Create EMPTY table.
+    #
+    # IMPORTANT:
+    # NORMAL PREV_RAW IS NOT CHECKED.
+    # NORMAL PREV_RAW IS NOT COPIED.
     # ----------------------------------------------------------
 
-    else:
+    print(
+        "\nLM TEST PREV_RAW does not exist."
+    )
 
-        print(
-            "\nProduction PREV_RAW does not exist."
+    print(
+        "Creating EMPTY LM TEST PREV_RAW."
+    )
+
+    print(
+        "Normal PREV_RAW will NOT be used."
+    )
+
+
+    (
+        current_df
+        .limit(0)
+        .write
+        .mode(
+            "overwrite"
         )
-
-        print(
-            "Creating EMPTY TEST PREV_RAW."
+        .option(
+            "overwriteSchema",
+            "true"
         )
-
-
-        (
-            current_df
-            .limit(0)
-            .write
-            .mode("overwrite")
-            .option(
-                "overwriteSchema",
-                "true"
-            )
-            .saveAsTable(
-                test_prev
-            )
+        .saveAsTable(
+            test_prev
         )
+    )
 
 
-        print(
-            "First run will classify "
-            "all current RAW rows as INSERT."
-        )
+    print(
+        f"Created EMPTY LM TEST PREV_RAW:"
+    )
+
+    print(
+        test_prev
+    )
+
+
+    print(
+        "\nFIRST RUN:"
+    )
+
+    print(
+        "All current RAW rows will be "
+        "classified as INSERT."
+    )
 
 
 # ==============================================================
@@ -1074,7 +1126,9 @@ def align_current_previous(
     }
 
 
-    # Add missing columns to CURRENT
+    # ----------------------------------------------------------
+    # ADD MISSING COLUMNS TO CURRENT
+    # ----------------------------------------------------------
 
     for column in all_columns:
 
@@ -1088,8 +1142,7 @@ def align_current_previous(
             )
 
             current_df = (
-                current_df
-                .withColumn(
+                current_df.withColumn(
                     column,
                     F.lit(None).cast(
                         data_type
@@ -1098,7 +1151,9 @@ def align_current_previous(
             )
 
 
-    # Add missing columns to PREVIOUS
+    # ----------------------------------------------------------
+    # ADD MISSING COLUMNS TO PREVIOUS
+    # ----------------------------------------------------------
 
     for column in all_columns:
 
@@ -1112,8 +1167,7 @@ def align_current_previous(
             )
 
             previous_df = (
-                previous_df
-                .withColumn(
+                previous_df.withColumn(
                     column,
                     F.lit(None).cast(
                         data_type
@@ -1122,12 +1176,17 @@ def align_current_previous(
             )
 
 
-    current_df = current_df.select(
-        all_columns
+    current_df = (
+        current_df.select(
+            all_columns
+        )
     )
 
-    previous_df = previous_df.select(
-        all_columns
+
+    previous_df = (
+        previous_df.select(
+            all_columns
+        )
     )
 
 
@@ -1169,9 +1228,7 @@ def build_key_join_condition(
 
         if join_condition is None:
 
-            join_condition = (
-                condition
-            )
+            join_condition = condition
 
         else:
 
@@ -1202,7 +1259,10 @@ def align_for_union(
 
         for field in df.schema.fields:
 
-            if field.name not in all_columns:
+            if (
+                field.name
+                not in all_columns
+            ):
 
                 all_columns.append(
                     field.name
@@ -1246,7 +1306,7 @@ def align_for_union(
 
 # ==============================================================
 # CHANGE DETECTION
-# LAST_MODIFIED BASED
+# USING LAST_MODIFIED TIMESTAMP
 # ==============================================================
 
 def build_changes(
@@ -1261,17 +1321,22 @@ def build_changes(
     # NORMALIZE
     # ==========================================================
 
-    current_df = normalize_columns(
-        current_df
+    current_df = (
+        normalize_columns(
+            current_df
+        )
     )
 
-    previous_df = normalize_columns(
-        previous_df
+
+    previous_df = (
+        normalize_columns(
+            previous_df
+        )
     )
 
 
     # ==========================================================
-    # RESOLVE KEY COLUMNS
+    # RESOLVE KEYS
     # ==========================================================
 
     requested_keys = (
@@ -1281,7 +1346,9 @@ def build_changes(
     )
 
 
-    if len(requested_keys) == 0:
+    if len(
+        requested_keys
+    ) == 0:
 
         raise Exception(
             "KEY_COLUMN cannot be empty."
@@ -1300,6 +1367,7 @@ def build_changes(
             )
         )
 
+
         previous_key = (
             resolve_column(
                 previous_df,
@@ -1308,7 +1376,11 @@ def build_changes(
         )
 
 
-        if current_key != previous_key:
+        if (
+            current_key
+            !=
+            previous_key
+        ):
 
             previous_df = (
                 previous_df
@@ -1325,7 +1397,7 @@ def build_changes(
 
 
     # ==========================================================
-    # RESOLVE LAST MODIFIED
+    # RESOLVE LAST MODIFIED COLUMN
     # ==========================================================
 
     current_last_modified = (
@@ -1346,7 +1418,8 @@ def build_changes(
 
     if (
         current_last_modified
-        != previous_last_modified
+        !=
+        previous_last_modified
     ):
 
         previous_df = (
@@ -1368,6 +1441,7 @@ def build_changes(
         f"{resolved_keys}"
     )
 
+
     print(
         f"Resolved Last Modified: "
         f"{resolved_last_modified}"
@@ -1388,7 +1462,7 @@ def build_changes(
 
 
     # ==========================================================
-    # VALIDATE KEYS
+    # VALIDATE CURRENT KEYS
     # ==========================================================
 
     validate_keys(
@@ -1398,21 +1472,29 @@ def build_changes(
     )
 
 
-    # Empty PREV is valid.
-    if previous_df.limit(
-        1
-    ).count() > 0:
+    # ==========================================================
+    # VALIDATE PREVIOUS KEYS
+    #
+    # Skip validation when PREV is empty.
+    # ==========================================================
+
+    if (
+        previous_df
+        .limit(1)
+        .count()
+        > 0
+    ):
 
         validate_keys(
             previous_df,
             resolved_keys,
-            "PREVIOUS RAW"
+            "LM TEST PREV_RAW"
         )
 
 
     # ==========================================================
-    # VALIDATE LAST_MODIFIED CONVERSION
-    # ==========================================================
+    # VALIDATE LAST_MODIFIED
+    # ==============================================================
 
     invalid_current_timestamp = (
 
@@ -1427,18 +1509,24 @@ def build_changes(
         .where(
             F.col(
                 resolved_last_modified
-            ).cast(
+            )
+            .cast(
                 "timestamp"
-            ).isNull()
+            )
+            .isNull()
         )
 
         .limit(1)
 
         .count()
+
     )
 
 
-    if invalid_current_timestamp > 0:
+    if (
+        invalid_current_timestamp
+        > 0
+    ):
 
         raise Exception(
             f"Some values in "
@@ -1452,11 +1540,16 @@ def build_changes(
     # ==========================================================
 
     current_alias = (
-        current_df.alias("c")
+        current_df.alias(
+            "c"
+        )
     )
 
+
     previous_alias = (
-        previous_df.alias("p")
+        previous_df.alias(
+            "p"
+        )
     )
 
 
@@ -1470,7 +1563,10 @@ def build_changes(
     # ==========================================================
     # INSERTS
     #
-    # CURRENT key does not exist in PREVIOUS
+    # Current key doesn't exist in LM_TEST PREV.
+    #
+    # FIRST RUN:
+    # PREV is empty, therefore every RAW row becomes I.
     # ==========================================================
 
     inserts_df = (
@@ -1487,7 +1583,9 @@ def build_changes(
             *[
                 F.col(
                     f"c.`{column}`"
-                ).alias(column)
+                ).alias(
+                    column
+                )
 
                 for column
                 in current_df.columns
@@ -1496,7 +1594,9 @@ def build_changes(
 
         .withColumn(
             "STATUS",
-            F.lit("I")
+            F.lit(
+                "I"
+            )
         )
 
         .withColumn(
@@ -1509,12 +1609,7 @@ def build_changes(
     # ==========================================================
     # DELETES
     #
-    # PREVIOUS key does not exist in CURRENT
-    #
-    # IMPORTANT:
-    # LastModified cannot identify a hard delete,
-    # because deleted row no longer exists in CURRENT.
-    # Key comparison is required.
+    # Previous key doesn't exist in CURRENT RAW.
     # ==========================================================
 
     deletes_df = (
@@ -1531,7 +1626,9 @@ def build_changes(
             *[
                 F.col(
                     f"p.`{column}`"
-                ).alias(column)
+                ).alias(
+                    column
+                )
 
                 for column
                 in previous_df.columns
@@ -1540,7 +1637,9 @@ def build_changes(
 
         .withColumn(
             "STATUS",
-            F.lit("D")
+            F.lit(
+                "D"
+            )
         )
 
         .withColumn(
@@ -1551,13 +1650,7 @@ def build_changes(
 
 
     # ==========================================================
-    # UPDATES
-    #
-    # Same key exists in both.
-    #
-    # CURRENT LAST_MODIFIED
-    # >
-    # PREVIOUS LAST_MODIFIED
+    # UPDATE TIMESTAMP EXPRESSIONS
     # ==========================================================
 
     current_lm = (
@@ -1584,10 +1677,20 @@ def build_changes(
     )
 
 
-    update_condition = (
+    # ==========================================================
+    # UPDATE CONDITION
+    #
+    # Same key AND:
+    #
+    # Current LM > Previous LM
+    #
+    # OR
+    #
+    # Previous LM NULL
+    # Current LM not NULL
+    # ==========================================================
 
-        # Previous timestamp NULL,
-        # but current has timestamp
+    update_condition = (
 
         (
             previous_lm.isNull()
@@ -1596,8 +1699,6 @@ def build_changes(
         )
 
         |
-
-        # Normal comparison
 
         (
             previous_lm.isNotNull()
@@ -1610,9 +1711,12 @@ def build_changes(
                 previous_lm
             )
         )
-
     )
 
+
+    # ==========================================================
+    # UPDATES
+    # ==========================================================
 
     updates_df = (
 
@@ -1632,7 +1736,9 @@ def build_changes(
             *[
                 F.col(
                     f"c.`{column}`"
-                ).alias(column)
+                ).alias(
+                    column
+                )
 
                 for column
                 in current_df.columns
@@ -1641,7 +1747,9 @@ def build_changes(
 
         .withColumn(
             "STATUS",
-            F.lit("U")
+            F.lit(
+                "U"
+            )
         )
 
         .withColumn(
@@ -1669,7 +1777,7 @@ def build_changes(
 
 
     # ==========================================================
-    # COMBINE
+    # FINAL CHANGES
     # ==========================================================
 
     changes_df = (
@@ -1697,7 +1805,7 @@ def build_changes(
 
 
 # ==============================================================
-# PREV RAW SNAPSHOT
+# WRITE LM TEST PREV_RAW SNAPSHOT
 # ==============================================================
 
 def write_prev_snapshot(
@@ -1714,7 +1822,7 @@ def write_prev_snapshot(
 
 
     # ----------------------------------------------------------
-    # Prevent duplicate snapshot rows if same run retries
+    # RETRY PROTECTION
     # ----------------------------------------------------------
 
     if table_exists(
@@ -1746,6 +1854,10 @@ def write_prev_snapshot(
             )
 
 
+    # ----------------------------------------------------------
+    # SNAPSHOT OLD LM TEST PREV
+    # ----------------------------------------------------------
+
     snapshot_df = (
 
         previous_df
@@ -1771,7 +1883,9 @@ def write_prev_snapshot(
 
     (
         snapshot_df.write
-        .mode("append")
+        .mode(
+            "append"
+        )
         .option(
             "mergeSchema",
             "true"
@@ -1793,8 +1907,10 @@ def process_single_table(
 ):
 
 
-    start_time = datetime.now(
-        CST_TZ
+    start_time = (
+        datetime.now(
+            CST_TZ
+        )
     )
 
 
@@ -1832,7 +1948,7 @@ def process_single_table(
     )
 
     print(
-        "SINGLE TABLE LAST MODIFIED STAGING TEST"
+        "SINGLE TABLE LAST MODIFIED TEST"
     )
 
     print(
@@ -1840,39 +1956,43 @@ def process_single_table(
     )
 
     print(
-        f"Table          : {table_name}"
+        f"TABLE             : {table_name}"
     )
 
     print(
-        f"RAW            : {source_table}"
+        f"CURRENT RAW       : {source_table}"
     )
 
     print(
-        f"TEST PREV_RAW  : {previous_table}"
+        f"LM TEST PREV_RAW  : {previous_table}"
     )
 
     print(
-        f"TEST STAGING   : {staging_table}"
+        f"LM TEST STAGING   : {staging_table}"
     )
 
     print(
-        f"TEST SNAPSHOT  : {snapshot_table}"
+        f"LM TEST SNAPSHOT  : {snapshot_table}"
     )
 
     print(
-        f"Key            : {key_column}"
+        f"KEY               : {key_column}"
     )
 
     print(
-        f"Last Modified  : {last_modified_column}"
+        f"LAST MODIFIED     : {last_modified_column}"
     )
 
     print(
-        "Row Hash       : NOT USED"
+        "NORMAL PREV_RAW   : NOT USED"
     )
 
     print(
-        "ThreadPool     : NOT USED"
+        "ROW HASH          : NOT USED"
+    )
+
+    print(
+        "THREADPOOL        : NOT USED"
     )
 
     print(
@@ -1898,15 +2018,28 @@ def process_single_table(
     # READ CURRENT RAW
     # ==========================================================
 
-    current_df = normalize_columns(
-        spark.table(
-            source_table
+    current_df = (
+        normalize_columns(
+            spark.table(
+                source_table
+            )
         )
     )
 
 
+    current_raw_count = (
+        current_df.count()
+    )
+
+
+    print(
+        f"\nCURRENT RAW COUNT: "
+        f"{current_raw_count}"
+    )
+
+
     # ==========================================================
-    # CHECK KEY EXISTS
+    # CHECK KEY
     # ==========================================================
 
     requested_keys = (
@@ -1916,7 +2049,9 @@ def process_single_table(
     )
 
 
-    if len(requested_keys) == 0:
+    if len(
+        requested_keys
+    ) == 0:
 
         raise Exception(
             "KEY_COLUMN is empty."
@@ -1932,7 +2067,7 @@ def process_single_table(
 
 
     # ==========================================================
-    # CHECK LAST MODIFIED EXISTS
+    # CHECK LAST MODIFIED
     # ==========================================================
 
     resolve_column(
@@ -1942,7 +2077,10 @@ def process_single_table(
 
 
     # ==========================================================
-    # INITIALIZE TEST PREV
+    # INITIALIZE LM TEST PREV
+    #
+    # IMPORTANT:
+    # THIS NEVER READS NORMAL PREV_RAW.
     # ==========================================================
 
     initialize_test_prev(
@@ -1952,13 +2090,26 @@ def process_single_table(
 
 
     # ==========================================================
-    # READ TEST PREV
+    # READ ONLY LM TEST PREV
     # ==========================================================
 
-    previous_df = normalize_columns(
-        spark.table(
-            previous_table
+    previous_df = (
+        normalize_columns(
+            spark.table(
+                previous_table
+            )
         )
+    )
+
+
+    previous_count = (
+        previous_df.count()
+    )
+
+
+    print(
+        f"LM TEST PREV COUNT BEFORE PROCESSING: "
+        f"{previous_count}"
     )
 
 
@@ -1986,12 +2137,14 @@ def process_single_table(
 
 
     # ==========================================================
-    # WRITE STAGING
-    # ==============================================================
+    # WRITE LM TEST STAGING
+    # ==========================================================
 
     (
         changes_df.write
-        .mode("overwrite")
+        .mode(
+            "overwrite"
+        )
         .option(
             "overwriteSchema",
             "true"
@@ -2003,11 +2156,13 @@ def process_single_table(
 
 
     # ==========================================================
-    # READ WRITTEN STAGING FOR COUNTS
+    # READ STAGING COUNTS
     # ==========================================================
 
-    staging_df = spark.table(
-        staging_table
+    staging_df = (
+        spark.table(
+            staging_table
+        )
     )
 
 
@@ -2020,20 +2175,28 @@ def process_single_table(
         )
 
         .agg(
-            F.count("*").alias(
+            F.count(
+                "*"
+            )
+            .alias(
                 "record_count"
             )
         )
 
         .collect()
+
     )
 
 
     counts = {
 
-        row["STATUS"]:
+        row[
+            "STATUS"
+        ]:
             int(
-                row["record_count"]
+                row[
+                    "record_count"
+                ]
             )
 
         for row
@@ -2042,19 +2205,27 @@ def process_single_table(
     }
 
 
-    insert_count = counts.get(
-        "I",
-        0
+    insert_count = (
+        counts.get(
+            "I",
+            0
+        )
     )
 
-    update_count = counts.get(
-        "U",
-        0
+
+    update_count = (
+        counts.get(
+            "U",
+            0
+        )
     )
 
-    delete_count = counts.get(
-        "D",
-        0
+
+    delete_count = (
+        counts.get(
+            "D",
+            0
+        )
     )
 
 
@@ -2065,11 +2236,12 @@ def process_single_table(
         update_count
         +
         delete_count
+
     )
 
 
     # ==========================================================
-    # GET MAX LAST MODIFIED FROM CURRENT RAW
+    # MAX LAST MODIFIED
     # ==========================================================
 
     max_last_modified = (
@@ -2077,12 +2249,16 @@ def process_single_table(
         aligned_current_df
 
         .select(
+
             F.max(
+
                 F.col(
                     resolved_last_modified
-                ).cast(
+                )
+                .cast(
                     "timestamp"
                 )
+
             ).alias(
                 "max_last_modified"
             )
@@ -2095,7 +2271,7 @@ def process_single_table(
 
 
     # ==========================================================
-    # DISPLAY COUNTS
+    # COUNTS
     # ==========================================================
 
     print(
@@ -2103,26 +2279,48 @@ def process_single_table(
         "================ CHANGE COUNTS ================="
     )
 
-    print(
-        f"INSERT COUNT : {insert_count}"
-    )
 
     print(
-        f"UPDATE COUNT : {update_count}"
+        f"CURRENT RAW COUNT : "
+        f"{current_raw_count}"
     )
 
-    print(
-        f"DELETE COUNT : {delete_count}"
-    )
 
     print(
-        f"TOTAL CHANGE : {total_change_count}"
+        f"PREV COUNT        : "
+        f"{previous_count}"
     )
+
+
+    print(
+        f"INSERT COUNT      : "
+        f"{insert_count}"
+    )
+
+
+    print(
+        f"UPDATE COUNT      : "
+        f"{update_count}"
+    )
+
+
+    print(
+        f"DELETE COUNT      : "
+        f"{delete_count}"
+    )
+
+
+    print(
+        f"TOTAL CHANGE      : "
+        f"{total_change_count}"
+    )
+
 
     print(
         f"MAX LAST MODIFIED : "
         f"{max_last_modified}"
     )
+
 
     print(
         "================================================"
@@ -2130,10 +2328,8 @@ def process_single_table(
 
 
     # ==========================================================
-    # SNAPSHOT OLD TEST PREV RAW
-    #
-    # Snapshot BEFORE replacing PREV_RAW.
-    # ==========================================================
+    # SNAPSHOT OLD LM TEST PREV
+    # ==============================================================
 
     write_prev_snapshot(
         table_name,
@@ -2142,15 +2338,18 @@ def process_single_table(
 
 
     # ==========================================================
-    # UPDATE TEST PREV_RAW
+    # UPDATE LM TEST PREV_RAW
     #
-    # Current RAW becomes next run's PREV_RAW.
-    # Production PREV_RAW remains untouched.
+    # CURRENT RAW BECOMES NEXT RUN'S PREVIOUS DATA.
+    #
+    # NORMAL PREV_RAW IS NOT TOUCHED.
     # ==========================================================
 
     (
         aligned_current_df.write
-        .mode("overwrite")
+        .mode(
+            "overwrite"
+        )
         .option(
             "overwriteSchema",
             "true"
@@ -2161,13 +2360,32 @@ def process_single_table(
     )
 
 
-    end_time = datetime.now(
-        CST_TZ
+    updated_prev_count = (
+        spark.table(
+            previous_table
+        ).count()
+    )
+
+
+    print(
+        f"\nLM TEST PREV COUNT AFTER UPDATE: "
+        f"{updated_prev_count}"
     )
 
 
     # ==========================================================
-    # SUCCESS LOGS
+    # END TIME
+    # ==========================================================
+
+    end_time = (
+        datetime.now(
+            CST_TZ
+        )
+    )
+
+
+    # ==========================================================
+    # LOG INSERTS
     # ==========================================================
 
     add_log_row(
@@ -2185,6 +2403,10 @@ def process_single_table(
     )
 
 
+    # ==========================================================
+    # LOG UPDATES
+    # ==========================================================
+
     add_log_row(
 
         table_name=table_name,
@@ -2200,6 +2422,10 @@ def process_single_table(
     )
 
 
+    # ==========================================================
+    # LOG DELETES
+    # ==========================================================
+
     add_log_row(
 
         table_name=table_name,
@@ -2214,6 +2440,10 @@ def process_single_table(
 
     )
 
+
+    # ==========================================================
+    # RETURN
+    # ==========================================================
 
     return {
 
@@ -2285,13 +2515,14 @@ def process_with_retry(
             result = (
                 process_single_table(
 
-                    table_name=table_name,
+                    table_name=
+                        table_name,
 
-                    key_column=key_column,
+                    key_column=
+                        key_column,
 
-                    last_modified_column=(
+                    last_modified_column=
                         last_modified_column
-                    )
 
                 )
             )
@@ -2299,7 +2530,7 @@ def process_with_retry(
 
             print(
                 f"\nSUCCESS - "
-                f"Attempt {attempt}"
+                f"ATTEMPT {attempt}"
             )
 
 
@@ -2308,7 +2539,12 @@ def process_with_retry(
 
         except Exception as e:
 
-            last_error = str(e)
+
+            last_error = (
+                str(
+                    e
+                )
+            )
 
 
             print(
@@ -2317,11 +2553,13 @@ def process_with_retry(
             )
 
             print(
-                f"FAILED ATTEMPT: {attempt}"
+                f"FAILED ATTEMPT: "
+                f"{attempt}"
             )
 
             print(
-                f"ERROR: {last_error}"
+                f"ERROR: "
+                f"{last_error}"
             )
 
             print(
@@ -2332,11 +2570,16 @@ def process_with_retry(
             traceback.print_exc()
 
 
-            if attempt < MAX_RETRIES:
+            if (
+                attempt
+                <
+                MAX_RETRIES
+            ):
 
                 print(
                     f"\nRetrying after "
-                    f"{SLEEP_BETWEEN_RETRIES} seconds..."
+                    f"{SLEEP_BETWEEN_RETRIES} "
+                    f"seconds..."
                 )
 
 
@@ -2346,31 +2589,39 @@ def process_with_retry(
 
 
     # ==========================================================
-    # AFTER ALL RETRIES FAILED
+    # FINAL FAILURE
     # ==========================================================
 
-    failure_time = datetime.now(
-        CST_TZ
+    failure_time = (
+        datetime.now(
+            CST_TZ
+        )
     )
 
 
     add_log_row(
 
-        table_name=table_name,
+        table_name=
+            table_name,
 
-        status="FAILED",
+        status=
+            "FAILED",
 
-        count_value=0,
+        count_value=
+            0,
 
-        start_time=failure_time,
+        start_time=
+            failure_time,
 
-        end_time=failure_time,
+        end_time=
+            failure_time,
 
-        error_message=(
-            f"Failed after "
-            f"{MAX_RETRIES} attempts. "
-            f"{last_error}"
-        )[:4000]
+        error_message=
+            (
+                f"Failed after "
+                f"{MAX_RETRIES} attempts. "
+                f"{last_error}"
+            )[:4000]
 
     )
 
@@ -2405,6 +2656,7 @@ def process_with_retry(
 
         "error":
             last_error
+
     }
 
 
@@ -2416,7 +2668,7 @@ def run_last_modified_test():
 
 
     # ==========================================================
-    # CREATE REQUIRED SCHEMAS
+    # ENSURE SCHEMAS
     # ==========================================================
 
     ensure_schema(
@@ -2437,14 +2689,14 @@ def run_last_modified_test():
 
 
     # ==========================================================
-    # CREATE LOG TABLES
+    # ENSURE TEST LOG TABLES
     # ==========================================================
 
     ensure_log_tables()
 
 
     # ==========================================================
-    # RESET DAILY TEST LOG
+    # RESET DAILY LOG
     # ==========================================================
 
     reset_daily_log()
@@ -2464,34 +2716,35 @@ def run_last_modified_test():
     result = (
         process_with_retry(
 
-            table_name=TEST_TABLE,
+            table_name=
+                TEST_TABLE,
 
-            key_column=KEY_COLUMN,
+            key_column=
+                KEY_COLUMN,
 
-            last_modified_column=(
+            last_modified_column=
                 LAST_MODIFIED_COLUMN
-            )
 
         )
     )
 
 
     # ==========================================================
-    # WRITE DAILY LOGS
+    # WRITE LOGS
     # ==========================================================
 
     write_daily_logs()
 
 
     # ==========================================================
-    # DAILY -> FINAL LOG
+    # DAILY -> FINAL
     # ==========================================================
 
     consolidate_logs()
 
 
     # ==========================================================
-    # CREATE FINAL RESULT DF
+    # RESULT DATAFRAME
     # ==========================================================
 
     result_df = (
@@ -2511,7 +2764,7 @@ def run_last_modified_test():
     )
 
     print(
-        "FINAL RESULT"
+        "FINAL LAST MODIFIED TEST RESULT"
     )
 
     print(
@@ -2525,7 +2778,7 @@ def run_last_modified_test():
 
 
     # ==========================================================
-    # SHOW STAGING COUNTS
+    # STAGING COUNTS
     # ==========================================================
 
     staging_table = (
@@ -2567,17 +2820,17 @@ def run_last_modified_test():
 
 
     # ==========================================================
-    # DISPLAY CREATED TABLE NAMES
+    # DISPLAY OBJECTS
     # ==========================================================
 
     print(
         "\n"
-        "================ TEST TABLES ===================="
+        "================ LM TEST OBJECTS ================"
     )
 
 
     print(
-        f"RAW:"
+        "\nCURRENT RAW:"
     )
 
     print(
@@ -2588,7 +2841,7 @@ def run_last_modified_test():
 
 
     print(
-        "\nTEST STAGING:"
+        "\nLM TEST STAGING:"
     )
 
     print(
@@ -2599,7 +2852,7 @@ def run_last_modified_test():
 
 
     print(
-        "\nTEST PREV_RAW:"
+        "\nLM TEST PREV_RAW:"
     )
 
     print(
@@ -2610,7 +2863,7 @@ def run_last_modified_test():
 
 
     print(
-        "\nTEST PREV_RAW SNAPSHOT:"
+        "\nLM TEST PREV_RAW SNAPSHOT:"
     )
 
     print(
@@ -2621,11 +2874,29 @@ def run_last_modified_test():
 
 
     print(
-        "\nTEST FINAL LOG:"
+        "\nLM TEST DAILY LOG:"
+    )
+
+    print(
+        DAILY_LOG_TABLE
+    )
+
+
+    print(
+        "\nLM TEST FINAL LOG:"
     )
 
     print(
         FINAL_LOG_TABLE
+    )
+
+
+    print(
+        "\nNORMAL PREV_RAW:"
+    )
+
+    print(
+        "NOT READ / NOT USED / NOT MODIFIED"
     )
 
 

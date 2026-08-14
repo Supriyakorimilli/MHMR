@@ -1,19 +1,41 @@
 # ==============================================================
-# STAGING LOAD — SINGLE TABLE ROW HASH TEST
+# STAGING LOAD — SINGLE TABLE ROW HASH DAILY RUN
+#
+# DAILY PRODUCTION-STYLE TEST
 #
 # RAW vs PREV_RAW Change Detection
-# + ROW HASH
+# + Corrected ROW HASH
+# + Existing ROW_HASH excluded from new hash
+# + Datatype alignment
+# + Deterministic hash column order
+# + Canonical JSON hash
 # + Retry Mechanism
 # + ThreadPoolExecutor
 # + Staging Daily/Final Logs
 # + PREV_RAW_SNAPSHOT Backup Before PREV_RAW Overwrite
-# + Existing Log Timestamps in CST/CDT
-# + Additional Log Timestamps in UTC/GMT
+# + CST/CDT Log Timestamps
+# + UTC/GMT Log Timestamps
 #
-# TEST OUTPUTS USE:
-#     _rowhash_test
+# DAILY FLOW:
 #
-# RAW SOURCE REMAINS UNCHANGED
+# TODAY RAW
+#       |
+#       v
+# Compare against PREV_RAW
+#       |
+#       +---- I
+#       +---- U
+#       +---- D
+#       |
+#       v
+# STAGING
+#       |
+# Snapshot OLD PREV_RAW
+#       |
+#       v
+# TODAY RAW becomes NEW PREV_RAW
+#
+# NO SNAPSHOT RESTORE DURING DAILY RUN
 # ==============================================================
 
 
@@ -22,7 +44,6 @@
 # ==============================================================
 
 from pyspark.sql import SparkSession, functions as F, types as T
-from pyspark.sql.utils import AnalysisException
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import pytz
@@ -37,12 +58,10 @@ import re
 
 spark = (
     SparkSession.builder
-    .appName("STAGING_SINGLE_TABLE_ROW_HASH_TEST")
+    .appName("STAGING_SINGLE_TABLE_ROW_HASH_DAILY")
     .getOrCreate()
 )
 
-
-# Keep Spark session timezone in America/Chicago
 spark.conf.set(
     "spark.sql.session.timeZone",
     "America/Chicago"
@@ -83,12 +102,10 @@ spark.conf.set(
 # TIMEZONES
 # ==============================================================
 
-# CST/CDT
 tz = pytz.timezone(
     "America/Chicago"
 )
 
-# UTC/GMT
 utc_tz = pytz.UTC
 
 
@@ -97,7 +114,6 @@ utc_tz = pytz.UTC
 # ==============================================================
 
 CATALOG = "MHMR_LAKEHOUSE"
-
 
 SOURCE_SCHEMA = (
     f"{CATALOG}.RAW"
@@ -111,21 +127,20 @@ SNAPSHOT_SCHEMA = (
     f"{CATALOG}.PREV_RAW_SNAPSHOT"
 )
 
-
 STAGING_SCHEMA = "STAGING"
 
 LOG_SCHEMA = "LOGS"
 
 
 # ==============================================================
-# ROW HASH TEST SUFFIX
+# TEST / DAILY TABLE SUFFIX
 # ==============================================================
 
 TEST_SUFFIX = "_rowhash_test"
 
 
 # ==============================================================
-# TEST LOG TABLES
+# LOG TABLES
 # ==============================================================
 
 STAGING_DAILY_LOG_TBL = (
@@ -141,15 +156,22 @@ STAGING_FINAL_LOG_TBL = (
 # THREADPOOL / RETRY
 # ==============================================================
 
-# One table only, so one worker is enough.
-# ThreadPool architecture is still retained.
 MAX_WORKERS = 1
 
 MAX_RETRIES = 2
 
 
 # ==============================================================
-# SNAPSHOT RUN ID
+# SINGLE TABLE
+# ==============================================================
+
+TEST_TABLE = "admission_data"
+
+TEST_KEY_COLUMN = "blank_row_id"
+
+
+# ==============================================================
+# RUN ID
 # ==============================================================
 
 RUN_ID = datetime.now(
@@ -157,15 +179,6 @@ RUN_ID = datetime.now(
 ).strftime(
     "%Y%m%d%H%M%S"
 )
-
-
-# ==============================================================
-# SINGLE TEST TABLE
-# ==============================================================
-
-TEST_TABLE = "admission_data"
-
-TEST_KEY_COLUMN = "blank_row_id"
 
 
 # ==============================================================
@@ -204,10 +217,7 @@ staging_log_schema = T.StructType([
         True
     ),
 
-    # ==========================================================
-    # CST/CDT LOG COLUMNS
-    # ==========================================================
-
+    # CST/CDT
     T.StructField(
         "insert_timestamp",
         T.TimestampType(),
@@ -226,10 +236,7 @@ staging_log_schema = T.StructType([
         True
     ),
 
-    # ==========================================================
-    # UTC/GMT LOG COLUMNS
-    # ==========================================================
-
+    # UTC/GMT
     T.StructField(
         "insert_timestamp_utc",
         T.TimestampType(),
@@ -266,12 +273,10 @@ LOG_LOCK = threading.Lock()
 
 
 # ==============================================================
-# TABLE NAME HELPERS
+# CLEAN TABLE NAME
 # ==============================================================
 
-def clean_table_name(
-    table: str
-) -> str:
+def clean_table_name(table):
 
     table = str(
         table
@@ -287,14 +292,10 @@ def clean_table_name(
 
 
 # ==============================================================
-# RAW SOURCE TABLE
-#
-# NO TEST SUFFIX HERE
+# RAW TABLE
 # ==============================================================
 
-def src_tbl(
-    table: str
-) -> str:
+def src_tbl(table):
 
     table = str(
         table
@@ -314,15 +315,10 @@ def src_tbl(
 
 
 # ==============================================================
-# STAGING TEST TABLE
-#
-# Example:
-# STAGING.stg_admission_data_rowhash_test
+# STAGING TABLE
 # ==============================================================
 
-def stg_tbl(
-    table: str
-) -> str:
+def stg_tbl(table):
 
     table = clean_table_name(
         table
@@ -335,16 +331,10 @@ def stg_tbl(
 
 
 # ==============================================================
-# PREV_RAW TEST TABLE
-#
-# Example:
-# MHMR_LAKEHOUSE.PREV_RAW.
-# admission_data_RAW_rowhash_test
+# PREV_RAW TABLE
 # ==============================================================
 
-def prev_tbl(
-    table: str
-) -> str:
+def prev_tbl(table):
 
     table = str(
         table
@@ -366,16 +356,10 @@ def prev_tbl(
 
 
 # ==============================================================
-# PREV_RAW_SNAPSHOT TEST TABLE
-#
-# Example:
-# MHMR_LAKEHOUSE.PREV_RAW_SNAPSHOT.
-# admission_data_RAW_rowhash_test
+# SNAPSHOT TABLE
 # ==============================================================
 
-def snapshot_tbl(
-    table: str
-) -> str:
+def snapshot_tbl(table):
 
     table = str(
         table
@@ -397,12 +381,10 @@ def snapshot_tbl(
 
 
 # ==============================================================
-# COMMON HELPERS
+# TABLE EXISTS
 # ==============================================================
 
-def table_exists(
-    table_name: str
-) -> bool:
+def table_exists(table_name):
 
     try:
 
@@ -431,14 +413,11 @@ def table_exists(
 # ENSURE SCHEMA
 # ==============================================================
 
-def ensure_schema(
-    schema_name: str
-):
+def ensure_schema(schema_name):
 
     spark.sql(
         f"""
-        CREATE SCHEMA IF NOT EXISTS
-        {schema_name}
+        CREATE SCHEMA IF NOT EXISTS {schema_name}
         """
     )
 
@@ -447,14 +426,11 @@ def ensure_schema(
 # NORMALIZE COLUMN NAMES
 # ==============================================================
 
-def normalize_columns(
-    df
-):
+def normalize_columns(df):
 
     new_cols = []
 
     seen = {}
-
 
     for c in df.columns:
 
@@ -465,7 +441,6 @@ def normalize_columns(
             "_",
             new_c
         )
-
 
         if new_c in seen:
 
@@ -480,11 +455,9 @@ def normalize_columns(
 
             seen[new_c] = 0
 
-
         new_cols.append(
             new_c
         )
-
 
     for old_c, new_c in zip(
         df.columns,
@@ -498,7 +471,6 @@ def normalize_columns(
                 new_c
             )
 
-
     return df
 
 
@@ -506,37 +478,30 @@ def normalize_columns(
 # PARSE KEY COLUMNS
 # ==============================================================
 
-def parse_key_cols(
-    key_column
-):
+def parse_key_cols(key_column):
 
     if key_column is None:
 
         return []
 
-
     key_column = str(
         key_column
     ).strip()
 
-
     if key_column == "":
 
         return []
-
 
     key_column = key_column.replace(
         "|",
         ","
     )
 
-
     return [
 
         k.strip()
 
-        for k
-        in key_column.split(",")
+        for k in key_column.split(",")
 
         if k.strip()
 
@@ -556,84 +521,293 @@ def resolve_key_columns(
 
         c.lower(): c
 
-        for c
-        in df.columns
+        for c in df.columns
 
     }
 
-
     resolved = []
-
 
     for k in key_cols:
 
         if k.lower() not in col_map:
 
             raise Exception(
-                f"Key column missing in RAW table: "
-                f"{k}"
+                f"Key column missing in RAW table: {k}"
             )
 
-
         resolved.append(
-            col_map[
-                k.lower()
-            ]
+            col_map[k.lower()]
         )
-
 
     return resolved
 
 
 # ==============================================================
-# ADD MISSING COLUMNS
+# ALIGN PREVIOUS TO CURRENT RAW SCHEMA
+#
+# CURRENT RAW IS SOURCE OF TRUTH
 # ==============================================================
 
-def add_missing_columns(
-    df,
-    required_cols,
-    reference_df
+def align_previous_to_current(
+    current_df,
+    previous_df
 ):
 
-    existing_lower = {
+    current_schema = {
 
-        c.lower(): c
+        field.name:
+            field.dataType
 
-        for c
-        in df.columns
+        for field in current_df.schema.fields
 
     }
 
+    previous_map = {
 
-    for c in required_cols:
+        c.lower(): c
 
-        if c.lower() not in existing_lower:
+        for c in previous_df.columns
 
-            ref_type = (
+    }
 
-                reference_df.schema[c].dataType
+    expressions = []
 
-                if c in reference_df.columns
+    for current_col in current_df.columns:
 
-                else T.StringType()
+        current_type = current_schema[
+            current_col
+        ]
 
-            )
+        if current_col.lower() in previous_map:
 
+            previous_col = previous_map[
+                current_col.lower()
+            ]
 
-            df = df.withColumn(
+            expressions.append(
 
-                c,
-
-                F.lit(
-                    None
-                ).cast(
-                    ref_type
+                F.col(
+                    f"`{previous_col}`"
+                )
+                .cast(
+                    current_type
+                )
+                .alias(
+                    current_col
                 )
 
             )
 
+        else:
 
-    return df
+            expressions.append(
+
+                F.lit(
+                    None
+                )
+                .cast(
+                    current_type
+                )
+                .alias(
+                    current_col
+                )
+
+            )
+
+    return previous_df.select(
+        *expressions
+    )
+
+
+# ==============================================================
+# ROW HASH COLUMN SELECTION
+# ==============================================================
+
+def get_hash_columns(
+    df,
+    key_cols
+):
+
+    exclude_cols = {
+
+        k.lower()
+
+        for k in key_cols
+
+    }
+
+
+    # ==========================================================
+    # DO NOT HASH TECHNICAL / GENERATED COLUMNS
+    # ==============================================================
+
+    exclude_cols.update([
+
+        "status",
+
+        "insert_timestamp",
+
+        "_row_hash",
+
+        # Existing RAW hash
+        "row_hash",
+
+        # Snapshot technical fields
+        "__snapshot_run_id",
+
+        "__snapshot_date",
+
+        "__snapshot_timestamp"
+
+    ])
+
+
+    hash_cols = [
+
+        c
+
+        for c in df.columns
+
+        if c.lower()
+        not in exclude_cols
+
+    ]
+
+
+    # ==========================================================
+    # SAME ORDER EVERY RUN
+    # ==============================================================
+
+    return sorted(
+        hash_cols,
+        key=lambda x: x.lower()
+    )
+
+
+# ==============================================================
+# ADD CORRECTED SHA-256 ROW HASH
+# ==============================================================
+
+def add_hash(
+    df,
+    key_cols
+):
+
+    hash_cols = get_hash_columns(
+        df,
+        key_cols
+    )
+
+    if len(
+        hash_cols
+    ) == 0:
+
+        return df.withColumn(
+            "_row_hash",
+            F.lit("")
+        )
+
+
+    # ==========================================================
+    # CREATE DETERMINISTIC STRUCT
+    # ==============================================================
+
+    hash_struct = F.struct(
+
+        *[
+
+            F.col(
+                f"`{c}`"
+            ).alias(
+                c
+            )
+
+            for c in hash_cols
+
+        ]
+
+    )
+
+
+    # ==========================================================
+    # CONVERT TO JSON
+    #
+    # NULL fields retained.
+    # ==============================================================
+
+    canonical_json = F.to_json(
+
+        hash_struct,
+
+        {
+            "ignoreNullFields":
+                "false"
+        }
+
+    )
+
+
+    # ==========================================================
+    # SHA-256
+    # ==============================================================
+
+    return df.withColumn(
+
+        "_row_hash",
+
+        F.sha2(
+            canonical_json,
+            256
+        )
+
+    )
+
+
+# ==============================================================
+# PRINT HASH CONFIG
+# ==============================================================
+
+def print_hash_configuration(
+    df,
+    key_cols
+):
+
+    hash_cols = get_hash_columns(
+        df,
+        key_cols
+    )
+
+    print(
+        "\n"
+        "================ HASH CONFIGURATION ================"
+    )
+
+    print(
+        f"Number of business/source columns hashed: "
+        f"{len(hash_cols)}"
+    )
+
+    print(
+        "\nColumns used in _row_hash:"
+    )
+
+    for c in hash_cols:
+
+        print(
+            f" + {c}"
+        )
+
+    print(
+        "\nExisting ROW_HASH is EXCLUDED."
+    )
+
+    print(
+        "UTCTimeStamp remains INCLUDED."
+    )
+
+    print(
+        "===================================================="
+    )
 
 
 # ==============================================================
@@ -647,7 +821,6 @@ def align_dataframes_for_union(
     all_cols = []
 
     col_types = {}
-
 
     for df in dfs:
 
@@ -663,9 +836,7 @@ def align_dataframes_for_union(
                     field.name
                 ] = field.dataType
 
-
     aligned = []
-
 
     for df in dfs:
 
@@ -674,149 +845,27 @@ def align_dataframes_for_union(
             if c not in df.columns:
 
                 df = df.withColumn(
-
                     c,
-
                     F.lit(
                         None
                     ).cast(
                         col_types[c]
                     )
-
                 )
-
 
         df = df.select(
             all_cols
         )
 
-
         aligned.append(
             df
         )
-
 
     return aligned
 
 
 # ==============================================================
-# ROW HASH COLUMN SELECTION
-# ==============================================================
-
-def get_hash_columns(
-    df,
-    key_cols
-):
-
-    # ==========================================================
-    # Exclude key columns
-    # ==============================================================
-
-    exclude_cols = {
-
-        k.lower()
-
-        for k
-        in key_cols
-
-    }
-
-
-    # ==========================================================
-    # Exclude system columns
-    # ==============================================================
-
-    exclude_cols.update([
-
-        "status",
-
-        "insert_timestamp",
-
-        "_row_hash"
-
-    ])
-
-
-    # ==========================================================
-    # Remaining columns participate in hash
-    # ==============================================================
-
-    return [
-
-        c
-
-        for c
-        in df.columns
-
-        if c.lower()
-        not in exclude_cols
-
-    ]
-
-
-# ==============================================================
-# ADD SHA-256 ROW HASH
-# ==============================================================
-
-def add_hash(
-    df,
-    key_cols
-):
-
-    hash_cols = get_hash_columns(
-        df,
-        key_cols
-    )
-
-
-    if len(
-        hash_cols
-    ) == 0:
-
-        return df.withColumn(
-            "_row_hash",
-            F.lit("")
-        )
-
-
-    return df.withColumn(
-
-        "_row_hash",
-
-        F.sha2(
-
-            F.concat_ws(
-
-                "||",
-
-                *[
-
-                    F.coalesce(
-
-                        F.col(c).cast(
-                            "string"
-                        ),
-
-                        F.lit("")
-
-                    )
-
-                    for c
-                    in hash_cols
-
-                ]
-
-            ),
-
-            256
-
-        )
-
-    )
-
-
-# ==============================================================
-# LOG HELPERS
+# ADD UTC LOG COLUMNS IF MISSING
 # ==============================================================
 
 def add_missing_utc_log_columns(
@@ -829,21 +878,17 @@ def add_missing_utc_log_columns(
 
         return
 
-
     existing_columns = {
 
         c.lower()
 
-        for c
-        in spark.table(
+        for c in spark.table(
             table_name
         ).columns
 
     }
 
-
     columns_to_add = []
-
 
     if (
         "insert_timestamp_utc"
@@ -854,7 +899,6 @@ def add_missing_utc_log_columns(
             "insert_timestamp_utc TIMESTAMP"
         )
 
-
     if (
         "start_time_utc"
         not in existing_columns
@@ -863,7 +907,6 @@ def add_missing_utc_log_columns(
         columns_to_add.append(
             "start_time_utc TIMESTAMP"
         )
-
 
     if (
         "end_time_utc"
@@ -874,13 +917,11 @@ def add_missing_utc_log_columns(
             "end_time_utc TIMESTAMP"
         )
 
-
     if columns_to_add:
 
         columns_sql = ",\n".join(
             columns_to_add
         )
-
 
         spark.sql(
             f"""
@@ -892,28 +933,17 @@ def add_missing_utc_log_columns(
         )
 
 
-        print(
-            f"Added UTC log columns to: "
-            f"{table_name}"
-        )
-
-
 # ==============================================================
-# CREATE LOG TABLES
+# ENSURE LOG TABLES
 # ==============================================================
 
 def ensure_staging_log_tables_exist():
-
 
     empty_log_df = spark.createDataFrame(
         [],
         staging_log_schema
     )
 
-
-    # ==========================================================
-    # DAILY ROWHASH TEST LOG
-    # ==============================================================
 
     if not table_exists(
         STAGING_DAILY_LOG_TBL
@@ -939,10 +969,6 @@ def ensure_staging_log_tables_exist():
             STAGING_DAILY_LOG_TBL
         )
 
-
-    # ==========================================================
-    # FINAL ROWHASH TEST LOG
-    # ==============================================================
 
     if not table_exists(
         STAGING_FINAL_LOG_TBL
@@ -970,17 +996,15 @@ def ensure_staging_log_tables_exist():
 
 
 # ==============================================================
-# RESET DAILY TEST LOG
+# RESET DAILY LOG
 # ==============================================================
 
 def reset_staging_daily_log():
-
 
     empty_log_df = spark.createDataFrame(
         [],
         staging_log_schema
     )
-
 
     (
         empty_log_df.write
@@ -998,38 +1022,21 @@ def reset_staging_daily_log():
 
 
 # ==============================================================
-# ADD STAGING LOG ROW
+# ADD LOG ROW
 # ==============================================================
 
 def add_staging_log_row(
-
     table_name,
-
     status,
-
     count_value,
-
     start_time,
-
     end_time,
-
     error_message=None
-
 ):
-
-
-    # ==========================================================
-    # CURRENT INSERT TIME CST/CDT
-    # ==============================================================
 
     insert_time_cst = datetime.now(
         tz
     )
-
-
-    # ==========================================================
-    # START TIME CST/CDT
-    # ==============================================================
 
     if start_time.tzinfo is None:
 
@@ -1042,11 +1049,6 @@ def add_staging_log_row(
         start_time_cst = start_time.astimezone(
             tz
         )
-
-
-    # ==========================================================
-    # END TIME CST/CDT
-    # ==============================================================
 
     if end_time.tzinfo is None:
 
@@ -1061,111 +1063,79 @@ def add_staging_log_row(
         )
 
 
-    # ==========================================================
-    # UTC CONVERSION
-    # ==============================================================
-
-    insert_time_utc = insert_time_cst.astimezone(
-        utc_tz
+    insert_time_utc = (
+        insert_time_cst.astimezone(
+            utc_tz
+        )
     )
 
-    start_time_utc = start_time_cst.astimezone(
-        utc_tz
+    start_time_utc = (
+        start_time_cst.astimezone(
+            utc_tz
+        )
     )
 
-    end_time_utc = end_time_cst.astimezone(
-        utc_tz
+    end_time_utc = (
+        end_time_cst.astimezone(
+            utc_tz
+        )
     )
 
-
-    # ==========================================================
-    # BUILD LOG ROW
-    # ==============================================================
 
     row = {
-
 
         "load_date":
             start_time_cst.date(),
 
-
-        # Keep actual source/business table name
         "table_name":
-            str(
+            clean_table_name(
                 table_name
             ),
 
-
         "status":
-            str(
-                status
-            ),
-
+            status,
 
         "count":
-            (
-                int(
-                    count_value
-                )
-
-                if count_value
-                is not None
-
+            int(
+                count_value
+                if count_value is not None
                 else 0
             ),
-
 
         "error_message":
             error_message,
 
-
-        # ======================================================
         # CST/CDT
-        # ======================================================
-
         "insert_timestamp":
             insert_time_cst.replace(
                 tzinfo=None
             ),
-
 
         "start_time":
             start_time_cst.replace(
                 tzinfo=None
             ),
 
-
         "end_time":
             end_time_cst.replace(
                 tzinfo=None
             ),
 
-
-        # ======================================================
-        # UTC/GMT
-        # ======================================================
-
+        # UTC
         "insert_timestamp_utc":
             insert_time_utc.replace(
                 tzinfo=None
             ),
-
 
         "start_time_utc":
             start_time_utc.replace(
                 tzinfo=None
             ),
 
-
         "end_time_utc":
             end_time_utc.replace(
                 tzinfo=None
             ),
-
-
-        # ======================================================
-        # IDENTIFY ROW HASH TEST
-        # ======================================================
 
         "load_type":
             "staging_rowhash_test"
@@ -1186,19 +1156,16 @@ def add_staging_log_row(
 
 def write_staging_daily_logs():
 
-
     if len(
         STAGING_LOG_ROWS
     ) == 0:
 
         return
 
-
     log_df = spark.createDataFrame(
         STAGING_LOG_ROWS,
         staging_log_schema
     )
-
 
     (
         log_df.write
@@ -1221,11 +1188,9 @@ def write_staging_daily_logs():
 
 def consolidate_staging_logs_to_final():
 
-
     daily_df = spark.table(
         STAGING_DAILY_LOG_TBL
     )
-
 
     if daily_df.count() > 0:
 
@@ -1243,27 +1208,37 @@ def consolidate_staging_logs_to_final():
             )
         )
 
-
     reset_staging_daily_log()
 
 
 # ==============================================================
-# PREV_RAW TEST SNAPSHOT
+# PREV_RAW SNAPSHOT
 # ==============================================================
 
 def write_prev_raw_snapshot(
-
     table_name,
-
     previous_df
-
 ):
+
+    # Nothing to snapshot on first-ever run
+    if previous_df.limit(
+        1
+    ).count() == 0:
+
+        print(
+            "\nPREV_RAW is empty."
+        )
+
+        print(
+            "Skipping PREV_RAW snapshot."
+        )
+
+        return
 
 
     snapshot_table = snapshot_tbl(
         table_name
     )
-
 
     snapshot_df = (
 
@@ -1304,19 +1279,20 @@ def write_prev_raw_snapshot(
     )
 
 
+    print(
+        f"\nPREV_RAW snapshot created: "
+        f"{snapshot_table}"
+    )
+
+
 # ==============================================================
-# CHANGE DETECTION
-# ROW HASH
+# BUILD CHANGES
 # ==============================================================
 
 def build_changes(
-
     current_df,
-
     previous_df,
-
     key_cols
-
 ):
 
 
@@ -1338,41 +1314,18 @@ def build_changes(
     # ==============================================================
 
     key_cols = resolve_key_columns(
-
         current_df,
-
         key_cols
-
     )
 
 
     # ==========================================================
-    # ALIGN PREVIOUS WITH CURRENT
+    # ALIGN PREVIOUS SCHEMA/DATATYPES TO CURRENT RAW
     # ==============================================================
 
-    previous_df = add_missing_columns(
-
-        previous_df,
-
-        current_df.columns,
-
-        current_df
-
-    )
-
-
-    # ==========================================================
-    # ALIGN CURRENT WITH PREVIOUS
-    # ==============================================================
-
-    current_df = add_missing_columns(
-
+    previous_df = align_previous_to_current(
         current_df,
-
-        previous_df.columns,
-
         previous_df
-
     )
 
 
@@ -1380,23 +1333,30 @@ def build_changes(
     # SAME COLUMN ORDER
     # ==============================================================
 
-    current_df = current_df.select(
-        previous_df.columns
+    previous_df = previous_df.select(
+        current_df.columns
     )
 
 
     # ==========================================================
-    # CURRENT HASH
+    # PRINT HASH CONFIG
+    # ==============================================================
+
+    print_hash_configuration(
+        current_df,
+        key_cols
+    )
+
+
+    # ==========================================================
+    # CALCULATE CURRENT HASH
     # ==============================================================
 
     current_hash = (
 
         add_hash(
-
             current_df,
-
             key_cols
-
         )
 
         .alias(
@@ -1407,17 +1367,14 @@ def build_changes(
 
 
     # ==========================================================
-    # PREVIOUS HASH
+    # CALCULATE PREVIOUS HASH
     # ==============================================================
 
     previous_hash = (
 
         add_hash(
-
             previous_df,
-
             key_cols
-
         )
 
         .alias(
@@ -1428,23 +1385,22 @@ def build_changes(
 
 
     # ==========================================================
-    # KEY JOIN CONDITION
+    # KEY JOIN
     # ==============================================================
 
     join_cond = [
 
         F.col(
             f"c.`{k}`"
+        ).eqNullSafe(
+
+            F.col(
+                f"p.`{k}`"
+            )
+
         )
 
-        ==
-
-        F.col(
-            f"p.`{k}`"
-        )
-
-        for k
-        in key_cols
+        for k in key_cols
 
     ]
 
@@ -1460,13 +1416,9 @@ def build_changes(
         current_hash
 
         .join(
-
             previous_hash,
-
             join_cond,
-
             "left_anti"
-
         )
 
         .drop(
@@ -1499,13 +1451,9 @@ def build_changes(
         previous_hash
 
         .join(
-
             current_hash,
-
             join_cond,
-
             "left_anti"
-
         )
 
         .drop(
@@ -1530,7 +1478,7 @@ def build_changes(
     # ==========================================================
     # UPDATE
     #
-    # SAME KEY + DIFFERENT ROW HASH
+    # SAME KEY + BUSINESS DATA CHANGED
     # ==============================================================
 
     updates_df = (
@@ -1538,13 +1486,9 @@ def build_changes(
         current_hash
 
         .join(
-
             previous_hash,
-
             join_cond,
-
             "inner"
-
         )
 
         .where(
@@ -1569,8 +1513,7 @@ def build_changes(
                 c
             )
 
-            for c
-            in current_df.columns
+            for c in current_df.columns
 
         ])
 
@@ -1590,7 +1533,7 @@ def build_changes(
 
 
     # ==========================================================
-    # ALIGN I / U / D
+    # ALIGN I/U/D
     # ==============================================================
 
     (
@@ -1612,68 +1555,47 @@ def build_changes(
     # COMBINE
     # ==============================================================
 
-    changes_df = (
+    return (
 
         inserts_df
 
         .unionByName(
-
             updates_df,
-
             allowMissingColumns=True
-
         )
 
         .unionByName(
-
             deletes_df,
-
             allowMissingColumns=True
-
         )
 
     )
 
 
-    return changes_df
-
-
 # ==============================================================
-# PROCESS SINGLE TABLE
+# PROCESS TABLE
 # ==============================================================
 
 def process_table(
-
     table_name,
-
     key_column
-
 ):
-
-
-    # ==========================================================
-    # START TIME
-    # ==============================================================
 
     start_time = datetime.now(
         tz
     )
 
-
     source_table = src_tbl(
         table_name
     )
-
-
-    staging_table = stg_tbl(
-        table_name
-    )
-
 
     previous_table = prev_tbl(
         table_name
     )
 
+    staging_table = stg_tbl(
+        table_name
+    )
 
     key_cols = parse_key_cols(
         key_column
@@ -1688,149 +1610,73 @@ def process_table(
         key_cols
     ) == 0:
 
-
-        end_time = datetime.now(
-            tz
-        )
-
-
-        add_staging_log_row(
-
-            table_name=
-                clean_table_name(
-                    table_name
-                ),
-
-            status=
-                "FAILED",
-
-            count_value=
-                0,
-
-            start_time=
-                start_time,
-
-            end_time=
-                end_time,
-
-            error_message=
-                "KEY_COLUMN is empty"
-
-        )
-
-
         raise Exception(
-            f"KEY_COLUMN is empty "
-            f"for {table_name}"
+            f"KEY_COLUMN is empty for {table_name}"
         )
 
 
     # ==========================================================
-    # PRINT CONFIG
-    # ==============================================================
-
-    print(
-        "\n"
-        "============================================================"
-    )
-
-    print(
-        f"Processing table : "
-        f"{table_name}"
-    )
-
-    print(
-        f"Source RAW       : "
-        f"{source_table}"
-    )
-
-    print(
-        f"Test PREV_RAW    : "
-        f"{previous_table}"
-    )
-
-    print(
-        f"Test Staging     : "
-        f"{staging_table}"
-    )
-
-    print(
-        f"Test Snapshot    : "
-        f"{snapshot_tbl(table_name)}"
-    )
-
-    print(
-        f"Keys             : "
-        f"{key_cols}"
-    )
-
-    print(
-        "Change Detection : ROW HASH"
-    )
-
-    print(
-        "ThreadPool       : ENABLED"
-    )
-
-    print(
-        "Retry            : ENABLED"
-    )
-
-    print(
-        "Test Suffix      : _rowhash_test"
-    )
-
-    print(
-        "============================================================"
-    )
-
-
-    # ==========================================================
-    # VALIDATE SOURCE RAW
+    # VALIDATE RAW
     # ==============================================================
 
     if not table_exists(
         source_table
     ):
 
-
-        end_time = datetime.now(
-            tz
-        )
-
-
-        add_staging_log_row(
-
-            table_name=
-                clean_table_name(
-                    table_name
-                ),
-
-            status=
-                "FAILED",
-
-            count_value=
-                0,
-
-            start_time=
-                start_time,
-
-            end_time=
-                end_time,
-
-            error_message=
-                (
-                    f"Source table does not exist: "
-                    f"{source_table}"
-                )
-
-        )
-
-
         raise Exception(
-            f"Source table does not exist: "
+            f"RAW source does not exist: "
             f"{source_table}"
         )
+
+
+    print(
+        "\n"
+        "========================================================"
+    )
+
+    print(
+        "DAILY ROW HASH PROCESS"
+    )
+
+    print(
+        "========================================================"
+    )
+
+    print(
+        f"Table       : {table_name}"
+    )
+
+    print(
+        f"RAW         : {source_table}"
+    )
+
+    print(
+        f"PREV_RAW    : {previous_table}"
+    )
+
+    print(
+        f"STAGING     : {staging_table}"
+    )
+
+    print(
+        f"SNAPSHOT    : {snapshot_tbl(table_name)}"
+    )
+
+    print(
+        f"Key         : {key_cols}"
+    )
+
+    print(
+        "Restore     : DISABLED"
+    )
+
+    print(
+        "Hash        : CORRECTED SHA-256"
+    )
+
+    print(
+        "========================================================"
+    )
 
 
     # ==========================================================
@@ -1846,47 +1692,49 @@ def process_table(
     )
 
 
+    current_count = current_df.count()
+
+
+    print(
+        f"\nCURRENT RAW COUNT : "
+        f"{current_count}"
+    )
+
+
     # ==========================================================
-    # CREATE EMPTY TEST PREV_RAW IF IT DOES NOT EXIST
+    # FIRST RUN
     #
-    # First execution:
-    # all RAW rows become INSERT
+    # IF PREV_RAW DOES NOT EXIST:
+    # CREATE EMPTY PREV_RAW.
+    #
+    # Therefore ALL CURRENT RAW becomes INSERT.
     # ==============================================================
 
     if not table_exists(
         previous_table
     ):
 
-
         print(
-            "\nTEST PREV_RAW does not exist."
+            "\nPREV_RAW does not exist."
         )
 
-
         print(
-            f"Creating empty TEST PREV_RAW: "
-            f"{previous_table}"
+            "Creating empty PREV_RAW."
         )
-
 
         (
             current_df
-
             .limit(
                 0
             )
-
             .write
-
             .mode(
                 "overwrite"
             )
-
             .option(
                 "overwriteSchema",
                 "true"
             )
-
             .saveAsTable(
                 previous_table
             )
@@ -1894,7 +1742,7 @@ def process_table(
 
 
     # ==========================================================
-    # READ TEST PREVIOUS RAW
+    # READ PREVIOUS
     # ==============================================================
 
     previous_df = normalize_columns(
@@ -1906,20 +1754,25 @@ def process_table(
     )
 
 
+    previous_count = previous_df.count()
+
+
+    print(
+        f"PREVIOUS RAW COUNT: "
+        f"{previous_count}"
+    )
+
+
     # ==========================================================
-    # BUILD CHANGES USING ROW HASH
+    # BUILD CHANGES
     # ==============================================================
 
     changes_df = (
 
         build_changes(
-
             current_df,
-
             previous_df,
-
             key_cols
-
         )
 
         .cache()
@@ -1928,10 +1781,10 @@ def process_table(
 
 
     # ==========================================================
-    # GET STATUS COUNTS
+    # GET I/U/D COUNTS
     # ==============================================================
 
-    status_counts_rows = (
+    status_rows = (
 
         changes_df
 
@@ -1940,13 +1793,11 @@ def process_table(
         )
 
         .agg(
-
             F.count(
                 "*"
             ).alias(
                 "cnt"
             )
-
         )
 
         .collect()
@@ -1961,8 +1812,7 @@ def process_table(
                 row["cnt"]
             )
 
-        for row
-        in status_counts_rows
+        for row in status_rows
 
     }
 
@@ -1972,12 +1822,10 @@ def process_table(
         0
     )
 
-
     update_count = status_counts.get(
         "U",
         0
     )
-
 
     delete_count = status_counts.get(
         "D",
@@ -2002,36 +1850,36 @@ def process_table(
 
     print(
         "\n"
-        "================ CHANGE COUNTS ================"
+        "================ DAILY CHANGE COUNTS ================"
     )
 
     print(
-        f"Insert count : "
+        f"INSERT COUNT : "
         f"{insert_count}"
     )
 
     print(
-        f"Update count : "
+        f"UPDATE COUNT : "
         f"{update_count}"
     )
 
     print(
-        f"Delete count : "
+        f"DELETE COUNT : "
         f"{delete_count}"
     )
 
     print(
-        f"Total changes: "
+        f"TOTAL CHANGE : "
         f"{total_change_count}"
     )
 
     print(
-        "================================================"
+        "====================================================="
     )
 
 
     # ==========================================================
-    # WRITE TEST STAGING TABLE
+    # WRITE TODAY'S STAGING
     # ==============================================================
 
     (
@@ -2052,21 +1900,26 @@ def process_table(
     )
 
 
-    # ==========================================================
-    # SNAPSHOT OLD TEST PREV_RAW
-    # ==============================================================
-
-    write_prev_raw_snapshot(
-
-        table_name,
-
-        previous_df
-
+    print(
+        f"\nSTAGING WRITTEN: "
+        f"{staging_table}"
     )
 
 
     # ==========================================================
-    # CURRENT RAW BECOMES NEW TEST PREV_RAW
+    # SNAPSHOT OLD PREV_RAW
+    #
+    # MUST HAPPEN BEFORE PREV_RAW OVERWRITE
+    # ==============================================================
+
+    write_prev_raw_snapshot(
+        table_name,
+        previous_df
+    )
+
+
+    # ==========================================================
+    # TODAY'S RAW BECOMES TOMORROW'S PREV_RAW
     # ==============================================================
 
     (
@@ -2088,14 +1941,35 @@ def process_table(
 
 
     # ==========================================================
-    # UNPERSIST
+    # VERIFY NEW PREV COUNT
+    # ==============================================================
+
+    new_prev_count = (
+
+        spark.table(
+            previous_table
+        )
+
+        .count()
+
+    )
+
+
+    print(
+        f"\nNEW PREV_RAW COUNT: "
+        f"{new_prev_count}"
+    )
+
+
+    # ==========================================================
+    # CLEAN CACHE
     # ==============================================================
 
     changes_df.unpersist()
 
 
     # ==========================================================
-    # END TIME
+    # LOGGING
     # ==============================================================
 
     end_time = datetime.now(
@@ -2103,106 +1977,66 @@ def process_table(
     )
 
 
-    # ==========================================================
-    # INSERT LOG
-    # ==============================================================
-
     add_staging_log_row(
-
-        clean_table_name(
-            table_name
-        ),
-
+        table_name,
         "I",
-
         insert_count,
-
         start_time,
-
         end_time,
-
         None
-
     )
 
 
-    # ==========================================================
-    # UPDATE LOG
-    # ==============================================================
-
     add_staging_log_row(
-
-        clean_table_name(
-            table_name
-        ),
-
+        table_name,
         "U",
-
         update_count,
-
         start_time,
-
         end_time,
-
         None
-
     )
 
-
-    # ==========================================================
-    # DELETE LOG
-    # ==============================================================
 
     add_staging_log_row(
-
-        clean_table_name(
-            table_name
-        ),
-
+        table_name,
         "D",
-
         delete_count,
-
         start_time,
-
         end_time,
-
         None
-
     )
 
-
-    # ==========================================================
-    # RESULT
-    # ==============================================================
 
     return {
-
 
         "table_name":
             clean_table_name(
                 table_name
             ),
 
+        "status":
+            "SUCCESS",
 
         "insert_count":
             insert_count,
 
-
         "update_count":
             update_count,
-
 
         "delete_count":
             delete_count,
 
-
         "total_change_count":
             total_change_count,
 
+        "raw_count":
+            current_count,
 
-        "status":
-            "SUCCESS"
+        "previous_count":
+            previous_count,
+
+        "new_prev_count":
+            new_prev_count
 
     }
 
@@ -2212,74 +2046,52 @@ def process_table(
 # ==============================================================
 
 def process_table_with_retry(
-
     table_name,
-
     key_column
-
 ):
-
 
     last_error = None
 
 
     for attempt in range(
-
         1,
-
         MAX_RETRIES + 1
-
     ):
 
 
         try:
 
-
             print(
                 f"\nAttempt {attempt} "
-                f"of {MAX_RETRIES} "
-                f"for {table_name}"
+                f"of {MAX_RETRIES}"
             )
 
-
             return process_table(
-
                 table_name,
-
                 key_column
-
             )
 
 
         except Exception as e:
 
-
             last_error = str(
                 e
             )
 
+            print(
+                f"\nAttempt {attempt} FAILED"
+            )
 
             print(
-
-                f"Attempt {attempt} "
-                f"failed for "
-                f"{table_name}: "
-                f"{last_error}"
-
+                last_error
             )
 
 
-            # ==================================================
-            # FINAL RETRY FAILED
-            # ==================================================
-
             if attempt == MAX_RETRIES:
-
 
                 start_time = datetime.now(
                     tz
                 )
-
 
                 end_time = datetime.now(
                     tz
@@ -2287,58 +2099,45 @@ def process_table_with_retry(
 
 
                 add_staging_log_row(
-
-                    table_name=
-                        clean_table_name(
-                            table_name
-                        ),
-
-                    status=
-                        "FAILED",
-
-                    count_value=
-                        0,
-
-                    start_time=
-                        start_time,
-
-                    end_time=
-                        end_time,
-
-                    error_message=
-                        last_error[:4000]
-
+                    table_name,
+                    "FAILED",
+                    0,
+                    start_time,
+                    end_time,
+                    last_error[:4000]
                 )
 
 
                 return {
-
 
                     "table_name":
                         clean_table_name(
                             table_name
                         ),
 
+                    "status":
+                        "FAILED",
 
                     "insert_count":
                         0,
 
-
                     "update_count":
                         0,
-
 
                     "delete_count":
                         0,
 
-
                     "total_change_count":
                         0,
 
+                    "raw_count":
+                        0,
 
-                    "status":
-                        "FAILED",
+                    "previous_count":
+                        0,
 
+                    "new_prev_count":
+                        0,
 
                     "error":
                         last_error
@@ -2347,12 +2146,10 @@ def process_table_with_retry(
 
 
 # ==============================================================
-# PROCESS ONE TABLE
-#
-# THREADPOOL RETAINED
+# DAILY RUN
 # ==============================================================
 
-def process_one_table():
+def run_daily_rowhash():
 
 
     # ==========================================================
@@ -2377,21 +2174,21 @@ def process_one_table():
 
 
     # ==========================================================
-    # ENSURE TEST LOG TABLES
+    # ENSURE LOG TABLES
     # ==============================================================
 
     ensure_staging_log_tables_exist()
 
 
     # ==========================================================
-    # RESET ONLY ROWHASH TEST DAILY LOG
+    # RESET DAILY LOG
     # ==============================================================
 
     reset_staging_daily_log()
 
 
     # ==========================================================
-    # CLEAR PYTHON MEMORY LOGS
+    # CLEAR MEMORY LOGS
     # ==============================================================
 
     with LOG_LOCK:
@@ -2414,7 +2211,7 @@ def process_one_table():
     )
 
     print(
-        "SINGLE TABLE ROW HASH TEST"
+        "ROW HASH DAILY RUN"
     )
 
     print(
@@ -2422,43 +2219,35 @@ def process_one_table():
     )
 
     print(
-        f"Table      : "
+        f"Table       : "
         f"{table_name}"
     )
 
     print(
-        f"Key Column : "
+        f"Key         : "
         f"{key_column}"
     )
 
     print(
-        f"Workers    : "
+        f"Workers     : "
         f"{MAX_WORKERS}"
     )
 
     print(
-        f"Retries    : "
+        f"Retries     : "
         f"{MAX_RETRIES}"
     )
 
     print(
-        "Row Hash   : ENABLED"
+        "PREV restore: DISABLED"
     )
 
     print(
-        "ThreadPool : ENABLED"
+        "ROW_HASH    : EXCLUDED FROM NEW HASH"
     )
 
     print(
-        "Logs       : ENABLED"
-    )
-
-    print(
-        "Snapshot   : ENABLED"
-    )
-
-    print(
-        "Suffix     : _rowhash_test"
+        "UTCTimeStamp: INCLUDED"
     )
 
     print(
@@ -2471,29 +2260,20 @@ def process_one_table():
 
     # ==========================================================
     # THREADPOOL
-    #
-    # Only one table submitted
     # ==============================================================
 
     with ThreadPoolExecutor(
-
         max_workers=
             MAX_WORKERS
-
     ) as executor:
 
 
         future_map = {
 
-
             executor.submit(
-
                 process_table_with_retry,
-
                 table_name,
-
                 key_column
-
             ):
                 table_name
 
@@ -2512,9 +2292,7 @@ def process_one_table():
 
             try:
 
-
                 result = future.result()
-
 
                 results.append(
                     result
@@ -2522,68 +2300,68 @@ def process_one_table():
 
 
                 print(
-
                     f"\nCompleted: "
-                    f"{current_table} | "
+                    f"{current_table}"
+                )
 
-                    f"Status: "
-                    f"{result.get('status')} | "
+                print(
+                    f"Status : "
+                    f"{result.get('status')}"
+                )
 
-                    f"I: "
-                    f"{result.get('insert_count')} | "
+                print(
+                    f"I      : "
+                    f"{result.get('insert_count')}"
+                )
 
-                    f"U: "
-                    f"{result.get('update_count')} | "
+                print(
+                    f"U      : "
+                    f"{result.get('update_count')}"
+                )
 
-                    f"D: "
+                print(
+                    f"D      : "
                     f"{result.get('delete_count')}"
-
                 )
 
 
             except Exception as e:
 
-
-                error_msg = traceback.format_exc()
-
-
                 print(
-
-                    f"Unexpected failure "
-                    f"for {current_table}: "
-                    f"{error_msg}"
-
+                    traceback.format_exc()
                 )
 
 
                 results.append({
-
 
                     "table_name":
                         clean_table_name(
                             current_table
                         ),
 
+                    "status":
+                        "FAILED",
 
                     "insert_count":
                         0,
 
-
                     "update_count":
                         0,
-
 
                     "delete_count":
                         0,
 
-
                     "total_change_count":
                         0,
 
+                    "raw_count":
+                        0,
 
-                    "status":
-                        "FAILED",
+                    "previous_count":
+                        0,
 
+                    "new_prev_count":
+                        0,
 
                     "error":
                         str(e)
@@ -2592,14 +2370,14 @@ def process_one_table():
 
 
     # ==========================================================
-    # WRITE TEST DAILY LOGS
+    # WRITE LOGS
     # ==============================================================
 
     write_staging_daily_logs()
 
 
     # ==========================================================
-    # DAILY -> FINAL TEST LOG
+    # DAILY -> FINAL
     # ==============================================================
 
     consolidate_staging_logs_to_final()
@@ -2620,24 +2398,7 @@ def process_one_table():
 
     print(
         "\n"
-        "================ FINAL SUMMARY ================"
-    )
-
-
-    result_df.groupBy(
-        "status"
-    ).count().show(
-        truncate=False
-    )
-
-
-    # ==========================================================
-    # CHANGE COUNTS
-    # ==============================================================
-
-    print(
-        "\n"
-        "================ CHANGE COUNTS ================"
+        "================ FINAL DAILY SUMMARY ================"
     )
 
 
@@ -2650,19 +2411,26 @@ def process_one_table():
 
             "status",
 
+            "raw_count",
+
+            "previous_count",
+
             "insert_count",
 
             "update_count",
 
             "delete_count",
 
-            "total_change_count"
+            "total_change_count",
+
+            "new_prev_count"
 
         )
 
         .show(
             truncate=False
         )
+
     )
 
 
@@ -2682,7 +2450,7 @@ def process_one_table():
 
         print(
             "\n"
-            "============= STAGING STATUS COUNTS ==========="
+            "================ STAGING STATUS COUNTS ================"
         )
 
 
@@ -2704,16 +2472,17 @@ def process_one_table():
             .show(
                 truncate=False
             )
+
         )
 
 
     # ==========================================================
-    # TEST TABLE LOCATIONS
+    # TABLE LOCATIONS
     # ==============================================================
 
     print(
         "\n"
-        "================ TABLE LOCATIONS =============="
+        "================ TABLE LOCATIONS ================"
     )
 
 
@@ -2754,7 +2523,7 @@ def process_one_table():
 
 
     print(
-        "================================================"
+        "================================================="
     )
 
 
@@ -2762,7 +2531,7 @@ def process_one_table():
 
 
 # ==============================================================
-# RUN
+# RUN DAILY PROCESS
 # ==============================================================
 
-final_result_df = process_one_table()
+final_result_df = run_daily_rowhash()

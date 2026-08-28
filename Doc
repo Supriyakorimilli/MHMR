@@ -1,124 +1,324 @@
-4. Proposed Solution
-4.1 Solution Overview
+Chapter 5 – Solution Architecture
+5.1 Architecture Overview
 
-To overcome the limitations of the existing process, a reusable and scalable data processing framework was developed using Microsoft Fabric Lakehouse and PySpark.
+The MHMR Data Processing Framework is built on Microsoft Fabric Lakehouse using PySpark and Delta Tables. The solution follows a layered architecture to efficiently process daily data, detect changes, preserve historical records, maintain current-state snapshots, and provide comprehensive operational logging.
 
-The framework standardizes the end-to-end processing of daily data across all source tables by introducing automated change detection, historical data management, snapshot generation, centralized logging, parallel execution, and backfill support.
+The framework is metadata-driven, allowing a common processing logic to be reused across hundreds of source tables while ensuring scalability, maintainability, and consistent execution.
 
-The implementation follows a metadata-driven design, allowing hundreds of source tables to be processed using a common framework with minimal configuration.
+The end-to-end data processing consists of the following major layers:
 
-4.2 High-Level Architecture
-                Source Systems
-                      │
-                      ▼
-                 RAW Layer
-                      │
-                      ▼
-              Previous RAW Comparison
-                      │
-                      ▼
-                STAGING Layer
-                      │
-        ┌─────────────┴─────────────┐
-        ▼                           ▼
- HISTORY Layer                SNAPSHOT Layer
- (SCD Type 2)                 (Current State)
-        │                           │
-        └─────────────┬─────────────┘
-                      ▼
-             Daily & Final Logs
-                      │
-                      ▼
-          Reporting & Monitoring
-4.3 Key Components
-
-The solution consists of the following major components:
-
+Source Systems
 Raw Layer
-
-Stores the latest source data received from upstream systems.
-
 Previous Raw Layer
-
-Maintains the previous execution's source data to enable comparison with the current data.
-
 Staging Layer
-
-Performs row-level change detection by identifying Inserts, Updates, and Deletes before downstream processing.
-
 History Layer
-
-Maintains complete historical versions of business records using the Slowly Changing Dimension Type 2 (SCD Type 2) methodology.
-
 Snapshot Layer
-
-Maintains the latest version of each business record for reporting and downstream consumption.
-
 Logging Framework
+Audit and Monitoring
 
-Captures execution details including processing status, timestamps, execution duration, record counts, retry information, and error details.
+Each layer has a clearly defined responsibility and works together to ensure reliable daily data processing.
 
-Audit Framework
+5.2 High-Level Solution Architecture
+                        Source Systems
+                              │
+                              ▼
+                      RAW Source Tables
+                              │
+                              ▼
+                  PREVIOUS RAW Tables
+                              │
+                 Compare Current vs Previous
+                              │
+                              ▼
+                     STAGING Framework
+                (Insert / Update / Delete)
+                              │
+             ┌────────────────┴─────────────────┐
+             ▼                                  ▼
+      HISTORY Framework                 SNAPSHOT Framework
+       (SCD Type 2)                     (Current State)
+             │                                  │
+             └──────────────┬───────────────────┘
+                            ▼
+                    Daily & Final Logs
+                            │
+                            ▼
+                 Audit / Monitoring / Reporting
+5.3 Solution Components
 
-Provides operational visibility and enables monitoring, validation, and troubleshooting of pipeline executions.
+The framework consists of several independent yet interconnected components.
 
-4.4 Key Features
+5.3.1 Source Layer
 
-The proposed framework introduces several enhancements:
+The Source Layer contains the operational data received from upstream source systems. These datasets represent the latest available business records and serve as the input for daily processing.
 
-Automated incremental processing
-Row-level change detection
-Historical data preservation
-Current-state snapshot generation
-Parallel processing
-Retry mechanism
-Automated backfill processing
-Comprehensive logging
-Audit reporting
-Metadata-driven execution
-Error handling and recovery
-Scalability across hundreds of source tables
-4.5 Benefits
+Responsibilities:
 
-The implementation provides several operational and business benefits.
+Receive daily source data.
+Provide input for downstream processing.
+Maintain latest source records.
+5.3.2 Raw Layer
 
-Improved Performance
+The Raw Layer stores the current day's source data exactly as received from upstream systems.
 
-Parallel execution significantly reduces overall processing time compared to sequential processing.
+Responsibilities:
 
-Increased Reliability
+Preserve incoming source data.
+Act as the primary input for comparison.
+Provide current business records.
+5.3.3 Previous Raw Layer
 
-Retry mechanisms and comprehensive error handling improve pipeline stability.
+The Previous Raw Layer stores the previous execution's source data.
 
-Better Data Quality
+This layer enables efficient comparison between the current and previous datasets.
 
-Standardized change detection ensures accurate processing of Inserts, Updates, and Deletes.
+Responsibilities:
 
-Complete Historical Tracking
+Store previous day's source data.
+Enable incremental change detection.
+Support Insert, Update, and Delete identification.
+5.3.4 Staging Layer
 
-Historical records are preserved for reporting, auditing, and regulatory purposes.
+The Staging Layer performs row-level comparison between Raw and Previous Raw data.
 
-Operational Visibility
+Based on the comparison, each record is classified as:
 
-Detailed logs provide complete insight into execution status and processing metrics.
+Insert
+Update
+Delete
 
-Scalability
+The processed records are written into staging tables, which become the source for downstream History and Snapshot processing.
 
-The metadata-driven framework allows new tables to be onboarded without major code changes.
+Responsibilities:
 
-Simplified Maintenance
+Compare Raw vs Previous Raw.
+Detect data changes.
+Populate staging tables.
+Generate staging logs.
+5.3.5 History Layer
 
-Reusable processing logic reduces code duplication and simplifies future enhancements.
+The History Layer maintains complete historical versions of business records using the Slowly Changing Dimension Type 2 (SCD Type 2) methodology.
 
-4.6 Solution Highlights
+Instead of overwriting existing records, previous versions are retained while new versions are inserted.
+
+Responsibilities:
+
+Preserve historical records.
+Maintain Active and Inactive versions.
+Support historical reporting.
+Enable data auditing.
+5.3.6 Snapshot Layer
+
+The Snapshot Layer maintains the latest version of each business record.
+
+Unlike History, Snapshot stores only the current state of the data.
+
+Responsibilities:
+
+Maintain current business data.
+Replace outdated records.
+Provide reporting datasets.
+Support operational dashboards.
+5.3.7 Logging Framework
+
+The Logging Framework records execution information for every processed table.
+
+Information captured includes:
+
+Processing status
+Execution timestamps
+Record counts
+Retry attempts
+Error details
+Processing duration
+
+The logs provide complete operational visibility into pipeline execution.
+
+5.3.8 Audit Framework
+
+The Audit Framework provides centralized monitoring and validation of all pipeline executions.
+
+It enables:
+
+Daily monitoring
+Failure analysis
+Operational reporting
+Data validation
+Processing statistics
+5.4 Data Flow
+
+The overall processing flow follows the sequence below.
+
+Receive Source Data
+
+        │
+
+        ▼
+
+Load RAW Tables
+
+        │
+
+        ▼
+
+Compare with Previous RAW
+
+        │
+
+        ▼
+
+Generate Row Hash
+
+        │
+
+        ▼
+
+Identify
+
+Insert
+Update
+Delete
+
+        │
+
+        ▼
+
+Load STAGING
+
+        │
+
+        ├───────────────┐
+        ▼               ▼
+
+History           Snapshot
+
+        │               │
+
+        └───────┬───────┘
+
+                ▼
+
+          Daily Logs
+
+                ▼
+
+          Final Logs
+
+                ▼
+
+       Audit & Monitoring
+5.5 Processing Architecture
+
+The framework follows a modular architecture where each processing layer executes independently while sharing common utility functions.
+
+Configuration
+
+        │
+
+        ▼
+
+Table List
+
+        │
+
+        ▼
+
+Driver Program
+
+        │
+
+        ▼
+
+Thread Pool
+
+        │
+
+        ├──────────┬──────────┬──────────┐
+
+        ▼          ▼          ▼          ▼
+
+    Table 1    Table 2    Table 3    Table N
+
+        │          │          │
+
+        ▼          ▼          ▼
+
+Retry Mechanism
+
+        │
+
+        ▼
+
+Logging
+
+        │
+
+        ▼
+
+Completion
+5.6 Metadata-Driven Design
+
+Instead of writing separate code for every source table, the framework uses metadata to drive execution.
+
+The metadata contains information such as:
+
+Table Name
+Primary Key Column(s)
+Source Table
+Target Table
+Processing Configuration
+
+Using this approach:
+
+The same processing logic is reused across all tables.
+New tables can be onboarded with minimal effort.
+Maintenance becomes significantly easier.
+5.7 Parallel Processing
+
+To improve performance, tables are processed concurrently using a thread pool.
+
+Each table is executed independently.
+
+Benefits include:
+
+Reduced execution time.
+Better utilization of Spark resources.
+Failure isolation.
+Improved scalability.
+5.8 Error Handling Strategy
+
+The framework includes a robust error handling mechanism.
+
+If processing fails:
+
+The exception is captured.
+Retry logic is initiated.
+Processing is attempted again.
+Failure information is written into log tables.
+Remaining tables continue processing.
+
+This prevents a single table failure from stopping the complete pipeline.
+
+5.9 Timezone Strategy
+
+The framework standardizes timestamp handling to ensure consistency across executions.
+
+Business processing follows the configured CST/CDT timezone.
+Log tables additionally capture UTC timestamps to support global operational monitoring.
+This dual-timezone approach improves traceability across different geographic regions while preserving business reporting requirements.
+5.10 Architecture Highlights
 Feature	Description
-Incremental Processing	Detects Inserts, Updates, and Deletes
-History	Maintains SCD Type 2 records
-Snapshot	Maintains latest business state
-Parallel Execution	Processes multiple tables concurrently
-Retry Mechanism	Automatically retries transient failures
-Logging	Records detailed execution metrics
-Auditing	Supports monitoring and troubleshooting
-Backfill	Automatically processes pending execution dates
-Metadata Driven	Supports large-scale table onboarding
-Scalable Design	Handles hundreds of source tables efficiently
+Processing Engine	PySpark on Microsoft Fabric
+Storage	Delta Lakehouse
+Design Pattern	Metadata Driven
+Change Detection	Row-Level Comparison
+History	SCD Type 2
+Snapshot	Latest Current State
+Processing Mode	Incremental
+Parallel Execution	ThreadPoolExecutor
+Logging	Daily and Final Logs
+Retry Logic	Automatic Retry Mechanism
+Monitoring	Audit Framework
+Scalability	Supports 500+ Tables
+Backfill	Automatic Pending Date Processing
+Timezone	CST/CDT for business processing and UTC for operational logging

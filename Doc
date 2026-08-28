@@ -1,111 +1,61 @@
-2. Business Requirement
-2.1 Background
+3. Existing Process
+3.1 Overview
 
-The MHMR organization receives data from multiple source systems on a daily basis. This data is used for operational reporting, analytics, regulatory reporting, and business decision-making. As the volume of data increased and the number of source tables grew, the existing data processing approach became difficult to maintain, monitor, and scale.
+Before implementing the MHMR Data Processing Framework, data ingestion and processing lacked a standardized and scalable approach for managing daily incremental data. As the number of source tables increased, maintaining consistent processing, monitoring execution, and preserving historical data became increasingly challenging.
 
-To address these challenges, a standardized data processing framework was required that could efficiently process daily data loads, identify changes, maintain historical records, and provide reliable audit information for operational monitoring.
+The existing process primarily focused on loading daily data without a unified framework for change detection, historical versioning, snapshot maintenance, or centralized operational logging. This resulted in increased manual effort for monitoring, troubleshooting, and recovering from failed executions.
 
-The MHMR Data Processing Framework was developed on Microsoft Fabric Lakehouse using PySpark to meet these requirements while providing scalability, reliability, and ease of maintenance.
+3.2 Existing Data Flow
+Source Systems
+       │
+       ▼
+ Raw Data Load
+       │
+       ▼
+ Manual Processing
+       │
+       ▼
+ Reporting Tables
+3.3 Challenges in the Existing Process
 
-2.2 Business Problem
+The existing process presented several operational and technical limitations.
 
-Prior to implementing the framework, several operational and technical challenges existed:
+3.3.1 No Standardized Incremental Processing
 
-Daily data processing required significant manual monitoring.
-Historical changes to records were not consistently maintained.
-Identifying inserted, updated, and deleted records across daily loads was inefficient.
-Recovery from failed executions required manual intervention.
-Processing large numbers of tables individually increased execution time.
-Limited audit information made troubleshooting difficult.
-Missing execution dates required manual backfill processing.
-The solution lacked a standardized framework that could be reused across multiple datasets.
+Daily data changes were not processed using a consistent framework. Identifying inserted, updated, and deleted records required additional effort and increased processing complexity.
 
-These challenges increased operational effort, delayed data availability, and reduced visibility into pipeline execution.
+3.3.2 Limited Historical Tracking
 
-2.3 Business Goals
+Historical versions of records were not maintained in a structured manner. Once records were updated, previous values were no longer available for auditing or historical reporting.
 
-The primary business goals of the MHMR Data Processing Framework are:
+3.3.3 No Current-State Snapshot Management
 
-Automate daily data ingestion and processing.
-Detect incremental data changes accurately.
-Preserve complete historical records for business reporting and compliance.
-Maintain the latest snapshot of business data for operational reporting.
-Reduce overall execution time through parallel processing.
-Enable automated recovery from transient failures.
-Provide detailed execution logs for auditing and operational monitoring.
-Support backfill processing for missed execution dates.
-Deliver a scalable framework capable of processing hundreds of tables with minimal configuration.
-2.4 Functional Requirements
+There was no dedicated mechanism to maintain a consolidated snapshot representing the latest version of each business record.
 
-The framework shall provide the following functionality:
+3.3.4 Manual Failure Recovery
 
-Data Ingestion
-Read source data from Raw tables.
-Compare current Raw data with Previous Raw data.
-Detect Inserts, Updates, and Deletes.
-Load incremental changes into the Staging layer.
-History Processing
-Maintain historical versions of records using SCD Type 2.
-Mark active and inactive records appropriately.
-Preserve historical data without overwriting previous versions.
-Snapshot Processing
-Maintain the latest state of each record.
-Replace outdated records with the most recent version.
-Ensure one current version exists for each business key.
-Logging and Auditing
-Record execution status for every processed table.
-Capture processing start time and end time.
-Store record counts for Inserts, Updates, and Deletes.
-Record failures and retry attempts.
-Backfill Processing
-Identify dates that have not been processed.
-Process missing dates automatically in chronological order.
-Prevent duplicate processing.
-2.5 Non-Functional Requirements
+Pipeline failures required manual investigation and rerunning processes, increasing operational effort and delaying data availability.
 
-The framework should satisfy the following quality attributes:
+3.3.5 Limited Operational Visibility
 
-Performance
-Process multiple tables in parallel.
-Minimize execution time for daily loads.
-Avoid unnecessary full-table processing.
-Scalability
-Support more than 500 source tables.
-Allow new tables to be added with minimal code changes.
-Reliability
-Retry failed operations automatically.
-Continue processing remaining tables even if one table fails.
-Maintain detailed failure logs for troubleshooting.
-Maintainability
-Use reusable functions.
-Support metadata-driven execution.
-Keep business logic centralized.
-Auditability
-Capture detailed execution logs.
-Maintain historical processing information.
-Support operational monitoring and compliance requirements.
-2.6 Expected Business Outcomes
+Execution details such as processing status, record counts, execution duration, and failure reasons were not centrally captured, making monitoring and troubleshooting more difficult.
 
-After implementation, the framework provides the following business benefits:
+3.3.6 Sequential Processing
 
-Faster daily data availability.
-Accurate incremental data processing.
-Complete historical tracking of business records.
-Reliable point-in-time snapshots for reporting.
-Reduced manual operational effort.
-Improved visibility into pipeline execution.
-Simplified recovery from failures.
-Standardized processing across all source tables.
-Improved scalability for future business growth.
-2.7 Success Criteria
+Tables were processed sequentially, resulting in longer execution times as the number of source tables increased.
 
-The implementation will be considered successful when:
+3.3.7 No Automated Backfill Support
 
-Daily data loads complete successfully within the expected execution window.
-Inserts, Updates, and Deletes are accurately detected and processed.
-History tables maintain complete SCD Type 2 records.
-Snapshot tables always reflect the latest state of the data.
-Logs accurately capture execution details for every table.
-Failed executions can be recovered through reruns without data inconsistency.
-Backfill processing correctly handles missed dates.
-The framework scales efficiently as additional tables are onboarded.
+If a daily execution was missed, processing historical dates required manual intervention and increased the risk of incomplete data.
+
+3.4 Limitations Summary
+Area	Existing Limitation
+Incremental Processing	No standardized change detection
+Historical Data	Previous versions not preserved
+Snapshot	No latest-state maintenance
+Logging	Limited execution visibility
+Recovery	Manual reruns required
+Performance	Sequential execution
+Scalability	Difficult to onboard additional tables
+Monitoring	Limited operational metrics
+Backfill	Manual processing

@@ -1,324 +1,211 @@
-Chapter 5 – Solution Architecture
-5.1 Architecture Overview
+Chapter 5.11 – Repository Structure and Project Organization
+5.11.1 Overview
 
-The MHMR Data Processing Framework is built on Microsoft Fabric Lakehouse using PySpark and Delta Tables. The solution follows a layered architecture to efficiently process daily data, detect changes, preserve historical records, maintain current-state snapshots, and provide comprehensive operational logging.
+The MHMR Data Processing Framework is organized into multiple notebooks, Lakehouse schemas, and configuration objects within Microsoft Fabric. Each component is designed with a specific responsibility to ensure modularity, maintainability, and scalability.
 
-The framework is metadata-driven, allowing a common processing logic to be reused across hundreds of source tables while ensuring scalability, maintainability, and consistent execution.
+The project follows a layered architecture where data flows from the source system through the Staging, History, and Snapshot layers while maintaining centralized logging and auditing.
 
-The end-to-end data processing consists of the following major layers:
+5.11.2 Project Structure
 
-Source Systems
-Raw Layer
-Previous Raw Layer
-Staging Layer
-History Layer
-Snapshot Layer
-Logging Framework
-Audit and Monitoring
+Note: Replace the notebook names below with the exact names from your Fabric workspace if they differ.
 
-Each layer has a clearly defined responsibility and works together to ensure reliable daily data processing.
+MHMR Workspace
 
-5.2 High-Level Solution Architecture
-                        Source Systems
-                              │
-                              ▼
-                      RAW Source Tables
-                              │
-                              ▼
-                  PREVIOUS RAW Tables
-                              │
-                 Compare Current vs Previous
-                              │
-                              ▼
-                     STAGING Framework
-                (Insert / Update / Delete)
-                              │
-             ┌────────────────┴─────────────────┐
-             ▼                                  ▼
-      HISTORY Framework                 SNAPSHOT Framework
-       (SCD Type 2)                     (Current State)
-             │                                  │
-             └──────────────┬───────────────────┘
-                            ▼
-                    Daily & Final Logs
-                            │
-                            ▼
-                 Audit / Monitoring / Reporting
-5.3 Solution Components
+│
+├── Lakehouse
+│      ├── RAW
+│      ├── PREV_RAW
+│      ├── STAGING
+│      ├── HISTORY
+│      ├── SNAPSHOT
+│      └── LOGS
+│
+├── Notebooks
+│      ├── STAGING Notebook
+│      ├── HISTORY Notebook
+│      ├── SNAPSHOT Notebook
+│
+├── Configuration
+│      ├── Table List
+│      ├── Key Columns
+│      ├── Constants
+│      └── Global Variables
+│
+└── Monitoring
+       ├── Daily Logs
+       └── Final Logs
+5.11.3 Lakehouse Organization
 
-The framework consists of several independent yet interconnected components.
+The project stores data in separate schemas to isolate each stage of the processing lifecycle.
 
-5.3.1 Source Layer
+Schema	Purpose
+RAW	Stores the latest data received from source systems.
+PREV_RAW	Stores the previous execution's source data for comparison.
+STAGING	Stores records identified as Inserts, Updates, and Deletes.
+HISTORY	Maintains historical versions of records using SCD Type 2.
+SNAPSHOT	Maintains the latest version of each business record.
+LOGS	Stores execution logs, audit details, and monitoring information.
+5.11.4 Notebook Responsibilities
+Staging Notebook
 
-The Source Layer contains the operational data received from upstream source systems. These datasets represent the latest available business records and serve as the input for daily processing.
+Purpose
 
-Responsibilities:
-
-Receive daily source data.
-Provide input for downstream processing.
-Maintain latest source records.
-5.3.2 Raw Layer
-
-The Raw Layer stores the current day's source data exactly as received from upstream systems.
-
-Responsibilities:
-
-Preserve incoming source data.
-Act as the primary input for comparison.
-Provide current business records.
-5.3.3 Previous Raw Layer
-
-The Previous Raw Layer stores the previous execution's source data.
-
-This layer enables efficient comparison between the current and previous datasets.
-
-Responsibilities:
-
-Store previous day's source data.
-Enable incremental change detection.
-Support Insert, Update, and Delete identification.
-5.3.4 Staging Layer
-
-The Staging Layer performs row-level comparison between Raw and Previous Raw data.
-
-Based on the comparison, each record is classified as:
-
-Insert
-Update
-Delete
-
-The processed records are written into staging tables, which become the source for downstream History and Snapshot processing.
-
-Responsibilities:
-
-Compare Raw vs Previous Raw.
-Detect data changes.
-Populate staging tables.
+Compare Raw and Previous Raw data.
+Detect Inserts, Updates, and Deletes.
+Generate row hashes.
+Load staging tables.
+Update Previous Raw.
 Generate staging logs.
-5.3.5 History Layer
 
-The History Layer maintains complete historical versions of business records using the Slowly Changing Dimension Type 2 (SCD Type 2) methodology.
+Output
 
-Instead of overwriting existing records, previous versions are retained while new versions are inserted.
+Staging Tables
+Daily Logs
+Final Logs
+Previous Raw Refresh
+History Notebook
 
-Responsibilities:
+Purpose
 
-Preserve historical records.
-Maintain Active and Inactive versions.
-Support historical reporting.
-Enable data auditing.
-5.3.6 Snapshot Layer
+Read Staging data.
+Apply SCD Type 2 logic.
+Maintain Active and Inactive records.
+Support backfill processing.
+Generate execution logs.
 
-The Snapshot Layer maintains the latest version of each business record.
+Output
 
-Unlike History, Snapshot stores only the current state of the data.
+History Tables
+Daily Logs
+Final Logs
+Snapshot Notebook
 
-Responsibilities:
+Purpose
 
-Maintain current business data.
+Read Staging data.
+Build the latest business snapshot.
 Replace outdated records.
-Provide reporting datasets.
-Support operational dashboards.
-5.3.7 Logging Framework
+Maintain one current version of each business key.
+Generate execution logs.
 
-The Logging Framework records execution information for every processed table.
+Output
 
-Information captured includes:
+Snapshot Tables
+Daily Logs
+Final Logs
+5.11.5 Configuration Components
 
-Processing status
-Execution timestamps
-Record counts
-Retry attempts
-Error details
-Processing duration
+The framework uses centralized configuration to minimize hard-coded values.
 
-The logs provide complete operational visibility into pipeline execution.
+Configuration includes:
 
-5.3.8 Audit Framework
+Table Names
+Business Key Columns
+Maximum Retry Count
+Sleep Duration Between Retries
+Maximum Parallel Workers
+Timezone Settings
+Catalog Names
+Schema Names
+Log Table Names
 
-The Audit Framework provides centralized monitoring and validation of all pipeline executions.
+This allows new tables to be onboarded with minimal code changes.
 
-It enables:
+5.11.6 Log Tables
 
-Daily monitoring
-Failure analysis
-Operational reporting
-Data validation
-Processing statistics
-5.4 Data Flow
+Separate log tables are maintained for each framework.
 
-The overall processing flow follows the sequence below.
+Staging Logs
 
-Receive Source Data
+Capture
 
-        │
-
-        ▼
-
-Load RAW Tables
-
-        │
-
-        ▼
-
-Compare with Previous RAW
-
-        │
-
-        ▼
-
-Generate Row Hash
-
-        │
-
-        ▼
-
-Identify
-
-Insert
-Update
-Delete
-
-        │
-
-        ▼
-
-Load STAGING
-
-        │
-
-        ├───────────────┐
-        ▼               ▼
-
-History           Snapshot
-
-        │               │
-
-        └───────┬───────┘
-
-                ▼
-
-          Daily Logs
-
-                ▼
-
-          Final Logs
-
-                ▼
-
-       Audit & Monitoring
-5.5 Processing Architecture
-
-The framework follows a modular architecture where each processing layer executes independently while sharing common utility functions.
-
-Configuration
-
-        │
-
-        ▼
-
-Table List
-
-        │
-
-        ▼
-
-Driver Program
-
-        │
-
-        ▼
-
-Thread Pool
-
-        │
-
-        ├──────────┬──────────┬──────────┐
-
-        ▼          ▼          ▼          ▼
-
-    Table 1    Table 2    Table 3    Table N
-
-        │          │          │
-
-        ▼          ▼          ▼
-
-Retry Mechanism
-
-        │
-
-        ▼
-
-Logging
-
-        │
-
-        ▼
-
-Completion
-5.6 Metadata-Driven Design
-
-Instead of writing separate code for every source table, the framework uses metadata to drive execution.
-
-The metadata contains information such as:
-
+Processing Status
 Table Name
-Primary Key Column(s)
-Source Table
-Target Table
-Processing Configuration
+Processing Date
+Insert Count
+Update Count
+Delete Count
+Start Time
+End Time
+Duration
+History Logs
 
-Using this approach:
+Capture
 
-The same processing logic is reused across all tables.
-New tables can be onboarded with minimal effort.
-Maintenance becomes significantly easier.
-5.7 Parallel Processing
+Processing Status
+Insert Count
+Update Count
+Delete Count
+Active Records
+Retry Count
+Error Details
+Execution Duration
+Snapshot Logs
 
-To improve performance, tables are processed concurrently using a thread pool.
+Capture
 
-Each table is executed independently.
+Processing Status
+Snapshot Records
+Retry Count
+Start Time
+End Time
+Error Details
+5.11.7 Configuration Parameters
+Parameter	Description
+Catalog	MHMR_LAKEHOUSE
+Session Timezone	America/Chicago
+Retry Count	Configurable
+Retry Delay	Configurable
+Parallel Workers	Configurable
+Auto Merge	Enabled
+Delta Tables	Enabled
+5.11.8 Execution Sequence
 
-Benefits include:
+The notebooks are executed in the following order:
 
-Reduced execution time.
-Better utilization of Spark resources.
-Failure isolation.
-Improved scalability.
-5.8 Error Handling Strategy
+Raw Data Arrival
+        │
+        ▼
+Staging Notebook
+        │
+        ▼
+History Notebook
+        │
+        ▼
+Snapshot Notebook
+        │
+        ▼
+Audit Logs
 
-The framework includes a robust error handling mechanism.
+Each notebook depends on the successful completion of the previous stage to ensure data consistency across the pipeline.
 
-If processing fails:
+5.11.9 Data Dependencies
 
-The exception is captured.
-Retry logic is initiated.
-Processing is attempted again.
-Failure information is written into log tables.
-Remaining tables continue processing.
+The relationship between layers is illustrated below:
 
-This prevents a single table failure from stopping the complete pipeline.
+RAW
+ │
+ ▼
+PREV_RAW
+ │
+ ▼
+STAGING
+ │
+ ├─────────────┐
+ ▼             ▼
+HISTORY    SNAPSHOT
+ │             │
+ └──────┬──────┘
+        ▼
+     LOG TABLES
+5.11.10 Security and Access
 
-5.9 Timezone Strategy
+Access to the MHMR Data Processing Framework should be managed using role-based access control (RBAC). Users should be granted permissions based on their responsibilities.
 
-The framework standardizes timestamp handling to ensure consistency across executions.
+Role	Responsibilities
+Developer	Develop and maintain notebooks, perform testing, and implement enhancements.
+Data Engineer	Monitor pipeline executions, troubleshoot issues, and support production processing.
+Administrator	Manage Lakehouse objects, workspace configurations, security, and deployment activities.
+Business User	Read-only access to reporting datasets and approved downstream outputs.
 
-Business processing follows the configured CST/CDT timezone.
-Log tables additionally capture UTC timestamps to support global operational monitoring.
-This dual-timezone approach improves traceability across different geographic regions while preserving business reporting requirements.
-5.10 Architecture Highlights
-Feature	Description
-Processing Engine	PySpark on Microsoft Fabric
-Storage	Delta Lakehouse
-Design Pattern	Metadata Driven
-Change Detection	Row-Level Comparison
-History	SCD Type 2
-Snapshot	Latest Current State
-Processing Mode	Incremental
-Parallel Execution	ThreadPoolExecutor
-Logging	Daily and Final Logs
-Retry Logic	Automatic Retry Mechanism
-Monitoring	Audit Framework
-Scalability	Supports 500+ Tables
-Backfill	Automatic Pending Date Processing
-Timezone	CST/CDT for business processing and UTC for operational logging
+Sensitive operational log tables should be accessible only to authorized technical users.

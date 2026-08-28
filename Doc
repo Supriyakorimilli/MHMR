@@ -1,61 +1,124 @@
-3. Existing Process
-3.1 Overview
+4. Proposed Solution
+4.1 Solution Overview
 
-Before implementing the MHMR Data Processing Framework, data ingestion and processing lacked a standardized and scalable approach for managing daily incremental data. As the number of source tables increased, maintaining consistent processing, monitoring execution, and preserving historical data became increasingly challenging.
+To overcome the limitations of the existing process, a reusable and scalable data processing framework was developed using Microsoft Fabric Lakehouse and PySpark.
 
-The existing process primarily focused on loading daily data without a unified framework for change detection, historical versioning, snapshot maintenance, or centralized operational logging. This resulted in increased manual effort for monitoring, troubleshooting, and recovering from failed executions.
+The framework standardizes the end-to-end processing of daily data across all source tables by introducing automated change detection, historical data management, snapshot generation, centralized logging, parallel execution, and backfill support.
 
-3.2 Existing Data Flow
-Source Systems
-       │
-       ▼
- Raw Data Load
-       │
-       ▼
- Manual Processing
-       │
-       ▼
- Reporting Tables
-3.3 Challenges in the Existing Process
+The implementation follows a metadata-driven design, allowing hundreds of source tables to be processed using a common framework with minimal configuration.
 
-The existing process presented several operational and technical limitations.
+4.2 High-Level Architecture
+                Source Systems
+                      │
+                      ▼
+                 RAW Layer
+                      │
+                      ▼
+              Previous RAW Comparison
+                      │
+                      ▼
+                STAGING Layer
+                      │
+        ┌─────────────┴─────────────┐
+        ▼                           ▼
+ HISTORY Layer                SNAPSHOT Layer
+ (SCD Type 2)                 (Current State)
+        │                           │
+        └─────────────┬─────────────┘
+                      ▼
+             Daily & Final Logs
+                      │
+                      ▼
+          Reporting & Monitoring
+4.3 Key Components
 
-3.3.1 No Standardized Incremental Processing
+The solution consists of the following major components:
 
-Daily data changes were not processed using a consistent framework. Identifying inserted, updated, and deleted records required additional effort and increased processing complexity.
+Raw Layer
 
-3.3.2 Limited Historical Tracking
+Stores the latest source data received from upstream systems.
 
-Historical versions of records were not maintained in a structured manner. Once records were updated, previous values were no longer available for auditing or historical reporting.
+Previous Raw Layer
 
-3.3.3 No Current-State Snapshot Management
+Maintains the previous execution's source data to enable comparison with the current data.
 
-There was no dedicated mechanism to maintain a consolidated snapshot representing the latest version of each business record.
+Staging Layer
 
-3.3.4 Manual Failure Recovery
+Performs row-level change detection by identifying Inserts, Updates, and Deletes before downstream processing.
 
-Pipeline failures required manual investigation and rerunning processes, increasing operational effort and delaying data availability.
+History Layer
 
-3.3.5 Limited Operational Visibility
+Maintains complete historical versions of business records using the Slowly Changing Dimension Type 2 (SCD Type 2) methodology.
 
-Execution details such as processing status, record counts, execution duration, and failure reasons were not centrally captured, making monitoring and troubleshooting more difficult.
+Snapshot Layer
 
-3.3.6 Sequential Processing
+Maintains the latest version of each business record for reporting and downstream consumption.
 
-Tables were processed sequentially, resulting in longer execution times as the number of source tables increased.
+Logging Framework
 
-3.3.7 No Automated Backfill Support
+Captures execution details including processing status, timestamps, execution duration, record counts, retry information, and error details.
 
-If a daily execution was missed, processing historical dates required manual intervention and increased the risk of incomplete data.
+Audit Framework
 
-3.4 Limitations Summary
-Area	Existing Limitation
-Incremental Processing	No standardized change detection
-Historical Data	Previous versions not preserved
-Snapshot	No latest-state maintenance
-Logging	Limited execution visibility
-Recovery	Manual reruns required
-Performance	Sequential execution
-Scalability	Difficult to onboard additional tables
-Monitoring	Limited operational metrics
-Backfill	Manual processing
+Provides operational visibility and enables monitoring, validation, and troubleshooting of pipeline executions.
+
+4.4 Key Features
+
+The proposed framework introduces several enhancements:
+
+Automated incremental processing
+Row-level change detection
+Historical data preservation
+Current-state snapshot generation
+Parallel processing
+Retry mechanism
+Automated backfill processing
+Comprehensive logging
+Audit reporting
+Metadata-driven execution
+Error handling and recovery
+Scalability across hundreds of source tables
+4.5 Benefits
+
+The implementation provides several operational and business benefits.
+
+Improved Performance
+
+Parallel execution significantly reduces overall processing time compared to sequential processing.
+
+Increased Reliability
+
+Retry mechanisms and comprehensive error handling improve pipeline stability.
+
+Better Data Quality
+
+Standardized change detection ensures accurate processing of Inserts, Updates, and Deletes.
+
+Complete Historical Tracking
+
+Historical records are preserved for reporting, auditing, and regulatory purposes.
+
+Operational Visibility
+
+Detailed logs provide complete insight into execution status and processing metrics.
+
+Scalability
+
+The metadata-driven framework allows new tables to be onboarded without major code changes.
+
+Simplified Maintenance
+
+Reusable processing logic reduces code duplication and simplifies future enhancements.
+
+4.6 Solution Highlights
+Feature	Description
+Incremental Processing	Detects Inserts, Updates, and Deletes
+History	Maintains SCD Type 2 records
+Snapshot	Maintains latest business state
+Parallel Execution	Processes multiple tables concurrently
+Retry Mechanism	Automatically retries transient failures
+Logging	Records detailed execution metrics
+Auditing	Supports monitoring and troubleshooting
+Backfill	Automatically processes pending execution dates
+Metadata Driven	Supports large-scale table onboarding
+Scalable Design	Handles hundreds of source tables efficiently

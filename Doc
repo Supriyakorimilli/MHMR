@@ -272,3 +272,21 @@ The Source-to-RAW ingestion layer is the foundation of the MHMR data processing 
 The six Master Pipelines coordinate multiple child pipelines that process Active Table Lists containing more than 500 source tables. Tables are filtered based on their source database, processed through ForEach activities, and dynamically loaded into the Fabric UAT-EHR RAW layer.
 
 After RAW ingestion, supporting notebook logic prepares the tables and generates row-hash values. These RAW tables then become the input for the Staging framework and all subsequent History, Snapshot, Dimension, and Fact processing.
+
+
+
+## 6.8 Row Hash Processing
+
+After the source data is successfully loaded into the RAW layer, a row hash is generated for each record using the relevant source columns. The row hash provides a compact representation of the record and is later used to identify changes between the current RAW data and the previous RAW data.
+
+The business key and row hash are used together to determine the type of change:
+
+* **Insert (I):** A record is identified as an Insert when its key exists in the current RAW table but does not exist in the Previous RAW table. This indicates that a new record has been added to the source system.
+
+* **Update (U):** A record is identified as an Update when the same key exists in both the current RAW and Previous RAW tables, but the row-hash values are different. This indicates that one or more values in the existing record have changed.
+
+* **Delete (D):** A record is identified as a Delete when its key exists in the Previous RAW table but is no longer present in the current RAW table. This indicates that the record has been removed from the source dataset.
+
+* **No Change:** When the same key exists in both RAW and Previous RAW and the row-hash values are identical, the record is considered unchanged and does not require further change processing.
+
+The actual Insert, Update, and Delete classification is performed in the downstream **Staging Framework**, while the RAW ingestion process prepares the required row-hash values for this comparison.

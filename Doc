@@ -1,211 +1,274 @@
-Chapter 5.11 – Repository Structure and Project Organization
-5.11.1 Overview
+# Chapter 6 – Source-to-RAW Data Ingestion and Master Pipeline Framework
 
-The MHMR Data Processing Framework is organized into multiple notebooks, Lakehouse schemas, and configuration objects within Microsoft Fabric. Each component is designed with a specific responsibility to ensure modularity, maintainability, and scalability.
+## 6.1 Overview
 
-The project follows a layered architecture where data flows from the source system through the Staging, History, and Snapshot layers while maintaining centralized logging and auditing.
+The Source-to-RAW Data Ingestion Framework is the entry point of the MHMR data processing architecture. It is implemented in the **UAT-EHR Microsoft Fabric environment** and is responsible for loading more than 500 source tables into the Fabric Lakehouse RAW layer.
 
-5.11.2 Project Structure
+The framework uses **six Master Pipelines**, each invoking multiple child pipelines. Source tables are divided into Active Table Lists, and the pipeline dynamically processes only the tables marked as Active.
 
-Note: Replace the notebook names below with the exact names from your Fabric workspace if they differ.
+The source tables originate from databases such as **PM, MSO, and CWS**. Based on the database metadata, the pipeline filters the tables, selects the appropriate source connection, and loads them into the RAW layer in Fabric.
 
-MHMR Workspace
+After the RAW data is loaded, supporting notebooks are used for RAW table preparation and row-hash generation. The resulting RAW tables are then used by the downstream Staging, History, Snapshot, Dimension, and Fact frameworks.
 
-│
-├── Lakehouse
-│      ├── RAW
-│      ├── PREV_RAW
-│      ├── STAGING
-│      ├── HISTORY
-│      ├── SNAPSHOT
-│      └── LOGS
-│
-├── Notebooks
-│      ├── STAGING Notebook
-│      ├── HISTORY Notebook
-│      ├── SNAPSHOT Notebook
-│
-├── Configuration
-│      ├── Table List
-│      ├── Key Columns
-│      ├── Constants
-│      └── Global Variables
-│
-└── Monitoring
-       ├── Daily Logs
-       └── Final Logs
-5.11.3 Lakehouse Organization
+---
 
-The project stores data in separate schemas to isolate each stage of the processing lifecycle.
+## 6.2 High-Level Architecture
 
-Schema	Purpose
-RAW	Stores the latest data received from source systems.
-PREV_RAW	Stores the previous execution's source data for comparison.
-STAGING	Stores records identified as Inserts, Updates, and Deletes.
-HISTORY	Maintains historical versions of records using SCD Type 2.
-SNAPSHOT	Maintains the latest version of each business record.
-LOGS	Stores execution logs, audit details, and monitoring information.
-5.11.4 Notebook Responsibilities
-Staging Notebook
+```text
+                    Source Systems
+                         |
+                         v
+                  UAT-EHR Fabric
+                         |
+                         v
+                 6 Master Pipelines
+                         |
+                         v
+                   Child Pipelines
+                         |
+                         v
+                 Active Table Lists
+                         |
+                         v
+                Database-Based Filters
+                  /       |       \
+                PM       MSO      CWS
+                  \       |       /
+                         v
+                  ForEach Activity
+                         |
+                         v
+           Source / Target Configuration
+                         |
+                         v
+                    RAW Data Load
+                         |
+                         v
+               Table Creation Notebook
+                         |
+                         v
+                 Row Hash Processing
+                         |
+                         v
+                 Fabric RAW Layer
+                         |
+            +------------+------------+
+            |            |            |
+            v            v            v
+         Staging      History      Snapshot
+                                      |
+                                Dimension / Fact
+```
 
-Purpose
+---
 
-Compare Raw and Previous Raw data.
-Detect Inserts, Updates, and Deletes.
-Generate row hashes.
-Load staging tables.
-Update Previous Raw.
-Generate staging logs.
+## 6.3 Master Pipeline Design
 
-Output
+The ingestion framework contains **six Master Pipelines**. Each Master Pipeline invokes approximately **two to three child pipelines**.
 
-Staging Tables
-Daily Logs
-Final Logs
-Previous Raw Refresh
-History Notebook
+The purpose of this design is to distribute the processing workload and avoid maintaining one large pipeline for all source tables.
 
-Purpose
+The overall structure is:
 
-Read Staging data.
-Apply SCD Type 2 logic.
-Maintain Active and Inactive records.
-Support backfill processing.
-Generate execution logs.
+```text
+6 Master Pipelines
+        |
+        v
+Multiple Child Pipelines
+        |
+        v
+Active Table Lists
+        |
+        v
+500+ Source Tables
+```
 
-Output
+Each Active Table List typically contains around **25–50 tables**.
 
-History Tables
-Daily Logs
-Final Logs
-Snapshot Notebook
+---
 
-Purpose
+## 6.4 Active Table List
 
-Read Staging data.
-Build the latest business snapshot.
-Replace outdated records.
-Maintain one current version of each business key.
-Generate execution logs.
+The Active Table Lists act as the metadata source for pipeline execution.
 
-Output
+Typical metadata includes:
 
-Snapshot Tables
-Daily Logs
-Final Logs
-5.11.5 Configuration Components
+| Attribute  | Purpose                            |
+| ---------- | ---------------------------------- |
+| Table Name | Source table to be processed       |
+| Key Column | Key used for downstream comparison |
+| Status     | Active / Inactive                  |
+| Database   | PM, MSO, CWS                       |
+| Schema     | Source schema                      |
+| Load Type  | Defines the configured load method |
 
-The framework uses centralized configuration to minimize hard-coded values.
+Only tables marked as **Active** are selected for processing.
 
-Configuration includes:
+This metadata-driven design allows tables to be added, removed, activated, or deactivated without creating separate pipelines for every table.
 
-Table Names
-Business Key Columns
-Maximum Retry Count
-Sleep Duration Between Retries
-Maximum Parallel Workers
-Timezone Settings
-Catalog Names
-Schema Names
-Log Table Names
+---
 
-This allows new tables to be onboarded with minimal code changes.
+## 6.5 Database-Based Filtering
 
-5.11.6 Log Tables
+The source tables belong to multiple databases, mainly:
 
-Separate log tables are maintained for each framework.
+* PM
+* MSO
+* CWS
 
-Staging Logs
+After the Active Table List is read, Filter activities separate the tables based on the database value.
 
-Capture
+```text
+Active Tables
+     |
+     v
+ Database Field
+   /    |    \
+ PM    MSO   CWS
+```
 
-Processing Status
-Table Name
-Processing Date
-Insert Count
-Update Count
-Delete Count
-Start Time
-End Time
-Duration
-History Logs
+Each filtered group is then processed using the corresponding source connection.
 
-Capture
+---
 
-Processing Status
-Insert Count
-Update Count
-Delete Count
-Active Records
-Retry Count
-Error Details
-Execution Duration
-Snapshot Logs
+## 6.6 ForEach Processing
 
-Capture
+The filtered table collection is passed to a **ForEach activity**.
 
-Processing Status
-Snapshot Records
-Retry Count
-Start Time
-End Time
-Error Details
-5.11.7 Configuration Parameters
-Parameter	Description
-Catalog	MHMR_LAKEHOUSE
-Session Timezone	America/Chicago
-Retry Count	Configurable
-Retry Delay	Configurable
-Parallel Workers	Configurable
-Auto Merge	Enabled
-Delta Tables	Enabled
-5.11.8 Execution Sequence
+For every table, the pipeline dynamically retrieves:
 
-The notebooks are executed in the following order:
+* Table Name
+* Database
+* Schema
+* Load Type
+* Source Connection
+* Target Connection
 
-Raw Data Arrival
-        │
-        ▼
-Staging Notebook
-        │
-        ▼
-History Notebook
-        │
-        ▼
-Snapshot Notebook
-        │
-        ▼
-Audit Logs
+The table is then loaded into the Fabric RAW layer.
 
-Each notebook depends on the successful completion of the previous stage to ensure data consistency across the pipeline.
+This enables the same pipeline logic to be reused across hundreds of tables.
 
-5.11.9 Data Dependencies
+---
 
-The relationship between layers is illustrated below:
+## 6.7 RAW Table Creation and Data Load
 
-RAW
- │
- ▼
-PREV_RAW
- │
- ▼
-STAGING
- │
- ├─────────────┐
- ▼             ▼
-HISTORY    SNAPSHOT
- │             │
- └──────┬──────┘
-        ▼
-     LOG TABLES
-5.11.10 Security and Access
+The destination for the ingestion process is the **UAT-EHR Fabric Lakehouse RAW layer**.
 
-Access to the MHMR Data Processing Framework should be managed using role-based access control (RBAC). Users should be granted permissions based on their responsibilities.
+A supporting notebook is used to create or prepare the required RAW tables before or during ingestion.
 
-Role	Responsibilities
-Developer	Develop and maintain notebooks, perform testing, and implement enhancements.
-Data Engineer	Monitor pipeline executions, troubleshoot issues, and support production processing.
-Administrator	Manage Lakehouse objects, workspace configurations, security, and deployment activities.
-Business User	Read-only access to reporting datasets and approved downstream outputs.
+The process is:
 
-Sensitive operational log tables should be accessible only to authorized technical users.
+```text
+Source Table
+     |
+     v
+Source Connection
+     |
+     v
+Fabric Pipeline
+     |
+     v
+RAW Table Creation / Preparation
+     |
+     v
+RAW Data Load
+```
+
+The RAW layer serves as the standardized input for downstream processing.
+
+---
+
+## 6.8 Row Hash Processing
+
+After the RAW data is loaded, row-hash logic is applied to the required tables.
+
+The row hash represents the data values of a record and is later used by the Staging framework to identify changes.
+
+Example:
+
+```text
+Current RAW              Previous RAW
+
+Key = 1001               Key = 1001
+Hash = ABC123            Hash = ABC123
+
+Result: No Change
+```
+
+If the hash values differ:
+
+```text
+Current RAW              Previous RAW
+
+Key = 1001               Key = 1001
+Hash = XYZ789            Hash = ABC123
+
+Result: Update
+```
+
+Detailed row-hash logic is explained later in the dedicated Change Detection chapter.
+
+---
+
+## 6.9 End-to-End Execution Flow
+
+```text
+Master Pipeline
+      |
+      v
+Invoke Child Pipeline
+      |
+      v
+Read Active Table List
+      |
+      v
+Filter Tables by Database
+      |
+      v
+ForEach Table
+      |
+      v
+Select Source / Target
+      |
+      v
+Create / Prepare RAW Table
+      |
+      v
+Load Data into RAW
+      |
+      v
+Update Row Hash
+      |
+      v
+RAW Data Ready
+      |
+      v
+Staging Processing
+```
+
+---
+
+## 6.10 Key Benefits
+
+The Source-to-RAW framework provides the following benefits:
+
+* Supports 500+ source tables.
+* Uses reusable Master and Child pipelines.
+* Reduces the need for table-specific pipelines.
+* Supports multiple source databases.
+* Uses metadata-driven processing.
+* Enables dynamic source and destination handling.
+* Standardizes RAW table creation.
+* Prepares data for downstream change detection.
+* Simplifies onboarding of new source tables.
+* Provides a scalable foundation for Staging, History, Snapshot, Dimension, and Fact processing.
+
+---
+
+## 6.11 Summary
+
+The Source-to-RAW ingestion layer is the foundation of the MHMR data processing framework.
+
+The six Master Pipelines coordinate multiple child pipelines that process Active Table Lists containing more than 500 source tables. Tables are filtered based on their source database, processed through ForEach activities, and dynamically loaded into the Fabric UAT-EHR RAW layer.
+
+After RAW ingestion, supporting notebook logic prepares the tables and generates row-hash values. These RAW tables then become the input for the Staging framework and all subsequent History, Snapshot, Dimension, and Fact processing.

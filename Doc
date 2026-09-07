@@ -1,292 +1,412 @@
-# Chapter 6 – Source-to-RAW Data Ingestion and Master Pipeline Framework
+# Chapter 7 – Staging Framework
 
-## 6.1 Overview
+## 7.1 Overview
 
-The Source-to-RAW Data Ingestion Framework is the entry point of the MHMR data processing architecture. It is implemented in the **UAT-EHR Microsoft Fabric environment** and is responsible for loading more than 500 source tables into the Fabric Lakehouse RAW layer.
+The Staging Framework identifies record-level changes between the latest source data stored in **RAW** and the previously processed data stored in **PREV_RAW**.
 
-The framework uses **six Master Pipelines**, each invoking multiple child pipelines. Source tables are divided into Active Table Lists, and the pipeline dynamically processes only the tables marked as Active.
+The framework is metadata-driven and primarily uses:
 
-The source tables originate from databases such as **PM, MSO, and CWS**. Based on the database metadata, the pipeline filters the tables, selects the appropriate source connection, and loads them into the RAW layer in Fabric.
+* **TABLE_NAME** – identifies the table to be processed.
+* **KEY_COLUMN** – identifies the configured key used to match records.
+* **ROW_HASH** – identifies whether the values of an existing record have changed.
 
-After the RAW data is loaded, supporting notebooks are used for RAW table preparation and row-hash generation. The resulting RAW tables are then used by the downstream Staging, History, Snapshot, Dimension, and Fact frameworks.
+Based on the comparison, records are classified as:
+
+* **I – Insert**
+* **U – Update**
+* **D – Delete**
+
+The current implementation is built around four operational concepts:
+
+1. **Row Hash Change Detection**
+2. **ThreadPoolExecutor for Parallel Processing**
+3. **Failure Handling and Controlled Rerun**
+4. **Auditing and Logging**
 
 ---
 
-## 6.2 High-Level Architecture
+## 7.2 Staging Architecture
 
 ```text
-                    Source Systems
-                         |
-                         v
-                  UAT-EHR Fabric
-                         |
-                         v
-                 6 Master Pipelines
-                         |
-                         v
-                   Child Pipelines
-                         |
-                         v
-                 Active Table Lists
-                         |
-                         v
-                Database-Based Filters
-                  /       |       \
-                PM       MSO      CWS
-                  \       |       /
-                         v
-                  ForEach Activity
-                         |
-                         v
-           Source / Target Configuration
-                         |
-                         v
-                    RAW Data Load
-                         |
-                         v
-               Table Creation Notebook
-                         |
-                         v
-                 Row Hash Processing
-                         |
-                         v
-                 Fabric RAW Layer
-                         |
-            +------------+------------+
-            |            |            |
-            v            v            v
-         Staging      History      Snapshot
-                                      |
-                                Dimension / Fact
+                 TABLES_LIST
+          TABLE_NAME + KEY_COLUMN
+                      |
+                      v
+              ThreadPoolExecutor
+                (4 Workers)
+                      |
+                      v
+              +---------------+
+              |               |
+              v               v
+             RAW          PREV_RAW
+          Current Data   Previous Data
+              |               |
+              +-------+-------+
+                      |
+                      v
+             Match by KEY_COLUMN
+                      |
+                      v
+               Compare ROW_HASH
+                      |
+            +---------+---------+
+            |         |         |
+            v         v         v
+         INSERT     UPDATE    DELETE
+           (I)        (U)       (D)
+            \         |         /
+             +--------+--------+
+                      |
+                      v
+                   STAGING
+                      |
+                      v
+               Daily Audit Log
+                      |
+                      v
+              Refresh PREV_RAW
+                      |
+                      v
+            PREV_RAW_SNAPSHOT
+                      |
+                      v
+              Ready for Next Run
 ```
 
 ---
 
-## 6.3 Master Pipeline Design
+## 7.3 Metadata-Driven Processing
 
-The ingestion framework contains **six Master Pipelines**. Each Master Pipeline invokes approximately **two to three child pipelines**.
+The same Staging logic is reused across the configured table inventory rather than maintaining separate comparison code for each table.
 
-The purpose of this design is to distribute the processing workload and avoid maintaining one large pipeline for all source tables.
+For every table, the framework reads the required metadata from **TABLES_LIST**.
 
-The overall structure is:
+| Metadata   | Purpose                                                     |
+| ---------- | ----------------------------------------------------------- |
+| TABLE_NAME | Determines the RAW, PREV_RAW, and Staging table to process  |
+| KEY_COLUMN | Determines how records are matched between RAW and PREV_RAW |
+
+The framework also supports multiple configured key columns when they are provided as comma-separated values.
+
+The table name and key configuration therefore determine **what table is processed and how its records are compared**.
+
+---
+
+## 7.4 RAW, PREV_RAW and PREV_RAW_SNAPSHOT
+
+Three main data areas participate in Staging processing.
+
+### RAW
+
+Contains the latest source data loaded through the Source-to-RAW pipeline framework.
+
+### PREV_RAW
+
+Contains the baseline used to compare the latest RAW data against the previously processed state.
+
+### PREV_RAW_SNAPSHOT
+
+After successful comparison, PREV_RAW is refreshed using the latest RAW data. A dated **PREV_RAW_SNAPSHOT** is then created from the refreshed PREV_RAW table.
+
+In the current implementation, PREV_RAW_SNAPSHOT therefore represents a dated copy of the newly established comparison baseline.
+
+The sequence is:
 
 ```text
-6 Master Pipelines
-        |
-        v
-Multiple Child Pipelines
-        |
-        v
-Active Table Lists
-        |
-        v
-500+ Source Tables
+Current RAW + Existing PREV_RAW
+              |
+              v
+         Compare Data
+              |
+              v
+         Generate I/U/D
+              |
+              v
+           STAGING
+              |
+              v
+     RAW → Refresh PREV_RAW
+              |
+              v
+ PREV_RAW → PREV_RAW_SNAPSHOT
+              |
+              v
+      Next Run Baseline
 ```
 
-Each Active Table List typically contains around **25–50 tables**.
-
 ---
 
-## 6.4 Active Table List
+## 7.5 Row Hash Change Detection
 
-The Active Table Lists act as the metadata source for pipeline execution.
+The framework first uses the configured **KEY_COLUMN** to determine whether the same record exists in RAW and PREV_RAW.
 
-Typical metadata includes:
+For records existing in both datasets, the **ROW_HASH** values are compared to determine whether the record has changed.
 
-| Attribute  | Purpose                            |
-| ---------- | ---------------------------------- |
-| Table Name | Source table to be processed       |
-| Key Column | Key used for downstream comparison |
-| Status     | Active / Inactive                  |
-| Database   | PM, MSO, CWS                       |
-| Schema     | Source schema                      |
-| Load Type  | Defines the configured load method |
+| Comparison                                   | Staging Status |
+| -------------------------------------------- | -------------- |
+| Key exists in RAW but not PREV_RAW           | **Insert (I)** |
+| Key exists in both and Row Hash differs      | **Update (U)** |
+| Key exists in PREV_RAW but not RAW           | **Delete (D)** |
+| Key exists in both and Row Hash is identical | **No Change**  |
 
-Only tables marked as **Active** are selected for processing.
-
-This metadata-driven design allows tables to be added, removed, activated, or deactivated without creating separate pipelines for every table.
-
----
-
-## 6.5 Database-Based Filtering
-
-The source tables belong to multiple databases, mainly:
-
-* PM
-* MSO
-* CWS
-
-After the Active Table List is read, Filter activities separate the tables based on the database value.
+The logic can be represented as:
 
 ```text
-Active Tables
+                KEY_COLUMN
+                     |
+                     v
+             Compare Existence
+              /      |      \
+             /       |       \
+       RAW Only   Both     PREV Only
+          |         |          |
+          v         v          v
+       INSERT   Compare Hash  DELETE
+                    |
+               +----+----+
+               |         |
+              Same    Different
+               |         |
+          No Change    UPDATE
+```
+
+Only detected **I/U/D changes** are written into the Staging layer.
+
+---
+
+## 7.6 Initial Load Handling
+
+If PREV_RAW does not exist for a table, the current implementation treats the execution as **baseline initialization**.
+
+The current RAW data is copied into PREV_RAW and a dated PREV_RAW_SNAPSHOT is created. An empty Staging table structure is also initialized.
+
+Therefore, during this first baseline execution:
+
+```text
+RAW Available
      |
      v
- Database Field
-   /    |    \
- PM    MSO   CWS
-```
-
-Each filtered group is then processed using the corresponding source connection.
-
----
-
-## 6.6 ForEach Processing
-
-The filtered table collection is passed to a **ForEach activity**.
-
-For every table, the pipeline dynamically retrieves:
-
-* Table Name
-* Database
-* Schema
-* Load Type
-* Source Connection
-* Target Connection
-
-The table is then loaded into the Fabric RAW layer.
-
-This enables the same pipeline logic to be reused across hundreds of tables.
-
----
-
-## 6.7 RAW Table Creation and Data Load
-
-The destination for the ingestion process is the **UAT-EHR Fabric Lakehouse RAW layer**.
-
-A supporting notebook is used to create or prepare the required RAW tables before or during ingestion.
-
-The process is:
-
-```text
-Source Table
+PREV_RAW Missing
      |
      v
-Source Connection
+Initialize PREV_RAW from RAW
      |
      v
-Fabric Pipeline
+Create PREV_RAW_SNAPSHOT
      |
      v
-RAW Table Creation / Preparation
+Initialize STAGING
      |
      v
-RAW Data Load
+I = 0, U = 0, D = 0
 ```
 
-The RAW layer serves as the standardized input for downstream processing.
+From the subsequent execution onward, RAW is compared against the established PREV_RAW baseline to identify actual changes.
 
 ---
 
-## 6.8 Row Hash Processing
+## 7.7 ThreadPoolExecutor – Parallel Table Processing
 
-After the RAW data is loaded, row-hash logic is applied to the required tables.
+The Staging framework uses **ThreadPoolExecutor** to process multiple tables concurrently.
 
-The row hash represents the data values of a record and is later used by the Staging framework to identify changes.
+The current configuration uses:
 
-Example:
+**Maximum Workers = 4**
 
 ```text
-Current RAW              Previous RAW
-
-Key = 1001               Key = 1001
-Hash = ABC123            Hash = ABC123
-
-Result: No Change
+                  TABLES_LIST
+                      |
+                      v
+              ThreadPoolExecutor
+                  4 Workers
+                      |
+        +-------------+-------------+
+        |             |             |
+        v             v             v
+     Table A       Table B       Table C
+        |             |             |
+        v             v             v
+ RAW vs PREV_RAW RAW vs PREV_RAW RAW vs PREV_RAW
 ```
 
-If the hash values differ:
+Each worker independently executes the same change-detection logic using the corresponding **TABLE_NAME and KEY_COLUMN**.
+
+This reduces overall processing time while allowing concurrency to remain controlled based on Fabric capacity.
+
+---
+
+## 7.8 Failure Handling and Controlled Rerun
+
+Table-level exception handling prevents one failed table from stopping the processing of all other tables.
+
+When a table fails, the error is captured and the table is recorded with a **Failed** status in the audit log.
+
+The current code does not automatically retry the table multiple times within the same execution. Instead, the processing framework uses the existing log status to determine whether a table should be processed when the notebook is run again.
 
 ```text
-Current RAW              Previous RAW
-
-Key = 1001               Key = 1001
-Hash = XYZ789            Hash = ABC123
-
-Result: Update
+             Check Today's Status
+                    |
+          +---------+---------+
+          |         |         |
+          v         v         v
+      Succeeded   Failed   Not Processed
+          |         |         |
+          v         v         v
+         Skip     Process    Process
 ```
 
-Detailed row-hash logic is explained later in the dedicated Change Detection chapter.
+This provides controlled rerun capability while preventing successfully processed tables from being unnecessarily processed again on the same day.
 
 ---
 
-## 6.9 End-to-End Execution Flow
+## 7.9 Staging Write Process
+
+Detected changes are first written to a temporary Staging table:
 
 ```text
-Master Pipeline
-      |
-      v
-Invoke Child Pipeline
-      |
-      v
-Read Active Table List
-      |
-      v
-Filter Tables by Database
-      |
-      v
-ForEach Table
-      |
-      v
-Select Source / Target
-      |
-      v
-Create / Prepare RAW Table
-      |
-      v
-Load Data into RAW
-      |
-      v
-Update Row Hash
-      |
-      v
-RAW Data Ready
-      |
-      v
-Staging Processing
+staging.temp_stg_<table_name>
+```
+
+After the temporary write completes, the data is promoted into:
+
+```text
+staging.stg_<table_name>
+```
+
+The temporary table is then removed.
+
+This separates the change-detection output from the final Staging write operation.
+
+The final Staging records contain the source data along with framework columns such as:
+
+* **status** – I/U/D
+* **insert_ts** – processing timestamp
+* **source_table** – originating table name
+
+---
+
+## 7.10 Auditing and Logging
+
+Auditing is integrated into the Staging process to track data loads and table-level processing results.
+
+The framework maintains two log tables:
+
+### Daily Log
+
+Captures individual table-processing results during the current execution.
+
+### Final Log
+
+Consolidates the Daily Log after table processing is completed and maintains the processing history used for status validation and rerun decisions.
+
+Important audit information includes:
+
+| Audit Information | Purpose                     |
+| ----------------- | --------------------------- |
+| Run Date          | Processing date             |
+| Table Name        | Processed table             |
+| Status            | Succeeded / Failed          |
+| Insert Count      | Number of Inserts           |
+| Update Count      | Number of Updates           |
+| Delete Count      | Number of Deletes           |
+| Start Time        | Table processing start      |
+| End Time          | Table processing completion |
+| Duration          | Processing duration         |
+| Error Message     | Failure information         |
+| Insert Timestamp  | Log creation timestamp      |
+
+The timestamps used for operational logging are converted to the **America/Chicago (CST/CDT)** timezone.
+
+---
+
+## 7.11 End-to-End Staging Flow
+
+```text
+              TABLES_LIST
+       TABLE_NAME + KEY_COLUMN
+                    |
+                    v
+            Check Audit Status
+                    |
+                    v
+            ThreadPoolExecutor
+              (4 Workers)
+                    |
+                    v
+              Read RAW
+                    |
+                    v
+            Read PREV_RAW
+                    |
+                    v
+        Match Using KEY_COLUMN
+                    |
+                    v
+           Compare ROW_HASH
+                    |
+          +---------+---------+
+          |         |         |
+          v         v         v
+          I         U         D
+          \         |         /
+           +--------+--------+
+                    |
+                    v
+          Temporary STAGING
+                    |
+                    v
+             Final STAGING
+                    |
+                    v
+             Daily Audit Log
+                    |
+                    v
+        Refresh PREV_RAW from RAW
+                    |
+                    v
+       Create PREV_RAW_SNAPSHOT
+                    |
+                    v
+             Table Complete
+                    |
+                    v
+       Consolidate Final Log
 ```
 
 ---
 
-## 6.10 Key Benefits
+## 7.12 Staging Output
 
-The Source-to-RAW framework provides the following benefits:
+The final output of the Staging Framework is the set of identified changes with the appropriate status:
 
-* Supports 500+ source tables.
-* Uses reusable Master and Child pipelines.
-* Reduces the need for table-specific pipelines.
-* Supports multiple source databases.
-* Uses metadata-driven processing.
-* Enables dynamic source and destination handling.
-* Standardizes RAW table creation.
-* Prepares data for downstream change detection.
-* Simplifies onboarding of new source tables.
-* Provides a scalable foundation for Staging, History, Snapshot, Dimension, and Fact processing.
+* **I** – New record
+* **U** – Existing record changed
+* **D** – Previously existing record is no longer available
+* **No Change** – Not written as a Staging change
+
+The Staging layer therefore acts as the controlled change feed for downstream processing.
+
+```text
+                 STAGING
+              STATUS = I/U/D
+                    |
+           +--------+--------+
+           |                 |
+           v                 v
+        HISTORY           SNAPSHOT
+```
+
+History uses these changes for historical/SCD processing, while Snapshot uses the Staging changes for snapshot processing.
 
 ---
 
-## 6.11 Summary
+## 7.13 Summary
 
-The Source-to-RAW ingestion layer is the foundation of the MHMR data processing framework.
+The Staging Framework compares the latest **RAW** data with **PREV_RAW** using the configured **TABLE_NAME, KEY_COLUMN, and ROW_HASH** to identify Inserts, Updates, and Deletes.
 
-The six Master Pipelines coordinate multiple child pipelines that process Active Table Lists containing more than 500 source tables. Tables are filtered based on their source database, processed through ForEach activities, and dynamically loaded into the Fabric UAT-EHR RAW layer.
+The framework uses **ThreadPoolExecutor with four workers** for parallel table processing and maintains **Daily and Final audit logs** containing processing status, I/U/D counts, timestamps, duration, and error information.
 
-After RAW ingestion, supporting notebook logic prepares the tables and generates row-hash values. These RAW tables then become the input for the Staging framework and all subsequent History, Snapshot, Dimension, and Fact processing.
+PREV_RAW provides the comparison baseline for subsequent executions, while PREV_RAW_SNAPSHOT maintains a dated copy of the refreshed baseline. Failed tables can be processed again during a controlled rerun, while tables already successfully completed for the day are skipped.
 
-
-
-## 6.8 Row Hash Processing
-
-After the source data is successfully loaded into the RAW layer, a row hash is generated for each record using the relevant source columns. The row hash provides a compact representation of the record and is later used to identify changes between the current RAW data and the previous RAW data.
-
-The business key and row hash are used together to determine the type of change:
-
-* **Insert (I):** A record is identified as an Insert when its key exists in the current RAW table but does not exist in the Previous RAW table. This indicates that a new record has been added to the source system.
-
-* **Update (U):** A record is identified as an Update when the same key exists in both the current RAW and Previous RAW tables, but the row-hash values are different. This indicates that one or more values in the existing record have changed.
-
-* **Delete (D):** A record is identified as a Delete when its key exists in the Previous RAW table but is no longer present in the current RAW table. This indicates that the record has been removed from the source dataset.
-
-* **No Change:** When the same key exists in both RAW and Previous RAW and the row-hash values are identical, the record is considered unchanged and does not require further change processing.
-
-The actual Insert, Update, and Delete classification is performed in the downstream **Staging Framework**, while the RAW ingestion process prepares the required row-hash values for this comparison.
+The resulting Staging data provides the standardized change feed required by the downstream **History and Snapshot frameworks**.

@@ -1,2537 +1,382 @@
 # ==============================================================
-# STAGING LOAD — SINGLE TABLE ROW HASH DAILY RUN
-#
-# DAILY PRODUCTION-STYLE TEST
-#
-# RAW vs PREV_RAW Change Detection
-# + Corrected ROW HASH
-# + Existing ROW_HASH excluded from new hash
-# + Datatype alignment
-# + Deterministic hash column order
-# + Canonical JSON hash
-# + Retry Mechanism
-# + ThreadPoolExecutor
-# + Staging Daily/Final Logs
-# + PREV_RAW_SNAPSHOT Backup Before PREV_RAW Overwrite
-# + CST/CDT Log Timestamps
-# + UTC/GMT Log Timestamps
-#
-# DAILY FLOW:
-#
-# TODAY RAW
-#       |
-#       v
-# Compare against PREV_RAW
-#       |
-#       +---- I
-#       +---- U
-#       +---- D
-#       |
-#       v
-# STAGING
-#       |
-# Snapshot OLD PREV_RAW
-#       |
-#       v
-# TODAY RAW becomes NEW PREV_RAW
-#
-# NO SNAPSHOT RESTORE DURING DAILY RUN
-# ==============================================================
-
-
-# ==============================================================
-# IMPORTS
+# Process History Tables — Staging + Change Detection + Logging (CST timestamps)
 # ==============================================================
 
 from pyspark.sql import SparkSession, functions as F, types as T
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from pyspark.sql.utils import AnalysisException
 from datetime import datetime
-import pytz
-import traceback
-import threading
-import re
+from functools import reduce
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import pytz, traceback, os, time
 
+# === INIT SPARK SESSION ===
+spark = SparkSession.builder.appName("Process History Tables").getOrCreate()
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+spark.conf.set("spark.sql.session.timeZone", "UTC")  # keep UTC; convert to CST explicitly
+spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
 
-# ==============================================================
-# INIT SPARK
-# ==============================================================
-
-spark = (
-    SparkSession.builder
-    .appName("STAGING_SINGLE_TABLE_ROW_HASH_DAILY")
-    .getOrCreate()
-)
-
-spark.conf.set(
-    "spark.sql.session.timeZone",
-    "America/Chicago"
-)
-
-spark.conf.set(
-    "spark.databricks.delta.schema.autoMerge.enabled",
-    "true"
-)
-
-spark.conf.set(
-    "spark.sql.autoBroadcastJoinThreshold",
-    -1
-)
-
-spark.conf.set(
-    "spark.sql.parquet.int96RebaseModeInRead",
-    "CORRECTED"
-)
-
-spark.conf.set(
-    "spark.sql.parquet.int96RebaseModeInWrite",
-    "CORRECTED"
-)
-
-spark.conf.set(
-    "spark.sql.legacy.parquet.datetimeRebaseModeInRead",
-    "CORRECTED"
-)
-
-spark.conf.set(
-    "spark.sql.legacy.parquet.datetimeRebaseModeInWrite",
-    "CORRECTED"
-)
-
-
-# ==============================================================
-# TIMEZONES
-# ==============================================================
-
-tz = pytz.timezone(
-    "America/Chicago"
-)
-
-utc_tz = pytz.UTC
-
-
-# ==============================================================
-# CONFIG
-# ==============================================================
-
+# === CONSTANTS / CONFIG ===
 CATALOG = "MHMR_LAKEHOUSE"
+RAW_DB = f"{CATALOG}.RAW"
+PREV_DB = f"{CATALOG}.PREV_RAW"
+SNAP_DB = f"{CATALOG}.PREV_RAW_SNAPSHOT"
+STG_DB = "staging"  # Fabric Lakehouse default schema for staging area
 
-SOURCE_SCHEMA = (
-    f"{CATALOG}.RAW"
-)
+tz = pytz.timezone("America/Chicago")
+Today_date = datetime.now(tz).date()
+def _ts(): return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
-PREV_SCHEMA = (
-    f"{CATALOG}.PREV_RAW"
-)
-
-SNAPSHOT_SCHEMA = (
-    f"{CATALOG}.PREV_RAW_SNAPSHOT"
-)
-
-STAGING_SCHEMA = "STAGING"
-
-LOG_SCHEMA = "LOGS"
-
-
-# ==============================================================
-# TEST / DAILY TABLE SUFFIX
-# ==============================================================
-
-TEST_SUFFIX = "_rowhash_test"
-
-
-# ==============================================================
-# LOG TABLES
-# ==============================================================
-
-STAGING_DAILY_LOG_TBL = (
-    f"{LOG_SCHEMA}.staging_daily_log{TEST_SUFFIX}"
-)
-
-STAGING_FINAL_LOG_TBL = (
-    f"{LOG_SCHEMA}.staging_final_log{TEST_SUFFIX}"
-)
-
-
-# ==============================================================
-# THREADPOOL / RETRY
-# ==============================================================
-
-MAX_WORKERS = 1
-
-MAX_RETRIES = 2
-
-
-# ==============================================================
-# SINGLE TABLE
-# ==============================================================
-
-TEST_TABLE = "admission_data"
-
-TEST_KEY_COLUMN = "blank_row_id"
-
-
-# ==============================================================
-# RUN ID
-# ==============================================================
-
-RUN_ID = datetime.now(
-    tz
-).strftime(
-    "%Y%m%d%H%M%S"
-)
-
-
-# ==============================================================
-# LOG SCHEMA
-# ==============================================================
-
-staging_log_schema = T.StructType([
-
-    T.StructField(
-        "load_date",
-        T.DateType(),
-        True
-    ),
-
-    T.StructField(
-        "table_name",
-        T.StringType(),
-        True
-    ),
-
-    T.StructField(
-        "status",
-        T.StringType(),
-        True
-    ),
-
-    T.StructField(
-        "count",
-        T.LongType(),
-        True
-    ),
-
-    T.StructField(
-        "error_message",
-        T.StringType(),
-        True
-    ),
-
-    # CST/CDT
-    T.StructField(
-        "insert_timestamp",
-        T.TimestampType(),
-        True
-    ),
-
-    T.StructField(
-        "start_time",
-        T.TimestampType(),
-        True
-    ),
-
-    T.StructField(
-        "end_time",
-        T.TimestampType(),
-        True
-    ),
-
-    # UTC/GMT
-    T.StructField(
-        "insert_timestamp_utc",
-        T.TimestampType(),
-        True
-    ),
-
-    T.StructField(
-        "start_time_utc",
-        T.TimestampType(),
-        True
-    ),
-
-    T.StructField(
-        "end_time_utc",
-        T.TimestampType(),
-        True
-    ),
-
-    T.StructField(
-        "load_type",
-        T.StringType(),
-        True
-    )
+# === LOG SCHEMA (legacy-compatible + counts) ===
+log_schema = T.StructType([
+    T.StructField("run_date", T.DateType()),
+    T.StructField("table_name", T.StringType()),
+    T.StructField("status", T.StringType()),
+    T.StructField("error_message", T.StringType()),
+    T.StructField("insert_timestamp", T.TimestampType()),  # CST
+    T.StructField("start_time", T.TimestampType()),        # CST
+    T.StructField("end_time", T.TimestampType()),          # CST
+    T.StructField("duration_sec", T.DoubleType()),
+    T.StructField("inserts", T.IntegerType()),
+    T.StructField("updates", T.IntegerType()),
+    T.StructField("deletes", T.IntegerType())
 ])
 
+# ===== LEGACY-STYLE LOGGING (daily overwrite+union with lock; final left-anti union; reset daily) =====
+LOG_LOCK = "/tmp/logs_legacy.lock"
 
-# ==============================================================
-# LOG MEMORY
-# ==============================================================
+def _acquire_lock(path=LOG_LOCK, timeout=30, interval=0.2):
+    start = time.time()
+    while os.path.exists(path):
+        if time.time() - start > timeout: return False
+        time.sleep(interval)
+    with open(path, "w") as f: f.write("locked")
+    return True
 
-STAGING_LOG_ROWS = []
+def _release_lock(path=LOG_LOCK):
+    try:
+        if os.path.exists(path): os.remove(path)
+    except:
+        pass
 
-LOG_LOCK = threading.Lock()
+def ensure_log_columns_exist():
+    for tbl in ["LOGS.daily_log", "LOGS.final_log"]:
+        try:
+            cols = [f.name.lower() for f in spark.read.table(tbl).schema.fields]
+            add = []
+            if "inserts" not in cols: add.append("inserts INT")
+            if "updates" not in cols: add.append("updates INT")
+            if "deletes" not in cols: add.append("deletes INT")
+            if add:
+                spark.sql(f"ALTER TABLE {tbl} ADD COLUMNS ({', '.join(add)})")
+                print(f"[{_ts()}] Added missing columns to {tbl}: {', '.join(add)}")
+        except Exception as e:
+            print(f"[{_ts()}] Column evolution skipped for {tbl}: {e}")
 
+def ensure_log_tables_exist():
+    print(f"[{_ts()}] Checking log tables existence (legacy mode)...")
+    try:
+        spark.read.table("LOGS.daily_log"); print(f"[{_ts()}] LOGS.daily_log exists.")
+    except:
+        print(f"[{_ts()}] LOGS.daily_log not found. Creating (empty)…")
+        spark.createDataFrame([], log_schema).write.mode("overwrite").saveAsTable("LOGS.daily_log")
+    try:
+        spark.read.table("LOGS.final_log"); print(f"[{_ts()}] LOGS.final_log exists.")
+    except:
+        print(f"[{_ts()}] LOGS.final_log not found. Creating (empty)…")
+        spark.createDataFrame([], log_schema).write.mode("overwrite").saveAsTable("LOGS.final_log")
+    ensure_log_columns_exist()
 
-# ==============================================================
-# CLEAN TABLE NAME
-# ==============================================================
+def _ts_to_cst_from_py(dt_py):
+    return F.from_utc_timestamp(F.lit(dt_py.astimezone(pytz.UTC)).cast("timestamp"), "America/Chicago")
 
-def clean_table_name(table):
+def _legacy_write_daily(row_df):
+    if not _acquire_lock():
+        print(f"[{_ts()}] [LOCK] Could not acquire log lock. Skipping daily_log write for this row.")
+        return
+    try:
+        try:
+            existing = spark.read.table("LOGS.daily_log")
+            r = row_df.first()
+            filtered = existing.filter(~(
+                (F.col("run_date") == r["run_date"]) &
+                (F.col("table_name") == r["table_name"]) &
+                (F.col("status") == r["status"]) &
+                (F.col("end_time") == r["end_time"])
+            ))
+            final_df = filtered.unionByName(row_df)
+        except Exception:
+            final_df = row_df
+        final_df.write.mode("overwrite").saveAsTable("LOGS.daily_log")
+    finally:
+        _release_lock()
 
-    table = str(
-        table
-    ).strip()
+def complete_daily_log(table_name, status, start_time_py, error_message=None, change_counts=None):
+    end_time_py = datetime.now(tz)
+    dur = (end_time_py - start_time_py).total_seconds()
+    i = u = d = 0
+    if change_counts:
+        i = int(change_counts.get("I", 0)); u = int(change_counts.get("U", 0)); d = int(change_counts.get("D", 0))
+    print(f"[{_ts()}] END TABLE: {table_name}\n STATUS: {status}  I:{i} U:{u} D:{d}\n Duration: {dur:.2f}s")
+    print("="*60 + "\n")
+    base_df = spark.createDataFrame([(Today_date, table_name, status, error_message, None, None, None, float(dur), i, u, d)], schema=log_schema)
+    row_df = (base_df
+              .withColumn("start_time", _ts_to_cst_from_py(start_time_py))
+              .withColumn("end_time",   _ts_to_cst_from_py(end_time_py))
+              .withColumn("insert_timestamp", F.from_utc_timestamp(F.current_timestamp(), "America/Chicago")))
+    _legacy_write_daily(row_df)
 
-    if table.upper().endswith(
-        "_RAW"
-    ):
+def consolidate_logs_to_final():
+    print(f"[{_ts()}] Consolidating LOGS.daily_log -> LOGS.final_log (legacy)…")
+    try:
+        daily_df = spark.read.table("LOGS.daily_log")
+    except:
+        print(f"[{_ts()}] No daily_log found; skipping consolidation.")
+        return
+    try:
+        final_df = spark.read.table("LOGS.final_log")
+    except:
+        print(f"[{_ts()}] final_log missing; creating from daily.")
+        daily_df.write.mode("overwrite").saveAsTable("LOGS.final_log")
+        spark.sql("DROP TABLE IF EXISTS LOGS.daily_log")
+        spark.createDataFrame([], log_schema).write.mode("overwrite").saveAsTable("LOGS.daily_log")
+        print(f"[{_ts()}] Consolidation done.")
+        return
+    key_cols = ["run_date", "table_name", "status", "end_time"]
+    cond = [F.col(f"d.{c}") == F.col(f"f.{c}") for c in key_cols]
+    to_add = daily_df.alias("d").join(final_df.select(*key_cols).alias("f"), on=cond, how="left_anti")
+    final_union = final_df.unionByName(to_add)
+    final_union.write.mode("overwrite").saveAsTable("LOGS.final_log")
+    spark.sql("DROP TABLE IF EXISTS LOGS.daily_log")
+    spark.createDataFrame([], log_schema).write.mode("overwrite").saveAsTable("LOGS.daily_log")
+    print(f"[{_ts()}] Final log updated and daily log reset (legacy).")
 
-        table = table[:-4]
+# === SCHEMA/TABLE UTILITIES ===
+def ensure_schema(catalog_schema: str):
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog_schema}")
 
-    return table
+def _table_exists(three_part: str) -> bool:
+    # Expects 'CATALOG.SCHEMA.TABLE'
+    parts = three_part.split(".")
+    if len(parts) != 3:
+        raise ValueError(f"Expect three-part name: CATALOG.SCHEMA.TABLE; got: {three_part}")
+    catalog, schema, table = parts
+    rows = spark.sql(f"SHOW TABLES IN {catalog}.{schema} LIKE '{table}'")
+    return rows.count() > 0
 
+# === SEED PREV FROM RAW (first-run baseline) ===
+def seed_prev_from_raw(table_name: str):
+    raw_tbl  = f"{RAW_DB}.{table_name}_RAW"
+    prev_tbl = f"{PREV_DB}.{table_name}_RAW_PREV"
+    ymd = datetime.now(tz).strftime("%Y%m%d")
+    snap_tbl = f"{SNAP_DB}.{table_name}_RAW_PREV_{ymd}"
 
-# ==============================================================
-# RAW TABLE
-# ==============================================================
+    ensure_schema(PREV_DB)
+    ensure_schema(SNAP_DB)
 
-def src_tbl(table):
+    spark.sql(f"DROP TABLE IF EXISTS {prev_tbl}")
+    spark.sql(f"CREATE TABLE {prev_tbl} AS SELECT * FROM {raw_tbl}")
 
-    table = str(
-        table
-    ).strip()
+    spark.sql(f"DROP TABLE IF EXISTS {snap_tbl}")
+    spark.sql(f"CREATE TABLE {snap_tbl} AS SELECT * FROM {prev_tbl}")
 
-    if table.upper().endswith(
-        "_RAW"
-    ):
+# === DELTA DETECTION LOGIC ===
+def build_changes(raw_df, prev_df, key_columns, row_hash_col, table_name):
+    print(f"[{_ts()}] Detecting changes for: {table_name}")
+    key_predicates = [F.col(f"raw.{k}") == F.col(f"prev.{k}") for k in key_columns]
 
-        return (
-            f"{SOURCE_SCHEMA}.{table}"
-        )
-
-    return (
-        f"{SOURCE_SCHEMA}.{table}_RAW"
+    deletes = (
+        prev_df.alias("prev")
+        .join(raw_df.alias("raw"), key_predicates, "left_anti")
+        .select("prev.*")
+        .withColumn("status", F.lit("D"))
+        .withColumn("insert_ts", F.from_utc_timestamp(F.current_timestamp(), "America/Chicago"))
+        .withColumn("source_table", F.lit(table_name))
     )
 
-
-# ==============================================================
-# STAGING TABLE
-# ==============================================================
-
-def stg_tbl(table):
-
-    table = clean_table_name(
-        table
+    updates = (
+        raw_df.alias("raw")
+        .join(prev_df.alias("prev"), key_predicates, "inner")
+        .filter(F.col(f"raw.{row_hash_col}") != F.col(f"prev.{row_hash_col}"))
+        .select("raw.*")
+        .withColumn("status", F.lit("U"))
+        .withColumn("insert_ts", F.from_utc_timestamp(F.current_timestamp(), "America/Chicago"))
+        .withColumn("source_table", F.lit(table_name))
     )
 
-    return (
-        f"{STAGING_SCHEMA}."
-        f"stg_{table}{TEST_SUFFIX}"
+    prev_null_checks = [F.col(f"prev.{k}").isNull() for k in key_columns]
+    all_prev_null = reduce(lambda a, b: a & b, prev_null_checks)
+
+    inserts = (
+        raw_df.alias("raw")
+        .join(prev_df.alias("prev"), key_predicates, "left")
+        .filter(all_prev_null)
+        .select("raw.*")
+        .withColumn("status", F.lit("I"))
+        .withColumn("insert_ts", F.from_utc_timestamp(F.current_timestamp(), "America/Chicago"))
+        .withColumn("source_table", F.lit(table_name))
     )
 
+    i_count = inserts.count()
+    u_count = updates.count()
+    d_count = deletes.count()
 
-# ==============================================================
-# PREV_RAW TABLE
-# ==============================================================
+    if i_count == 0 and u_count == 0 and d_count == 0:
+        print(f"[{_ts()}] No changes found.")
+        return None, {"I": 0, "U": 0, "D": 0}
 
-def prev_tbl(table):
+    print(f"[{_ts()}] Changes detected — I: {i_count}, U:{u_count}, D:{d_count}")
+    changes_df = deletes.unionByName(updates).unionByName(inserts)
+    return changes_df, {"I": i_count, "U": u_count, "D": d_count}
 
-    table = str(
-        table
-    ).strip()
+def write_to_temp(df, table_name):
+    print(f"[{_ts()}] Writing to {STG_DB}.temp_stg_{table_name}")
+    df.write.mode("overwrite").saveAsTable(f"{STG_DB}.temp_stg_{table_name}")
 
-    if table.upper().endswith(
-        "_RAW"
-    ):
+def promote_to_final(table_name):
+    print(f"[{_ts()}] Promoting to {STG_DB}.stg_{table_name}")
+    spark.sql(f"CREATE TABLE IF NOT EXISTS {STG_DB}.stg_{table_name} AS SELECT * FROM {STG_DB}.temp_stg_{table_name} WHERE 1=0")
+    spark.sql(f"INSERT INTO {STG_DB}.stg_{table_name} SELECT * FROM {STG_DB}.temp_stg_{table_name}")
+    spark.sql(f"DROP TABLE IF EXISTS {STG_DB}.temp_stg_{table_name}")
 
-        return (
-            f"{PREV_SCHEMA}."
-            f"{table}{TEST_SUFFIX}"
-        )
+# === PREV_RAW UPDATE + DATED SNAPSHOT (end-of-run baseline) ===
+def update_prev_raw_and_snapshot(table_name):
+    ymd = datetime.now(tz).strftime("%Y%m%d")
+    raw_tbl  = f"{RAW_DB}.{table_name}_RAW"
+    prev_tbl = f"{PREV_DB}.{table_name}_RAW_PREV"
+    snap_tbl = f"{SNAP_DB}.{table_name}_RAW_PREV_{ymd}"
 
-    return (
-        f"{PREV_SCHEMA}."
-        f"{table}_RAW{TEST_SUFFIX}"
-    )
+    ensure_schema(SNAP_DB)
 
+    print(f"[{_ts()}] Updating PREV_RAW for {table_name} …")
+    spark.sql(f"DROP TABLE IF EXISTS {prev_tbl}")
+    spark.sql(f"CREATE TABLE {prev_tbl} AS SELECT * FROM {raw_tbl}")
 
-# ==============================================================
-# SNAPSHOT TABLE
-# ==============================================================
+    print(f"[{_ts()}] Creating dated snapshot {snap_tbl} …")
+    spark.sql(f"DROP TABLE IF EXISTS {snap_tbl}")
+    spark.sql(f"CREATE TABLE {snap_tbl} AS SELECT * FROM {prev_tbl}")
 
-def snapshot_tbl(table):
-
-    table = str(
-        table
-    ).strip()
-
-    if table.upper().endswith(
-        "_RAW"
-    ):
-
-        return (
-            f"{SNAPSHOT_SCHEMA}."
-            f"{table}{TEST_SUFFIX}"
-        )
-
-    return (
-        f"{SNAPSHOT_SCHEMA}."
-        f"{table}_RAW{TEST_SUFFIX}"
-    )
-
-
-# ==============================================================
-# TABLE EXISTS
-# ==============================================================
-
-def table_exists(table_name):
+# === PROCESS A SINGLE TABLE (unit of work) ===
+def process_table(row):
+    table_name = row["TABLE_NAME"]
+    keys = [k.strip() for k in row["KEY_COLUMN"].split(",") if k.strip()]
+    row_hash_col = "row_hash"
+    start_cst = datetime.now(tz)
 
     try:
+        print(f"[{_ts()}] Reading RAW and PREV_RAW for {table_name}")
 
-        return spark.catalog.tableExists(
-            table_name
-        )
+        raw_tbl  = f"{RAW_DB}.{table_name}_RAW"
+        prev_tbl = f"{PREV_DB}.{table_name}_RAW_PREV"
 
-    except Exception:
+        # Ensure schemas exist (idempotent)
+        ensure_schema(RAW_DB)
+        ensure_schema(PREV_DB)
+        ensure_schema(SNAP_DB)
 
-        try:
+        # Guard 1: RAW must exist
+        if not _table_exists(raw_tbl):
+            msg = f"RAW table missing for {table_name}: {raw_tbl}"
+            print(f"[{_ts()}] {msg}")
+            complete_daily_log(table_name, "Failed", start_cst, msg, change_counts={"I":0,"U":0,"D":0})
+            return
 
-            spark.table(
-                table_name
-            ).limit(
-                1
-            ).count()
+        if not _table_exists(prev_tbl):
+            print(f"[{_ts()}] PREV_RAW not found for {table_name}. Seeding from RAW…")
+            seed_prev_from_raw(table_name)
 
-            return True
+        # === Injected logic to create empty staging table on first run ===
+            raw_df = spark.read.table(raw_tbl)
+            empty_df = raw_df.limit(0).withColumn("status", F.lit("I")) \
+                                .withColumn("insert_ts", F.current_timestamp()) \
+                                .withColumn("source_table", F.lit(table_name))
+            write_to_temp(empty_df, table_name)
+            promote_to_final(table_name)
 
-        except Exception:
-
-            return False
-
-
-# ==============================================================
-# ENSURE SCHEMA
-# ==============================================================
-
-def ensure_schema(schema_name):
-
-    spark.sql(
-        f"""
-        CREATE SCHEMA IF NOT EXISTS {schema_name}
-        """
-    )
+            complete_daily_log(table_name, "Succeeded", start_cst, change_counts={"I":0,"U":0,"D":0})
+            return
 
 
-# ==============================================================
-# NORMALIZE COLUMN NAMES
-# ==============================================================
+        # Normal path
+        raw_df  = spark.read.table(raw_tbl)
+        prev_df = spark.read.table(prev_tbl)
 
-def normalize_columns(df):
+        if raw_df.rdd.isEmpty() and prev_df.rdd.isEmpty():
+            print(f"[{_ts()}] RAW and PREV are both empty for {table_name}. Logging 0/0/0.")
+            complete_daily_log(table_name, "Succeeded", start_cst, change_counts={"I":0,"U":0,"D":0})
+            return
 
-    new_cols = []
+        if not raw_df.schema or not prev_df.schema:
+            print(f"[{_ts()}] Invalid schema for {table_name}. Logging 0/0/0.")
+            complete_daily_log(table_name, "Succeeded", start_cst, change_counts={"I":0,"U":0,"D":0})
+            return
 
-    seen = {}
+        changes_df, change_counts = build_changes(raw_df, prev_df, keys, row_hash_col, table_name)
 
-    for c in df.columns:
-
-        new_c = c.strip()
-
-        new_c = re.sub(
-            r"[ ,;{}()\n\t=]",
-            "_",
-            new_c
-        )
-
-        if new_c in seen:
-
-            seen[new_c] += 1
-
-            new_c = (
-                f"{new_c}_"
-                f"{seen[new_c]}"
-            )
-
+        if changes_df is not None:
+            print(f"[{_ts()}] {table_name} — I:{change_counts['I']} U:{change_counts['U']} D:{change_counts['D']}")
+            write_to_temp(changes_df, table_name)
+            promote_to_final(table_name)
+            update_prev_raw_and_snapshot(table_name)
+            complete_daily_log(table_name, "Succeeded", start_cst, change_counts=change_counts)
         else:
+            update_prev_raw_and_snapshot(table_name)
+            complete_daily_log(table_name, "Succeeded", start_cst, change_counts={"I":0,"U":0,"D":0})
 
-            seen[new_c] = 0
+    except Exception as e:
+        print(f"[{_ts()}] FAILED {table_name}: {str(e)}")
+        traceback.print_exc()
+        complete_daily_log(table_name, "Failed", start_cst, str(e), change_counts={"I":0,"U":0,"D":0})
 
-        new_cols.append(
-            new_c
-        )
+# === MAIN PROCESS ===
+def process_all():
+    ensure_log_tables_exist()
+    print(f"[{_ts()}] Reading TABLES_LIST…")
+    tables_df = spark.read.table("TABLES_LIST")
 
-    for old_c, new_c in zip(
-        df.columns,
-        new_cols
-    ):
+    # Build today's status flags from final_log (post-consolidation)
+    try:
+        final_today = spark.read.table("LOGS.final_log").filter(F.col("run_date") == Today_date)
+    except:
+        final_today = spark.createDataFrame([], log_schema)
 
-        if old_c != new_c:
+    flags_df = (final_today
+                .groupBy("table_name")
+                .agg(
+                    F.max(F.when(F.col("status") == "Failed", 1).otherwise(0)).alias("has_failed"),
+                    F.max(F.when(F.col("status") == "Succeeded", 1).otherwise(0)).alias("has_succeeded")
+                ))
+    flags = {r["table_name"]: (int(r["has_failed"]), int(r["has_succeeded"])) for r in flags_df.collect()}
 
-            df = df.withColumnRenamed(
-                old_c,
-                new_c
-            )
-
-    return df
-
-
-# ==============================================================
-# PARSE KEY COLUMNS
-# ==============================================================
-
-def parse_key_cols(key_column):
-
-    if key_column is None:
-
-        return []
-
-    key_column = str(
-        key_column
-    ).strip()
-
-    if key_column == "":
-
-        return []
-
-    key_column = key_column.replace(
-        "|",
-        ","
-    )
-
-    return [
-
-        k.strip()
-
-        for k in key_column.split(",")
-
-        if k.strip()
-
-    ]
-
-
-# ==============================================================
-# RESOLVE KEY COLUMNS
-# ==============================================================
-
-def resolve_key_columns(
-    df,
-    key_cols
-):
-
-    col_map = {
-
-        c.lower(): c
-
-        for c in df.columns
-
-    }
-
-    resolved = []
-
-    for k in key_cols:
-
-        if k.lower() not in col_map:
-
-            raise Exception(
-                f"Key column missing in RAW table: {k}"
-            )
-
-        resolved.append(
-            col_map[k.lower()]
-        )
-
-    return resolved
-
-
-# ==============================================================
-# ALIGN PREVIOUS TO CURRENT RAW SCHEMA
-#
-# CURRENT RAW IS SOURCE OF TRUTH
-# ==============================================================
-
-def align_previous_to_current(
-    current_df,
-    previous_df
-):
-
-    current_schema = {
-
-        field.name:
-            field.dataType
-
-        for field in current_df.schema.fields
-
-    }
-
-    previous_map = {
-
-        c.lower(): c
-
-        for c in previous_df.columns
-
-    }
-
-    expressions = []
-
-    for current_col in current_df.columns:
-
-        current_type = current_schema[
-            current_col
-        ]
-
-        if current_col.lower() in previous_map:
-
-            previous_col = previous_map[
-                current_col.lower()
-            ]
-
-            expressions.append(
-
-                F.col(
-                    f"`{previous_col}`"
-                )
-                .cast(
-                    current_type
-                )
-                .alias(
-                    current_col
-                )
-
-            )
-
+    all_tables = [r["TABLE_NAME"] for r in tables_df.collect()]
+    target_table_names = []
+    for table in all_tables:
+        has_failed, has_succeeded = flags.get(table, (0, 0))
+        if has_failed:
+            print(f"[{_ts()}] Will process {table} — it has a Failed entry today.")
+            target_table_names.append(table)
+        elif has_succeeded:
+            print(f"[{_ts()}] Skipping {table} — already Succeeded today.")
         else:
-
-            expressions.append(
-
-                F.lit(
-                    None
-                )
-                .cast(
-                    current_type
-                )
-                .alias(
-                    current_col
-                )
-
-            )
-
-    return previous_df.select(
-        *expressions
-    )
-
-
-# ==============================================================
-# ROW HASH COLUMN SELECTION
-# ==============================================================
-
-def get_hash_columns(
-    df,
-    key_cols
-):
-
-    exclude_cols = {
-
-        k.lower()
-
-        for k in key_cols
-
-    }
-
-
-    # ==========================================================
-    # DO NOT HASH TECHNICAL / GENERATED COLUMNS
-    # ==============================================================
-
-    exclude_cols.update([
-
-        "status",
-
-        "insert_timestamp",
-
-        "_row_hash",
-
-        # Existing RAW hash
-        "row_hash",
-
-        # Snapshot technical fields
-        "__snapshot_run_id",
-
-        "__snapshot_date",
-
-        "__snapshot_timestamp"
-
-    ])
-
-
-    hash_cols = [
-
-        c
-
-        for c in df.columns
-
-        if c.lower()
-        not in exclude_cols
-
-    ]
-
-
-    # ==========================================================
-    # SAME ORDER EVERY RUN
-    # ==============================================================
-
-    return sorted(
-        hash_cols,
-        key=lambda x: x.lower()
-    )
-
-
-# ==============================================================
-# ADD CORRECTED SHA-256 ROW HASH
-# ==============================================================
-
-def add_hash(
-    df,
-    key_cols
-):
-
-    hash_cols = get_hash_columns(
-        df,
-        key_cols
-    )
-
-    if len(
-        hash_cols
-    ) == 0:
-
-        return df.withColumn(
-            "_row_hash",
-            F.lit("")
-        )
-
-
-    # ==========================================================
-    # CREATE DETERMINISTIC STRUCT
-    # ==============================================================
-
-    hash_struct = F.struct(
-
-        *[
-
-            F.col(
-                f"`{c}`"
-            ).alias(
-                c
-            )
-
-            for c in hash_cols
-
-        ]
-
-    )
-
-
-    # ==========================================================
-    # CONVERT TO JSON
-    #
-    # NULL fields retained.
-    # ==============================================================
-
-    canonical_json = F.to_json(
-
-        hash_struct,
-
-        {
-            "ignoreNullFields":
-                "false"
-        }
-
-    )
-
-
-    # ==========================================================
-    # SHA-256
-    # ==============================================================
-
-    return df.withColumn(
-
-        "_row_hash",
-
-        F.sha2(
-            canonical_json,
-            256
-        )
-
-    )
-
-
-# ==============================================================
-# PRINT HASH CONFIG
-# ==============================================================
-
-def print_hash_configuration(
-    df,
-    key_cols
-):
-
-    hash_cols = get_hash_columns(
-        df,
-        key_cols
-    )
-
-    print(
-        "\n"
-        "================ HASH CONFIGURATION ================"
-    )
-
-    print(
-        f"Number of business/source columns hashed: "
-        f"{len(hash_cols)}"
-    )
-
-    print(
-        "\nColumns used in _row_hash:"
-    )
-
-    for c in hash_cols:
-
-        print(
-            f" + {c}"
-        )
-
-    print(
-        "\nExisting ROW_HASH is EXCLUDED."
-    )
-
-    print(
-        "UTCTimeStamp remains INCLUDED."
-    )
-
-    print(
-        "===================================================="
-    )
-
-
-# ==============================================================
-# ALIGN DATAFRAMES FOR UNION
-# ==============================================================
-
-def align_dataframes_for_union(
-    dfs
-):
-
-    all_cols = []
-
-    col_types = {}
-
-    for df in dfs:
-
-        for field in df.schema.fields:
-
-            if field.name not in all_cols:
-
-                all_cols.append(
-                    field.name
-                )
-
-                col_types[
-                    field.name
-                ] = field.dataType
-
-    aligned = []
-
-    for df in dfs:
-
-        for c in all_cols:
-
-            if c not in df.columns:
-
-                df = df.withColumn(
-                    c,
-                    F.lit(
-                        None
-                    ).cast(
-                        col_types[c]
-                    )
-                )
-
-        df = df.select(
-            all_cols
-        )
-
-        aligned.append(
-            df
-        )
-
-    return aligned
-
-
-# ==============================================================
-# ADD UTC LOG COLUMNS IF MISSING
-# ==============================================================
-
-def add_missing_utc_log_columns(
-    table_name
-):
-
-    if not table_exists(
-        table_name
-    ):
-
+            print(f"[{_ts()}] Will process {table} — not processed yet today.")
+            target_table_names.append(table)
+
+    if not target_table_names:
+        print(f"[{_ts()}] All tables are already succeeded today. Nothing to process.")
+        consolidate_logs_to_final()
         return
 
-    existing_columns = {
+    target_rows = tables_df.filter(F.col("TABLE_NAME").isin(target_table_names)).collect()
 
-        c.lower()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(process_table, row.asDict()) for row in target_rows]
+        for f in as_completed(futures):
+            f.result()
 
-        for c in spark.table(
-            table_name
-        ).columns
+    consolidate_logs_to_final()
 
-    }
-
-    columns_to_add = []
-
-    if (
-        "insert_timestamp_utc"
-        not in existing_columns
-    ):
-
-        columns_to_add.append(
-            "insert_timestamp_utc TIMESTAMP"
-        )
-
-    if (
-        "start_time_utc"
-        not in existing_columns
-    ):
-
-        columns_to_add.append(
-            "start_time_utc TIMESTAMP"
-        )
-
-    if (
-        "end_time_utc"
-        not in existing_columns
-    ):
-
-        columns_to_add.append(
-            "end_time_utc TIMESTAMP"
-        )
-
-    if columns_to_add:
-
-        columns_sql = ",\n".join(
-            columns_to_add
-        )
-
-        spark.sql(
-            f"""
-            ALTER TABLE {table_name}
-            ADD COLUMNS (
-                {columns_sql}
-            )
-            """
-        )
-
-
-# ==============================================================
-# ENSURE LOG TABLES
-# ==============================================================
-
-def ensure_staging_log_tables_exist():
-
-    empty_log_df = spark.createDataFrame(
-        [],
-        staging_log_schema
-    )
-
-
-    if not table_exists(
-        STAGING_DAILY_LOG_TBL
-    ):
-
-        (
-            empty_log_df.write
-            .mode(
-                "overwrite"
-            )
-            .option(
-                "overwriteSchema",
-                "true"
-            )
-            .saveAsTable(
-                STAGING_DAILY_LOG_TBL
-            )
-        )
-
-    else:
-
-        add_missing_utc_log_columns(
-            STAGING_DAILY_LOG_TBL
-        )
-
-
-    if not table_exists(
-        STAGING_FINAL_LOG_TBL
-    ):
-
-        (
-            empty_log_df.write
-            .mode(
-                "overwrite"
-            )
-            .option(
-                "overwriteSchema",
-                "true"
-            )
-            .saveAsTable(
-                STAGING_FINAL_LOG_TBL
-            )
-        )
-
-    else:
-
-        add_missing_utc_log_columns(
-            STAGING_FINAL_LOG_TBL
-        )
-
-
-# ==============================================================
-# RESET DAILY LOG
-# ==============================================================
-
-def reset_staging_daily_log():
-
-    empty_log_df = spark.createDataFrame(
-        [],
-        staging_log_schema
-    )
-
-    (
-        empty_log_df.write
-        .mode(
-            "overwrite"
-        )
-        .option(
-            "overwriteSchema",
-            "true"
-        )
-        .saveAsTable(
-            STAGING_DAILY_LOG_TBL
-        )
-    )
-
-
-# ==============================================================
-# ADD LOG ROW
-# ==============================================================
-
-def add_staging_log_row(
-    table_name,
-    status,
-    count_value,
-    start_time,
-    end_time,
-    error_message=None
-):
-
-    insert_time_cst = datetime.now(
-        tz
-    )
-
-    if start_time.tzinfo is None:
-
-        start_time_cst = tz.localize(
-            start_time
-        )
-
-    else:
-
-        start_time_cst = start_time.astimezone(
-            tz
-        )
-
-    if end_time.tzinfo is None:
-
-        end_time_cst = tz.localize(
-            end_time
-        )
-
-    else:
-
-        end_time_cst = end_time.astimezone(
-            tz
-        )
-
-
-    insert_time_utc = (
-        insert_time_cst.astimezone(
-            utc_tz
-        )
-    )
-
-    start_time_utc = (
-        start_time_cst.astimezone(
-            utc_tz
-        )
-    )
-
-    end_time_utc = (
-        end_time_cst.astimezone(
-            utc_tz
-        )
-    )
-
-
-    row = {
-
-        "load_date":
-            start_time_cst.date(),
-
-        "table_name":
-            clean_table_name(
-                table_name
-            ),
-
-        "status":
-            status,
-
-        "count":
-            int(
-                count_value
-                if count_value is not None
-                else 0
-            ),
-
-        "error_message":
-            error_message,
-
-        # CST/CDT
-        "insert_timestamp":
-            insert_time_cst.replace(
-                tzinfo=None
-            ),
-
-        "start_time":
-            start_time_cst.replace(
-                tzinfo=None
-            ),
-
-        "end_time":
-            end_time_cst.replace(
-                tzinfo=None
-            ),
-
-        # UTC
-        "insert_timestamp_utc":
-            insert_time_utc.replace(
-                tzinfo=None
-            ),
-
-        "start_time_utc":
-            start_time_utc.replace(
-                tzinfo=None
-            ),
-
-        "end_time_utc":
-            end_time_utc.replace(
-                tzinfo=None
-            ),
-
-        "load_type":
-            "staging_rowhash_test"
-
-    }
-
-
-    with LOG_LOCK:
-
-        STAGING_LOG_ROWS.append(
-            row
-        )
-
-
-# ==============================================================
-# WRITE DAILY LOGS
-# ==============================================================
-
-def write_staging_daily_logs():
-
-    if len(
-        STAGING_LOG_ROWS
-    ) == 0:
-
-        return
-
-    log_df = spark.createDataFrame(
-        STAGING_LOG_ROWS,
-        staging_log_schema
-    )
-
-    (
-        log_df.write
-        .mode(
-            "append"
-        )
-        .option(
-            "mergeSchema",
-            "true"
-        )
-        .saveAsTable(
-            STAGING_DAILY_LOG_TBL
-        )
-    )
-
-
-# ==============================================================
-# DAILY LOG -> FINAL LOG
-# ==============================================================
-
-def consolidate_staging_logs_to_final():
-
-    daily_df = spark.table(
-        STAGING_DAILY_LOG_TBL
-    )
-
-    if daily_df.count() > 0:
-
-        (
-            daily_df.write
-            .mode(
-                "append"
-            )
-            .option(
-                "mergeSchema",
-                "true"
-            )
-            .saveAsTable(
-                STAGING_FINAL_LOG_TBL
-            )
-        )
-
-    reset_staging_daily_log()
-
-
-# ==============================================================
-# PREV_RAW SNAPSHOT
-# ==============================================================
-
-def write_prev_raw_snapshot(
-    table_name,
-    previous_df
-):
-
-    # Nothing to snapshot on first-ever run
-    if previous_df.limit(
-        1
-    ).count() == 0:
-
-        print(
-            "\nPREV_RAW is empty."
-        )
-
-        print(
-            "Skipping PREV_RAW snapshot."
-        )
-
-        return
-
-
-    snapshot_table = snapshot_tbl(
-        table_name
-    )
-
-    snapshot_df = (
-
-        previous_df
-
-        .withColumn(
-            "__snapshot_run_id",
-            F.lit(
-                RUN_ID
-            )
-        )
-
-        .withColumn(
-            "__snapshot_date",
-            F.current_date()
-        )
-
-        .withColumn(
-            "__snapshot_timestamp",
-            F.current_timestamp()
-        )
-
-    )
-
-
-    (
-        snapshot_df.write
-        .mode(
-            "append"
-        )
-        .option(
-            "mergeSchema",
-            "true"
-        )
-        .saveAsTable(
-            snapshot_table
-        )
-    )
-
-
-    print(
-        f"\nPREV_RAW snapshot created: "
-        f"{snapshot_table}"
-    )
-
-
-# ==============================================================
-# BUILD CHANGES
-# ==============================================================
-
-def build_changes(
-    current_df,
-    previous_df,
-    key_cols
-):
-
-
-    # ==========================================================
-    # NORMALIZE
-    # ==============================================================
-
-    current_df = normalize_columns(
-        current_df
-    )
-
-    previous_df = normalize_columns(
-        previous_df
-    )
-
-
-    # ==========================================================
-    # RESOLVE KEYS
-    # ==============================================================
-
-    key_cols = resolve_key_columns(
-        current_df,
-        key_cols
-    )
-
-
-    # ==========================================================
-    # ALIGN PREVIOUS SCHEMA/DATATYPES TO CURRENT RAW
-    # ==============================================================
-
-    previous_df = align_previous_to_current(
-        current_df,
-        previous_df
-    )
-
-
-    # ==========================================================
-    # SAME COLUMN ORDER
-    # ==============================================================
-
-    previous_df = previous_df.select(
-        current_df.columns
-    )
-
-
-    # ==========================================================
-    # PRINT HASH CONFIG
-    # ==============================================================
-
-    print_hash_configuration(
-        current_df,
-        key_cols
-    )
-
-
-    # ==========================================================
-    # CALCULATE CURRENT HASH
-    # ==============================================================
-
-    current_hash = (
-
-        add_hash(
-            current_df,
-            key_cols
-        )
-
-        .alias(
-            "c"
-        )
-
-    )
-
-
-    # ==========================================================
-    # CALCULATE PREVIOUS HASH
-    # ==============================================================
-
-    previous_hash = (
-
-        add_hash(
-            previous_df,
-            key_cols
-        )
-
-        .alias(
-            "p"
-        )
-
-    )
-
-
-    # ==========================================================
-    # KEY JOIN
-    # ==============================================================
-
-    join_cond = [
-
-        F.col(
-            f"c.`{k}`"
-        ).eqNullSafe(
-
-            F.col(
-                f"p.`{k}`"
-            )
-
-        )
-
-        for k in key_cols
-
-    ]
-
-
-    # ==========================================================
-    # INSERT
-    #
-    # CURRENT KEY NOT IN PREVIOUS
-    # ==============================================================
-
-    inserts_df = (
-
-        current_hash
-
-        .join(
-            previous_hash,
-            join_cond,
-            "left_anti"
-        )
-
-        .drop(
-            "_row_hash"
-        )
-
-        .withColumn(
-            "STATUS",
-            F.lit(
-                "I"
-            )
-        )
-
-        .withColumn(
-            "insert_timestamp",
-            F.current_timestamp()
-        )
-
-    )
-
-
-    # ==========================================================
-    # DELETE
-    #
-    # PREVIOUS KEY NOT IN CURRENT
-    # ==============================================================
-
-    deletes_df = (
-
-        previous_hash
-
-        .join(
-            current_hash,
-            join_cond,
-            "left_anti"
-        )
-
-        .drop(
-            "_row_hash"
-        )
-
-        .withColumn(
-            "STATUS",
-            F.lit(
-                "D"
-            )
-        )
-
-        .withColumn(
-            "insert_timestamp",
-            F.current_timestamp()
-        )
-
-    )
-
-
-    # ==========================================================
-    # UPDATE
-    #
-    # SAME KEY + BUSINESS DATA CHANGED
-    # ==============================================================
-
-    updates_df = (
-
-        current_hash
-
-        .join(
-            previous_hash,
-            join_cond,
-            "inner"
-        )
-
-        .where(
-
-            F.col(
-                "c._row_hash"
-            )
-
-            !=
-
-            F.col(
-                "p._row_hash"
-            )
-
-        )
-
-        .select([
-
-            F.col(
-                f"c.`{c}`"
-            ).alias(
-                c
-            )
-
-            for c in current_df.columns
-
-        ])
-
-        .withColumn(
-            "STATUS",
-            F.lit(
-                "U"
-            )
-        )
-
-        .withColumn(
-            "insert_timestamp",
-            F.current_timestamp()
-        )
-
-    )
-
-
-    # ==========================================================
-    # ALIGN I/U/D
-    # ==============================================================
-
-    (
-        inserts_df,
-        updates_df,
-        deletes_df
-    ) = align_dataframes_for_union([
-
-        inserts_df,
-
-        updates_df,
-
-        deletes_df
-
-    ])
-
-
-    # ==========================================================
-    # COMBINE
-    # ==============================================================
-
-    return (
-
-        inserts_df
-
-        .unionByName(
-            updates_df,
-            allowMissingColumns=True
-        )
-
-        .unionByName(
-            deletes_df,
-            allowMissingColumns=True
-        )
-
-    )
-
-
-# ==============================================================
-# PROCESS TABLE
-# ==============================================================
-
-def process_table(
-    table_name,
-    key_column
-):
-
-    start_time = datetime.now(
-        tz
-    )
-
-    source_table = src_tbl(
-        table_name
-    )
-
-    previous_table = prev_tbl(
-        table_name
-    )
-
-    staging_table = stg_tbl(
-        table_name
-    )
-
-    key_cols = parse_key_cols(
-        key_column
-    )
-
-
-    # ==========================================================
-    # VALIDATE KEY
-    # ==============================================================
-
-    if len(
-        key_cols
-    ) == 0:
-
-        raise Exception(
-            f"KEY_COLUMN is empty for {table_name}"
-        )
-
-
-    # ==========================================================
-    # VALIDATE RAW
-    # ==============================================================
-
-    if not table_exists(
-        source_table
-    ):
-
-        raise Exception(
-            f"RAW source does not exist: "
-            f"{source_table}"
-        )
-
-
-    print(
-        "\n"
-        "========================================================"
-    )
-
-    print(
-        "DAILY ROW HASH PROCESS"
-    )
-
-    print(
-        "========================================================"
-    )
-
-    print(
-        f"Table       : {table_name}"
-    )
-
-    print(
-        f"RAW         : {source_table}"
-    )
-
-    print(
-        f"PREV_RAW    : {previous_table}"
-    )
-
-    print(
-        f"STAGING     : {staging_table}"
-    )
-
-    print(
-        f"SNAPSHOT    : {snapshot_tbl(table_name)}"
-    )
-
-    print(
-        f"Key         : {key_cols}"
-    )
-
-    print(
-        "Restore     : DISABLED"
-    )
-
-    print(
-        "Hash        : CORRECTED SHA-256"
-    )
-
-    print(
-        "========================================================"
-    )
-
-
-    # ==========================================================
-    # CURRENT RAW
-    # ==============================================================
-
-    current_df = normalize_columns(
-
-        spark.table(
-            source_table
-        )
-
-    )
-
-
-    current_count = current_df.count()
-
-
-    print(
-        f"\nCURRENT RAW COUNT : "
-        f"{current_count}"
-    )
-
-
-    # ==========================================================
-    # FIRST RUN
-    #
-    # IF PREV_RAW DOES NOT EXIST:
-    # CREATE EMPTY PREV_RAW.
-    #
-    # Therefore ALL CURRENT RAW becomes INSERT.
-    # ==============================================================
-
-    if not table_exists(
-        previous_table
-    ):
-
-        print(
-            "\nPREV_RAW does not exist."
-        )
-
-        print(
-            "Creating empty PREV_RAW."
-        )
-
-        (
-            current_df
-            .limit(
-                0
-            )
-            .write
-            .mode(
-                "overwrite"
-            )
-            .option(
-                "overwriteSchema",
-                "true"
-            )
-            .saveAsTable(
-                previous_table
-            )
-        )
-
-
-    # ==========================================================
-    # READ PREVIOUS
-    # ==============================================================
-
-    previous_df = normalize_columns(
-
-        spark.table(
-            previous_table
-        )
-
-    )
-
-
-    previous_count = previous_df.count()
-
-
-    print(
-        f"PREVIOUS RAW COUNT: "
-        f"{previous_count}"
-    )
-
-
-    # ==========================================================
-    # BUILD CHANGES
-    # ==============================================================
-
-    changes_df = (
-
-        build_changes(
-            current_df,
-            previous_df,
-            key_cols
-        )
-
-        .cache()
-
-    )
-
-
-    # ==========================================================
-    # GET I/U/D COUNTS
-    # ==============================================================
-
-    status_rows = (
-
-        changes_df
-
-        .groupBy(
-            "STATUS"
-        )
-
-        .agg(
-            F.count(
-                "*"
-            ).alias(
-                "cnt"
-            )
-        )
-
-        .collect()
-
-    )
-
-
-    status_counts = {
-
-        row["STATUS"]:
-            int(
-                row["cnt"]
-            )
-
-        for row in status_rows
-
-    }
-
-
-    insert_count = status_counts.get(
-        "I",
-        0
-    )
-
-    update_count = status_counts.get(
-        "U",
-        0
-    )
-
-    delete_count = status_counts.get(
-        "D",
-        0
-    )
-
-
-    total_change_count = (
-
-        insert_count
-        +
-        update_count
-        +
-        delete_count
-
-    )
-
-
-    # ==========================================================
-    # PRINT COUNTS
-    # ==============================================================
-
-    print(
-        "\n"
-        "================ DAILY CHANGE COUNTS ================"
-    )
-
-    print(
-        f"INSERT COUNT : "
-        f"{insert_count}"
-    )
-
-    print(
-        f"UPDATE COUNT : "
-        f"{update_count}"
-    )
-
-    print(
-        f"DELETE COUNT : "
-        f"{delete_count}"
-    )
-
-    print(
-        f"TOTAL CHANGE : "
-        f"{total_change_count}"
-    )
-
-    print(
-        "====================================================="
-    )
-
-
-    # ==========================================================
-    # WRITE TODAY'S STAGING
-    # ==============================================================
-
-    (
-        changes_df.write
-
-        .mode(
-            "overwrite"
-        )
-
-        .option(
-            "overwriteSchema",
-            "true"
-        )
-
-        .saveAsTable(
-            staging_table
-        )
-    )
-
-
-    print(
-        f"\nSTAGING WRITTEN: "
-        f"{staging_table}"
-    )
-
-
-    # ==========================================================
-    # SNAPSHOT OLD PREV_RAW
-    #
-    # MUST HAPPEN BEFORE PREV_RAW OVERWRITE
-    # ==============================================================
-
-    write_prev_raw_snapshot(
-        table_name,
-        previous_df
-    )
-
-
-    # ==========================================================
-    # TODAY'S RAW BECOMES TOMORROW'S PREV_RAW
-    # ==============================================================
-
-    (
-        current_df.write
-
-        .mode(
-            "overwrite"
-        )
-
-        .option(
-            "overwriteSchema",
-            "true"
-        )
-
-        .saveAsTable(
-            previous_table
-        )
-    )
-
-
-    # ==========================================================
-    # VERIFY NEW PREV COUNT
-    # ==============================================================
-
-    new_prev_count = (
-
-        spark.table(
-            previous_table
-        )
-
-        .count()
-
-    )
-
-
-    print(
-        f"\nNEW PREV_RAW COUNT: "
-        f"{new_prev_count}"
-    )
-
-
-    # ==========================================================
-    # CLEAN CACHE
-    # ==============================================================
-
-    changes_df.unpersist()
-
-
-    # ==========================================================
-    # LOGGING
-    # ==============================================================
-
-    end_time = datetime.now(
-        tz
-    )
-
-
-    add_staging_log_row(
-        table_name,
-        "I",
-        insert_count,
-        start_time,
-        end_time,
-        None
-    )
-
-
-    add_staging_log_row(
-        table_name,
-        "U",
-        update_count,
-        start_time,
-        end_time,
-        None
-    )
-
-
-    add_staging_log_row(
-        table_name,
-        "D",
-        delete_count,
-        start_time,
-        end_time,
-        None
-    )
-
-
-    return {
-
-        "table_name":
-            clean_table_name(
-                table_name
-            ),
-
-        "status":
-            "SUCCESS",
-
-        "insert_count":
-            insert_count,
-
-        "update_count":
-            update_count,
-
-        "delete_count":
-            delete_count,
-
-        "total_change_count":
-            total_change_count,
-
-        "raw_count":
-            current_count,
-
-        "previous_count":
-            previous_count,
-
-        "new_prev_count":
-            new_prev_count
-
-    }
-
-
-# ==============================================================
-# RETRY WRAPPER
-# ==============================================================
-
-def process_table_with_retry(
-    table_name,
-    key_column
-):
-
-    last_error = None
-
-
-    for attempt in range(
-        1,
-        MAX_RETRIES + 1
-    ):
-
-
-        try:
-
-            print(
-                f"\nAttempt {attempt} "
-                f"of {MAX_RETRIES}"
-            )
-
-            return process_table(
-                table_name,
-                key_column
-            )
-
-
-        except Exception as e:
-
-            last_error = str(
-                e
-            )
-
-            print(
-                f"\nAttempt {attempt} FAILED"
-            )
-
-            print(
-                last_error
-            )
-
-
-            if attempt == MAX_RETRIES:
-
-                start_time = datetime.now(
-                    tz
-                )
-
-                end_time = datetime.now(
-                    tz
-                )
-
-
-                add_staging_log_row(
-                    table_name,
-                    "FAILED",
-                    0,
-                    start_time,
-                    end_time,
-                    last_error[:4000]
-                )
-
-
-                return {
-
-                    "table_name":
-                        clean_table_name(
-                            table_name
-                        ),
-
-                    "status":
-                        "FAILED",
-
-                    "insert_count":
-                        0,
-
-                    "update_count":
-                        0,
-
-                    "delete_count":
-                        0,
-
-                    "total_change_count":
-                        0,
-
-                    "raw_count":
-                        0,
-
-                    "previous_count":
-                        0,
-
-                    "new_prev_count":
-                        0,
-
-                    "error":
-                        last_error
-
-                }
-
-
-# ==============================================================
-# DAILY RUN
-# ==============================================================
-
-def run_daily_rowhash():
-
-
-    # ==========================================================
-    # ENSURE SCHEMAS
-    # ==============================================================
-
-    ensure_schema(
-        STAGING_SCHEMA
-    )
-
-    ensure_schema(
-        PREV_SCHEMA
-    )
-
-    ensure_schema(
-        SNAPSHOT_SCHEMA
-    )
-
-    ensure_schema(
-        LOG_SCHEMA
-    )
-
-
-    # ==========================================================
-    # ENSURE LOG TABLES
-    # ==============================================================
-
-    ensure_staging_log_tables_exist()
-
-
-    # ==========================================================
-    # RESET DAILY LOG
-    # ==============================================================
-
-    reset_staging_daily_log()
-
-
-    # ==========================================================
-    # CLEAR MEMORY LOGS
-    # ==============================================================
-
-    with LOG_LOCK:
-
-        STAGING_LOG_ROWS.clear()
-
-
-    # ==========================================================
-    # ONE TABLE
-    # ==============================================================
-
-    table_name = TEST_TABLE
-
-    key_column = TEST_KEY_COLUMN
-
-
-    print(
-        "\n"
-        "============================================================"
-    )
-
-    print(
-        "ROW HASH DAILY RUN"
-    )
-
-    print(
-        "============================================================"
-    )
-
-    print(
-        f"Table       : "
-        f"{table_name}"
-    )
-
-    print(
-        f"Key         : "
-        f"{key_column}"
-    )
-
-    print(
-        f"Workers     : "
-        f"{MAX_WORKERS}"
-    )
-
-    print(
-        f"Retries     : "
-        f"{MAX_RETRIES}"
-    )
-
-    print(
-        "PREV restore: DISABLED"
-    )
-
-    print(
-        "ROW_HASH    : EXCLUDED FROM NEW HASH"
-    )
-
-    print(
-        "UTCTimeStamp: INCLUDED"
-    )
-
-    print(
-        "============================================================"
-    )
-
-
-    results = []
-
-
-    # ==========================================================
-    # THREADPOOL
-    # ==============================================================
-
-    with ThreadPoolExecutor(
-        max_workers=
-            MAX_WORKERS
-    ) as executor:
-
-
-        future_map = {
-
-            executor.submit(
-                process_table_with_retry,
-                table_name,
-                key_column
-            ):
-                table_name
-
-        }
-
-
-        for future in as_completed(
-            future_map
-        ):
-
-
-            current_table = future_map[
-                future
-            ]
-
-
-            try:
-
-                result = future.result()
-
-                results.append(
-                    result
-                )
-
-
-                print(
-                    f"\nCompleted: "
-                    f"{current_table}"
-                )
-
-                print(
-                    f"Status : "
-                    f"{result.get('status')}"
-                )
-
-                print(
-                    f"I      : "
-                    f"{result.get('insert_count')}"
-                )
-
-                print(
-                    f"U      : "
-                    f"{result.get('update_count')}"
-                )
-
-                print(
-                    f"D      : "
-                    f"{result.get('delete_count')}"
-                )
-
-
-            except Exception as e:
-
-                print(
-                    traceback.format_exc()
-                )
-
-
-                results.append({
-
-                    "table_name":
-                        clean_table_name(
-                            current_table
-                        ),
-
-                    "status":
-                        "FAILED",
-
-                    "insert_count":
-                        0,
-
-                    "update_count":
-                        0,
-
-                    "delete_count":
-                        0,
-
-                    "total_change_count":
-                        0,
-
-                    "raw_count":
-                        0,
-
-                    "previous_count":
-                        0,
-
-                    "new_prev_count":
-                        0,
-
-                    "error":
-                        str(e)
-
-                })
-
-
-    # ==========================================================
-    # WRITE LOGS
-    # ==============================================================
-
-    write_staging_daily_logs()
-
-
-    # ==========================================================
-    # DAILY -> FINAL
-    # ==============================================================
-
-    consolidate_staging_logs_to_final()
-
-
-    # ==========================================================
-    # RESULT DATAFRAME
-    # ==============================================================
-
-    result_df = spark.createDataFrame(
-        results
-    )
-
-
-    # ==========================================================
-    # FINAL SUMMARY
-    # ==============================================================
-
-    print(
-        "\n"
-        "================ FINAL DAILY SUMMARY ================"
-    )
-
-
-    (
-        result_df
-
-        .select(
-
-            "table_name",
-
-            "status",
-
-            "raw_count",
-
-            "previous_count",
-
-            "insert_count",
-
-            "update_count",
-
-            "delete_count",
-
-            "total_change_count",
-
-            "new_prev_count"
-
-        )
-
-        .show(
-            truncate=False
-        )
-
-    )
-
-
-    # ==========================================================
-    # STAGING STATUS COUNTS
-    # ==============================================================
-
-    staging_table = stg_tbl(
-        TEST_TABLE
-    )
-
-
-    if table_exists(
-        staging_table
-    ):
-
-
-        print(
-            "\n"
-            "================ STAGING STATUS COUNTS ================"
-        )
-
-
-        (
-            spark.table(
-                staging_table
-            )
-
-            .groupBy(
-                "STATUS"
-            )
-
-            .count()
-
-            .orderBy(
-                "STATUS"
-            )
-
-            .show(
-                truncate=False
-            )
-
-        )
-
-
-    # ==========================================================
-    # TABLE LOCATIONS
-    # ==============================================================
-
-    print(
-        "\n"
-        "================ TABLE LOCATIONS ================"
-    )
-
-
-    print(
-        f"RAW SOURCE     : "
-        f"{src_tbl(TEST_TABLE)}"
-    )
-
-
-    print(
-        f"TEST PREV_RAW  : "
-        f"{prev_tbl(TEST_TABLE)}"
-    )
-
-
-    print(
-        f"TEST STAGING   : "
-        f"{stg_tbl(TEST_TABLE)}"
-    )
-
-
-    print(
-        f"TEST SNAPSHOT  : "
-        f"{snapshot_tbl(TEST_TABLE)}"
-    )
-
-
-    print(
-        f"TEST DAILY LOG : "
-        f"{STAGING_DAILY_LOG_TBL}"
-    )
-
-
-    print(
-        f"TEST FINAL LOG : "
-        f"{STAGING_FINAL_LOG_TBL}"
-    )
-
-
-    print(
-        "================================================="
-    )
-
-
-    return result_df
-
-
-# ==============================================================
-# RUN DAILY PROCESS
-# ==============================================================
-
-final_result_df = run_daily_rowhash()
+# === RUN ===
+if __name__ == "__main__":
+    process_all()

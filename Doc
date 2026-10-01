@@ -1,18 +1,23 @@
 Chapter 10 – Dimension and Fact Tables
+
 10.1 Overview
+
 The Dimension and Fact tables form the business and analytical layer of the MHMR data processing solution in Microsoft Fabric.
+
 After the source data is ingested and processed through the RAW, Staging, History, and Snapshot layers, business-specific transformation logic is applied to create the required Dimension and Fact tables.
+
 The current implementation consists of:
-
+
 15 Dimension Tables
-
-
+
 3 Fact Tables
-
+
 Unlike the common frameworks used for Staging, History, and Snapshot, each Dimension and Fact table has its own transformation code based on the corresponding business requirements and existing SQL implementation.
+
 The objective is to reproduce the required SQL business logic in Microsoft Fabric while maintaining consistent data structures and expected results for downstream reporting and analytics.
 
 10.2 High-Level Architecture
+
                  Source Systems
                        |
                        v
@@ -40,222 +45,265 @@ The objective is to reproduce the required SQL business logic in Microsoft Fabri
                        |
                        v
              Reporting / Analytics
+
 The processed Lakehouse data provides the source for the business transformations. Individual transformation logic is then applied to create the required Dimension and Fact datasets.
 
 10.3 Dimension Tables
+
 The project contains 15 Dimension tables implemented in Microsoft Fabric.
+
 Dimension tables contain descriptive and reference information required for reporting and analytical processing. They provide business context that can be associated with the transactional or measurable information maintained in the Fact tables.
+
 Each Dimension table is created using its own transformation code based on the corresponding SQL implementation.
+
 Depending on the business requirement, Dimension processing may include:
-
+
 Reading the required source datasets
-
-
+
 Joining related source tables
-
-
+
 Applying business filters
-
-
+
 Selecting required attributes
-
-
+
 Renaming and mapping columns
-
-
+
 Applying business rules
-
-
+
 Creating derived attributes
-
-
+
 Handling null/default values
-
-
+
 Removing duplicates where required
-
-
+
 Applying data type conversions
-
-
+
 Preparing required keys and reference values
-
-
+
 Loading the final Dimension table into Fabric
-
+
 The transformation logic differs by Dimension table based on its business purpose and source data.
 
 10.4 Fact Tables
+
 The project contains 3 Fact tables implemented in Microsoft Fabric.
+
 Fact tables contain the transactional, event-level, or measurable business information required for reporting and analytics.
+
 Fact processing generally combines the required source data with related Dimension information and applies the necessary business rules before loading the final Fact table.
+
 Depending on the table requirement, Fact processing may include:
-
+
 Reading multiple source datasets
-
-
+
 Joining related datasets
-
-
+
 Referencing Dimension tables where required
-
-
+
 Applying business filters and conditions
-
-
+
 Mapping required keys
-
-
+
 Performing calculations
-
-
+
 Creating derived measures or attributes
-
-
+
 Applying date and timestamp transformations
-
-
+
 Handling null/default values
-
-
+
 Maintaining the required record grain
-
-
+
 Selecting the final target columns
-
-
+
 Loading the completed Fact table into Fabric
-
+
 Each Fact table has its own implementation logic based on the corresponding existing SQL process and business requirements.
 
 10.5 Transformation and Loading Process
+
 Although each Dimension and Fact table contains different business logic, the overall transformation and loading approach follows a common pattern.
+
 Source Data Selection
+
 The required source datasets are identified based on the existing SQL implementation and target table requirements.
+
 The processing reads the required data from the appropriate Lakehouse layers and selects the columns necessary to construct the target Dimension or Fact table.
+
 Data Transformation
+
 Once the source data is identified, table-specific transformation logic is applied.
+
 The transformations may include:
-
+
 Source-to-source joins
-
-
+
 Filtering conditions
-
-
+
 Column selection and mapping
-
-
+
 Conditional/CASE logic
-
-
+
 Data type conversions
-
-
+
 Derived columns
-
-
+
 Business calculations
-
-
+
 Date transformations
-
-
+
 Null/default value handling
-
-
+
 Duplicate handling
-
-
+
 Key mapping
-
-
+
 Business-specific rules
-
+
 The transformation logic in Microsoft Fabric is designed to maintain the same required business outcome as the corresponding SQL implementation.
+
 Dimension Transformation
+
 For Dimension tables, the processing primarily prepares the descriptive and reference attributes required for analytical use.
+
 The source data is transformed into the required Dimension structure, and the necessary business attributes and keys are prepared before loading.
+
 Fact Transformation
+
 For Fact tables, the processing prepares the required transactional or measurable information.
+
 Source datasets are joined according to the defined business relationships, Dimension information is incorporated where required, and the necessary calculations and measures are prepared.
+
 The required Fact grain is maintained so that each record represents the intended business-level information.
+
 Target Mapping
+
 After the business transformations are completed, the resulting dataset is mapped to the corresponding Fabric target structure.
+
 The mapping ensures consistency in:
-
+
 Column names
-
-
+
 Data types
-
-
+
 Required keys
-
-
+
 Target attributes
-
-
+
 Mandatory values
-
+
 Data Loading
+
 The transformed dataset is then loaded into the corresponding Dimension or Fact table in Microsoft Fabric.
+
 Each table uses its own implementation code to perform the required transformations and final target load.
+
 The overall process is:
+
 Source Data → Joins & Filters → Business Rules → Transformations → Target Mapping → DIM/FACT Load
 
 10.6 Dimension and Fact Table Inventory
+
 The complete table inventory will be maintained in this section once the final table names and descriptions are added.
+
 Dimension Tables
-S.No	Dimension Table Name	Description
-	To be updated	
-	To be updated	
-	To be updated	
-	To be updated	
+
+S.No
+
+Dimension Table Name
+
+Description
+
+
+
+To be updated
+
+
+
+
+
+To be updated
+
+
+
+
+
+To be updated
+
+
+
+
+
+To be updated
+
+
+
 Total Dimension Tables: 15
+
 Fact Tables
-S.No	Fact Table Name	Description
-	To be updated	
-	To be updated	
-	To be updated	
+
+S.No
+
+Fact Table Name
+
+Description
+
+
+
+To be updated
+
+
+
+
+
+To be updated
+
+
+
+
+
+To be updated
+
+
+
 Total Fact Tables: 3
+
 The final Dimension and Fact table names can be added to this section without changing the overall framework documentation.
 
 10.7 Validation
+
 After the Dimension and Fact tables are loaded into Microsoft Fabric, validation is performed to ensure that the Fabric implementation produces the expected results.
+
 The primary validation activities include:
-
+
 Record Count Validation – Compare expected and actual record counts.
-
-
+
 Source-to-Target Validation – Verify that required source data is correctly represented in the target.
-
-
+
 Key Validation – Validate the required business and relationship keys.
-
-
+
 Duplicate Validation – Identify unexpected duplicate records.
-
-
+
 Null Validation – Validate mandatory and required attributes.
-
-
+
 Transformation Validation – Verify calculated and derived columns.
-
-
+
 Business Rule Validation – Confirm that required filters and conditions are correctly implemented.
-
-
+
 Data Type Validation – Verify consistency of target data types.
-
-
+
 Dimension/Fact Relationship Validation – Confirm required relationships between Fact and Dimension data.
-
+
 Where applicable, the Fabric output is compared against the corresponding existing SQL results to verify that the migration maintains the expected business logic and data output.
 
 10.8 Summary
+
 The Dimension and Fact layer represents the final business-ready analytical layer of the MHMR Fabric solution.
+
 The implementation currently consists of 15 Dimension tables and 3 Fact tables. Each table has its own transformation code based on the corresponding SQL implementation and business requirements.
+
 Dimension tables provide descriptive and reference information, while Fact tables provide transactional and measurable business data.
+
 The processing follows a common approach of selecting the required source data, applying joins and business transformations, mapping the results to the target structure, and loading the final tables into Microsoft Fabric.
+
 Post-load validation ensures that the Fabric implementation maintains the required SQL business logic and produces the expected results for downstream reporting and analytics.
